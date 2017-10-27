@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sqlbase
 
@@ -28,9 +26,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 // Makes an IndexDescriptor with all columns being ascending.
@@ -588,6 +588,31 @@ func TestValidateTableDesc(t *testing.T) {
 				NextFamilyID: 1,
 				NextIndexID:  2,
 			}},
+		{`at least one of LIST or RANGE partitioning must be used`,
+			// Verify that validatePartitioning is hooked up. The rest of these
+			// tests are in TestValidatePartitionion.
+			TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: FamilyFormatVersion,
+				Columns: []ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+				},
+				Families: []ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary", ColumnIDs: []ColumnID{1}, ColumnNames: []string{"bar"}},
+				},
+				PrimaryIndex: IndexDescriptor{
+					ID: 1, Name: "primary", ColumnIDs: []ColumnID{1}, ColumnNames: []string{"bar"},
+					ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+					},
+				},
+				NextColumnID: 2,
+				NextFamilyID: 1,
+				NextIndexID:  3,
+			}},
 	}
 	for i, d := range testData {
 		if err := d.desc.ValidateTable(); err == nil {
@@ -635,7 +660,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			}},
 		},
 		{
-			err: `missing fk back reference to foo.bar from baz.qux`,
+			err: `missing fk back reference to "foo"@"bar" from "baz"@"qux"`,
 			desc: TableDescriptor{
 				ID:   51,
 				Name: "foo",
@@ -679,7 +704,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			}},
 		},
 		{
-			err: `broken fk backward reference from foo.bar to baz.qux`,
+			err: `broken fk backward reference from "foo"@"bar" to "baz"@"qux"`,
 			desc: TableDescriptor{
 				ID:   51,
 				Name: "foo",
@@ -730,7 +755,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			}},
 		},
 		{
-			err: `missing interleave back reference to foo.bar from baz.qux`,
+			err: `missing interleave back reference to "foo"@"bar" from "baz"@"qux"`,
 			desc: TableDescriptor{
 				ID:   51,
 				Name: "foo",
@@ -776,7 +801,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			}},
 		},
 		{
-			err: `broken interleave backward reference from foo.bar to baz.qux`,
+			err: `broken interleave backward reference from "foo"@"bar" to "baz"@"qux"`,
 			desc: TableDescriptor{
 				ID:   51,
 				Name: "foo",
@@ -819,7 +844,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		txn := client.NewTxn(kvDB)
+		txn := client.NewTxn(kvDB, s.NodeID())
 		if err := test.desc.validateCrossReferences(context.TODO(), txn); err == nil {
 			t.Errorf("%d: expected \"%s\", but found success: %+v", i, test.err, test.desc)
 		} else if test.err != err.Error() {
@@ -829,6 +854,201 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			if err := kvDB.Del(context.TODO(), MakeDescMetadataKey(referencedDesc.ID)); err != nil {
 				t.Fatal(err)
 			}
+		}
+	}
+}
+
+func TestValidatePartitioning(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	tests := []struct {
+		err  string
+		desc TableDescriptor
+	}{
+		{"not enough columns in index for this partitioning",
+			TableDescriptor{
+				PrimaryIndex: IndexDescriptor{
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+					},
+				},
+			},
+		},
+		{"not enough columns in index for this partitioning",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs: []ColumnID{1},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{
+								Name:   "p1",
+								Values: [][]byte{{0x03, 0x02}},
+								Subpartitioning: PartitioningDescriptor{
+									NumColumns: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{"at least one of LIST or RANGE partitioning must be used",
+			TableDescriptor{
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs: []ColumnID{1},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+					},
+				},
+			},
+		},
+		{"only one LIST or RANGE partitioning may used",
+			TableDescriptor{
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs: []ColumnID{1},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{},
+						},
+						Range: []PartitioningDescriptor_Range{
+							{},
+						},
+					},
+				},
+			},
+		},
+		{"partition name must be non-empty",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs: []ColumnID{1},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{},
+						},
+					},
+				},
+			},
+		},
+		{"partition p1 must contain values",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs: []ColumnID{1},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{Name: "p1"},
+						},
+					},
+				},
+			},
+		},
+		{"PARTITION p1: decoding: empty array",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs: []ColumnID{1},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{Name: "p1", Values: [][]byte{{}}},
+						},
+					},
+				},
+			},
+		},
+		{"PARTITION p1: decoding: int64 varint decoding failed: 0",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs: []ColumnID{1},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{Name: "p1", Values: [][]byte{{0x03}}},
+						},
+					},
+				},
+			},
+		},
+		{"PARTITION p1: superfluous data in encoded value",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs: []ColumnID{1},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{Name: "p1", Values: [][]byte{{0x03, 0x02, 0x00}}},
+						},
+					},
+				},
+			},
+		},
+		{"values must be strictly increasing",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs: []ColumnID{1, 1},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						Range: []PartitioningDescriptor_Range{
+							{Name: "p1", UpperBound: []byte{0x03, 0x04}},
+							{Name: "p2", UpperBound: []byte{0x03, 0x02}},
+						},
+					},
+				},
+			},
+		},
+		{"partition name p1 must be unique",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs: []ColumnID{1},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{Name: "p1", Values: [][]byte{{0x03, 0x02}}},
+							{Name: "p1", Values: [][]byte{{0x03, 0x04}}},
+						},
+					},
+				},
+			},
+		},
+		{"partition name p1 must be unique",
+			TableDescriptor{
+				Columns: []ColumnDescriptor{{ID: 1, Type: ColumnType{SemanticType: ColumnType_INT}}},
+				PrimaryIndex: IndexDescriptor{
+					ColumnIDs: []ColumnID{1, 1},
+					Partitioning: PartitioningDescriptor{
+						NumColumns: 1,
+						List: []PartitioningDescriptor_List{
+							{Name: "p1", Values: [][]byte{{0x03, 0x02}}},
+							{
+								Name:   "p2",
+								Values: [][]byte{{0x03, 0x04}},
+								Subpartitioning: PartitioningDescriptor{
+									NumColumns: 1,
+									List: []PartitioningDescriptor_List{
+										{Name: "p1", Values: [][]byte{{0x03, 0x02}}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	for i, test := range tests {
+		err := test.desc.validatePartitioning()
+		if !testutils.IsError(err, test.err) {
+			t.Errorf(`%d: got "%v" expected "%v"`, i, err, test.err)
 		}
 	}
 }
@@ -1105,7 +1325,7 @@ func TestKeysPerRow(t *testing.T) {
 				`SELECT descriptor FROM system.descriptor ORDER BY id DESC LIMIT 1`)
 			row.Scan(&descBytes)
 			var desc Descriptor
-			if err := desc.Unmarshal(descBytes); err != nil {
+			if err := protoutil.Unmarshal(descBytes, &desc); err != nil {
 				t.Fatalf("%+v", err)
 			}
 

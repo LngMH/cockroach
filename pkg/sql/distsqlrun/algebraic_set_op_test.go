@@ -11,14 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Arjun Narayan (arjun@cockroachlabs.com)
 
 package distsqlrun
 
 import (
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -43,8 +42,7 @@ type testInputs struct {
 func initTestData() testInputs {
 	v := [15]sqlbase.EncDatum{}
 	for i := range v {
-		v[i] = sqlbase.DatumToEncDatum(sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT},
-			parser.NewDInt(parser.DInt(i)))
+		v[i] = sqlbase.DatumToEncDatum(intType, parser.NewDInt(parser.DInt(i)))
 	}
 
 	inputUnordered := sqlbase.EncDatumRows{
@@ -82,11 +80,12 @@ func initTestData() testInputs {
 }
 
 func runProcessors(tc testCase) (sqlbase.EncDatumRows, error) {
-	inL := NewRowBuffer(nil, tc.inputLeft, RowBufferArgs{})
-	inR := NewRowBuffer(nil, tc.inputRight, RowBufferArgs{})
-	out := &RowBuffer{}
+	types := twoIntCols
+	inL := NewRowBuffer(types, tc.inputLeft, RowBufferArgs{})
+	inR := NewRowBuffer(types, tc.inputRight, RowBufferArgs{})
+	out := NewRowBuffer(types, nil /* rows */, RowBufferArgs{})
 
-	flowCtx := FlowCtx{}
+	flowCtx := FlowCtx{Settings: cluster.MakeTestingClusterSettings()}
 
 	s, err := newAlgebraicSetOp(&flowCtx, &tc.spec, inL, inR, &PostProcessSpec{}, out)
 	if err != nil {
@@ -110,8 +109,8 @@ func runProcessors(tc testCase) (sqlbase.EncDatumRows, error) {
 		res = append(res, row)
 	}
 
-	if result := res.String(); result != tc.expected.String() {
-		return nil, errors.Errorf("invalid results: %s, expected %s'", result, tc.expected.String())
+	if result, exp := res.String(types), tc.expected.String(types); result != exp {
+		return nil, errors.Errorf("invalid results: %s, expected %s'", result, exp)
 	}
 
 	return res, nil
@@ -194,8 +193,8 @@ func TestExceptAll(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if result := outRows.String(); result != tc.expected.String() {
-			t.Errorf("invalid result index %d: %s, expected %s'", i, result, tc.expected.String())
+		if result, exp := outRows.String(twoIntCols), tc.expected.String(twoIntCols); result != exp {
+			t.Errorf("invalid result index %d: %s, expected %s'", i, result, exp)
 		}
 	}
 }

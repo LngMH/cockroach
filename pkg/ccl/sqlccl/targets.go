@@ -16,10 +16,13 @@ import (
 
 // descriptorsMatchingTargets returns the descriptors that match the targets. A
 // database descriptor is included in this set if it matches the targets (or the
-// session database) or if one of its tables matches the targets.
+// session database) or if one of its tables matches the targets. Those
+// databases that are explicitly mentioned (e.g. as `DATABASE foo`, as opposed
+// to `foo.bar` or even `foo.*`) are also included in the second list for
+// callers that wish to handle that case differently.
 func descriptorsMatchingTargets(
 	sessionDatabase string, descriptors []sqlbase.Descriptor, targets parser.TargetList,
-) ([]sqlbase.Descriptor, error) {
+) ([]sqlbase.Descriptor, []*sqlbase.DatabaseDescriptor, error) {
 	// TODO(dan): If the session search path starts including more than virtual
 	// tables (as of 2017-01-12 it's only pg_catalog), then this method will
 	// need to support it.
@@ -30,9 +33,13 @@ func descriptorsMatchingTargets(
 		valid
 	)
 
+	explicitlyNamedDBs := map[string]struct{}{}
+	var retDBs []*sqlbase.DatabaseDescriptor
+
 	starByDatabase := make(map[string]validity, len(targets.Databases))
 	for _, d := range targets.Databases {
-		starByDatabase[d.Normalize()] = maybeValid
+		explicitlyNamedDBs[string(d)] = struct{}{}
+		starByDatabase[string(d)] = maybeValid
 	}
 
 	type table struct {
@@ -45,30 +52,30 @@ func descriptorsMatchingTargets(
 		var err error
 		pattern, err = pattern.NormalizeTablePattern()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		switch p := pattern.(type) {
 		case *parser.TableName:
 			if sessionDatabase != "" {
 				if err := p.QualifyWithDatabase(sessionDatabase); err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 			}
-			db := p.DatabaseName.Normalize()
+			db := string(p.DatabaseName)
 			tablesByDatabase[db] = append(tablesByDatabase[db], table{
-				name:     p.TableName.Normalize(),
+				name:     string(p.TableName),
 				validity: maybeValid,
 			})
 		case *parser.AllTablesSelector:
 			if sessionDatabase != "" {
 				if err := p.QualifyWithDatabase(sessionDatabase); err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 			}
-			starByDatabase[p.Database.Normalize()] = maybeValid
+			starByDatabase[string(p.Database)] = maybeValid
 		default:
-			return nil, errors.Errorf("unknown pattern %T: %+v", pattern, pattern)
+			return nil, nil, errors.Errorf("unknown pattern %T: %+v", pattern, pattern)
 		}
 	}
 
@@ -78,7 +85,10 @@ func descriptorsMatchingTargets(
 	for _, desc := range descriptors {
 		if dbDesc := desc.GetDatabase(); dbDesc != nil {
 			databasesByID[dbDesc.ID] = dbDesc
-			normalizedDBName := parser.ReNormalizeName(dbDesc.Name)
+			normalizedDBName := dbDesc.Name
+			if _, ok := explicitlyNamedDBs[normalizedDBName]; ok {
+				retDBs = append(retDBs, dbDesc)
+			}
 			if _, ok := starByDatabase[normalizedDBName]; ok {
 				starByDatabase[normalizedDBName] = valid
 				ret = append(ret, desc)
@@ -90,14 +100,17 @@ func descriptorsMatchingTargets(
 
 	for _, desc := range descriptors {
 		if tableDesc := desc.GetTable(); tableDesc != nil {
+			if tableDesc.Dropped() {
+				continue
+			}
 			dbDesc, ok := databasesByID[tableDesc.ParentID]
 			if !ok {
-				return nil, errors.Errorf("unknown ParentID: %d", tableDesc.ParentID)
+				return nil, nil, errors.Errorf("unknown ParentID: %d", tableDesc.ParentID)
 			}
-			normalizedDBName := parser.ReNormalizeName(dbDesc.Name)
+			normalizedDBName := dbDesc.Name
 			if tables, ok := tablesByDatabase[normalizedDBName]; ok {
 				for i := range tables {
-					if parser.ReNormalizeName(tables[i].name) == parser.ReNormalizeName(tableDesc.Name) {
+					if tables[i].name == tableDesc.Name {
 						tables[i].validity = valid
 						ret = append(ret, desc)
 						break
@@ -112,19 +125,21 @@ func descriptorsMatchingTargets(
 	for dbName, validity := range starByDatabase {
 		if validity != valid {
 			if dbName == "" {
-				return nil, errors.Errorf("no database specified for wildcard")
+				return nil, nil, errors.Errorf("no database specified for wildcard")
 			}
-			return nil, errors.Errorf(`database "%s" does not exist`, dbName)
+			return nil, nil, errors.Errorf(`database "%s" does not exist`, dbName)
 		}
 	}
+
+	// explicitlyNamedDBs is a subset of starByDatabase, so no need to verify it.
 
 	for _, tables := range tablesByDatabase {
 		for _, table := range tables {
 			if table.validity != valid {
-				return nil, errors.Errorf(`table "%s" does not exist`, table.name)
+				return nil, nil, errors.Errorf(`table "%s" does not exist`, table.name)
 			}
 		}
 	}
 
-	return ret, nil
+	return ret, retDBs, nil
 }

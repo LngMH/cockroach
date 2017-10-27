@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
 
 package sql
 
@@ -26,6 +25,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -40,8 +40,9 @@ type stmtKey struct {
 
 // appStats holds per-application statistics.
 type appStats struct {
-	syncutil.Mutex
+	st *cluster.Settings
 
+	syncutil.Mutex
 	stmts map[stmtKey]*stmtStats
 }
 
@@ -52,18 +53,24 @@ type stmtStats struct {
 	data roachpb.StatementStatistics
 }
 
-// StmtStatsEnable determines whether to collect per-statement
+// stmtStatsEnable determines whether to collect per-statement
 // statistics.
-var StmtStatsEnable = settings.RegisterBoolSetting(
-	"sql.metrics.statement_details.enabled", "collect per-statement query statistics ", true,
+var stmtStatsEnable = settings.RegisterBoolSetting(
+	"sql.metrics.statement_details.enabled", "collect per-statement query statistics", true,
 )
 
-// SQLStatsCollectionLatencyThreshold specifies the minimum amount of time
+// sqlStatsCollectionLatencyThreshold specifies the minimum amount of time
 // consumed by a SQL statement before it is collected for statistics reporting.
-var SQLStatsCollectionLatencyThreshold = settings.RegisterDurationSetting(
+var sqlStatsCollectionLatencyThreshold = settings.RegisterDurationSetting(
 	"sql.metrics.statement_details.threshold",
-	"minmum execution time to cause statics to be collected",
+	"minimum execution time to cause statistics to be collected",
 	0,
+)
+
+var dumpStmtStatsToLogBeforeReset = settings.RegisterBoolSetting(
+	"sql.metrics.statement_details.dump_to_logs",
+	"dump collected statement statistics to node logs when periodically cleared",
+	false,
 )
 
 func (s stmtKey) String() string {
@@ -89,11 +96,11 @@ func (a *appStats) recordStatement(
 	err error,
 	parseLat, planLat, runLat, svcLat, ovhLat float64,
 ) {
-	if a == nil || !StmtStatsEnable.Get() {
+	if a == nil || !stmtStatsEnable.Get(&a.st.SV) {
 		return
 	}
 
-	if t := SQLStatsCollectionLatencyThreshold.Get(); t > 0 && t.Seconds() >= svcLat {
+	if t := sqlStatsCollectionLatencyThreshold.Get(&a.st.SV); t > 0 && t.Seconds() >= svcLat {
 		return
 	}
 
@@ -106,12 +113,17 @@ func (a *appStats) recordStatement(
 	// Extend the statement key with a character that indicated whether
 	// there was an error and/or whether the query was distributed, so
 	// that we use separate buckets for the different situations.
-	var buf bytes.Buffer
+	key := stmtKey{failed: err != nil, distSQLUsed: distSQLUsed}
 
-	parser.FormatNode(&buf, parser.FmtHideConstants, stmt.AST)
+	if stmt.AnonymizedStr != "" {
+		// Use the cached anonymized string.
+		key.stmt = stmt.AnonymizedStr
+	} else {
+		key.stmt = a.getStrForStmt(stmt)
+	}
 
 	// Get the statistics object.
-	s := a.getStatsForStmt(stmtKey{stmt: buf.String(), failed: err != nil, distSQLUsed: distSQLUsed})
+	s := a.getStatsForStmt(key)
 
 	// Collect the per-statement statistics.
 	s.Lock()
@@ -147,9 +159,16 @@ func (a *appStats) getStatsForStmt(key stmtKey) *stmtStats {
 	return s
 }
 
+func (a *appStats) getStrForStmt(stmt Statement) string {
+	var buf bytes.Buffer
+	parser.FormatNode(&buf, parser.FmtHideConstants, stmt.AST)
+	return buf.String()
+}
+
 // sqlStats carries per-application statistics for all applications on
 // each node. It hangs off Executor.
 type sqlStats struct {
+	st *cluster.Settings
 	syncutil.Mutex
 
 	// apps is the container for all the per-application statistics
@@ -175,16 +194,10 @@ func (s *sqlStats) getStatsForApplication(appName string) *appStats {
 	if a, ok := s.apps[appName]; ok {
 		return a
 	}
-	a := &appStats{stmts: make(map[stmtKey]*stmtStats)}
+	a := &appStats{st: s.st, stmts: make(map[stmtKey]*stmtStats)}
 	s.apps[appName] = a
 	return a
 }
-
-var dumpStmtStatsToLogBeforeReset = settings.RegisterBoolSetting(
-	"sql.metrics.statement_details.dump_to_logs",
-	"dump collected statement statistics to node logs when periodically cleared",
-	false,
-)
 
 // resetStats clears all the stored per-app and per-statement
 // statistics.
@@ -213,7 +226,7 @@ func (s *sqlStats) resetStats(ctx context.Context) {
 		// TODO(knz/dt): instead of dumping the stats to the log, save
 		// them in a SQL table so they can be inspected by the DBA and/or
 		// the UI.
-		if dumpStmtStatsToLogBeforeReset.Get() {
+		if dumpStmtStatsToLogBeforeReset.Get(&a.st.SV) {
 			dumpStmtStats(ctx, appName, a.stmts)
 		}
 

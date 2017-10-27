@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Vivek Menezes (vivek@cockroachlabs.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package sql
 
@@ -37,20 +34,29 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
+
+// debugTrace7881Enabled causes all SQL transactions to be traced, in the hope
+// that we'll catch #7881 and dump the current trace for debugging.
+var debugTrace7881Enabled = envutil.EnvOrDefaultBool("COCKROACH_TRACE_7881", false)
+
+// span baggage key used for marking a span
+const keyFor7881Sample = "found#7881"
 
 // traceTxnThreshold can be used to log SQL transactions that take
 // longer than duration to complete. For example, traceTxnThreshold=1s
@@ -61,7 +67,8 @@ import (
 // if they are not output.
 var traceTxnThreshold = settings.RegisterDurationSetting(
 	"sql.trace.txn.enable_threshold",
-	"duration beyond which all transactions are traced (set to 0 to disable)", 0)
+	"duration beyond which all transactions are traced (set to 0 to disable)", 0,
+)
 
 // traceSessionEventLogEnabled can be used to enable the event log
 // that is normally kept for every SQL connection. The event log has a
@@ -69,20 +76,20 @@ var traceTxnThreshold = settings.RegisterDurationSetting(
 // which may be a privacy concern.
 var traceSessionEventLogEnabled = settings.RegisterBoolSetting(
 	"sql.trace.session_eventlog.enabled",
-	"set to true to enable session tracing", false)
+	"set to true to enable session tracing", false,
+)
 
-// debugTrace7881Enabled causes all SQL transactions to be traced, in the hope
-// that we'll catch #7881 and dump the current trace for debugging.
-var debugTrace7881Enabled = envutil.EnvOrDefaultBool("COCKROACH_TRACE_7881", false)
-
-// logStatementsExecuteEnabled causes the Executor to log executed
-// statements and, if any, resulting errors.
-var logStatementsExecuteEnabled = settings.RegisterBoolSetting(
-	"sql.trace.log_statement_execute",
-	"set to true to enable logging of executed statements", false)
-
-// span baggage key used for marking a span
-const keyFor7881Sample = "found#7881"
+// DistSQLClusterExecMode controls the cluster default for when DistSQL is used.
+var DistSQLClusterExecMode = settings.RegisterEnumSetting(
+	"sql.defaults.distsql",
+	"Default distributed SQL execution mode",
+	"Auto",
+	map[int64]string{
+		int64(DistSQLOff):  "Off",
+		int64(DistSQLAuto): "Auto",
+		int64(DistSQLOn):   "On",
+	},
+)
 
 // DistSQLExecMode controls if and when the Executor uses DistSQL.
 type DistSQLExecMode int64
@@ -114,11 +121,6 @@ func (m DistSQLExecMode) String() string {
 	}
 }
 
-// DistSQLExecModeFromInt converts an int64 into a DistSQLExecMode
-func DistSQLExecModeFromInt(val int64) DistSQLExecMode {
-	return DistSQLExecMode(val)
-}
-
 // DistSQLExecModeFromString converts a string into a DistSQLExecMode
 func DistSQLExecModeFromString(val string) DistSQLExecMode {
 	switch strings.ToUpper(val) {
@@ -135,18 +137,6 @@ func DistSQLExecModeFromString(val string) DistSQLExecMode {
 	}
 }
 
-// DistSQLClusterExecMode controls the cluster default for when DistSQL is used.
-var DistSQLClusterExecMode = settings.RegisterEnumSetting(
-	"sql.defaults.distsql",
-	"Default distributed SQL execution mode",
-	"Auto",
-	map[int64]string{
-		int64(DistSQLOff):  "Off",
-		int64(DistSQLAuto): "Auto",
-		int64(DistSQLOn):   "On",
-	},
-)
-
 // queryPhase represents a phase during a query's execution.
 type queryPhase int
 
@@ -159,7 +149,7 @@ const (
 )
 
 // queryMeta stores metadata about a query. Stored as reference in
-// session.mu.ActiveQueries and planner.queryMeta.
+// session.mu.ActiveQueries.
 type queryMeta struct {
 	// The timestamp when this query began execution.
 	start time.Time
@@ -176,10 +166,23 @@ type queryMeta struct {
 
 	// Current phase of execution of query.
 	phase queryPhase
+
+	// Context associated with this query's transaction.
+	ctx context.Context
+
+	// Cancellation function for the context associated with this query's transaction.
+	// Set to session.txnState.cancel in executor.
+	ctxCancel context.CancelFunc
+
+	// Reference to the Session that contains this query.
+	session *Session
 }
 
-// queryHandle is a type for uniquely identifying queries in a session.
-type queryHandle *queryMeta
+// cancel cancels the query associated with this queryMeta, by closing the associated
+// txn context.
+func (q *queryMeta) cancel() {
+	q.ctxCancel()
+}
 
 // Session contains the state of a SQL client connection.
 // Create instances using NewSession().
@@ -205,6 +208,9 @@ type Session struct {
 	SearchPath parser.SearchPath
 	// User is the name of the user logged into the session.
 	User string
+	// SafeUpdates causes errors when the client
+	// sends syntax that may have unwanted side effects.
+	SafeUpdates bool
 
 	//
 	// Session parameters, non-user-configurable.
@@ -250,7 +256,7 @@ type Session struct {
 	execCfg *ExecutorConfig
 	// distSQLPlanner is in charge of distSQL physical planning and running
 	// logic.
-	distSQLPlanner *distSQLPlanner
+	distSQLPlanner *DistSQLPlanner
 	// context is the Session's base context, to be used for all
 	// SQL-related logging. See Ctx().
 	context context.Context
@@ -279,11 +285,16 @@ type Session struct {
 	// is typically caused by transactions, not sessions. The reason why
 	// sessionMon and mon are split is to enable separate reporting of
 	// statistics for result sets (which escape transactions).
-	mon        mon.MemoryMonitor
-	sessionMon mon.MemoryMonitor
+	mon        mon.BytesMonitor
+	sessionMon mon.BytesMonitor
 	// emergencyShutdown is set to true by EmergencyClose() to
 	// indicate to Finish() that the session is already closed.
 	emergencyShutdown bool
+
+	// ResultsWriter is where query results are written to. It's set to a
+	// pgwire.v3conn for sessions opened for SQL client connections and a
+	// bufferedResultWriter for internal uses.
+	ResultsWriter ResultsWriter
 
 	Tracing SessionTracing
 
@@ -291,6 +302,10 @@ type Session struct {
 
 	// If set, contains the in progress COPY FROM columns.
 	copyFrom *copyNode
+
+	// ActiveSyncQueries contains query IDs of all synchronous (i.e. non-parallel)
+	// queries in flight. All ActiveSyncQueries must also be in mu.ActiveQueries.
+	ActiveSyncQueries []uint128.Uint128
 
 	// mu contains of all elements of the struct that can be changed
 	// after initialization, and may be accessed from another thread.
@@ -311,7 +326,11 @@ type Session struct {
 		//
 
 		// ActiveQueries contains all queries in flight.
-		ActiveQueries map[queryHandle]struct{}
+		ActiveQueries map[uint128.Uint128]*queryMeta
+
+		// LastActiveQuery contains a reference to the AST of the last
+		// query that ran on this session.
+		LastActiveQuery parser.Statement
 	}
 
 	//
@@ -384,6 +403,35 @@ func (r *SessionRegistry) deregister(s *Session) {
 	r.Unlock()
 }
 
+// CancelQuery looks up the associated query in the session registry and cancels it.
+func (r *SessionRegistry) CancelQuery(queryIDStr string, username string) (bool, error) {
+	queryID, err := uint128.FromString(queryIDStr)
+	if err != nil {
+		return false, fmt.Errorf("query ID %s malformed: %s", queryID, err)
+	}
+
+	r.Lock()
+	defer r.Unlock()
+
+	for session := range r.store {
+		if !(username == security.RootUser || username == session.User) {
+			// Skip this session.
+			continue
+		}
+
+		session.mu.Lock()
+		if queryMeta, exists := session.mu.ActiveQueries[queryID]; exists {
+			queryMeta.cancel()
+
+			session.mu.Unlock()
+			return true, nil
+		}
+		session.mu.Unlock()
+	}
+
+	return false, fmt.Errorf("query ID %s not found", queryID)
+}
+
 // SerializeAll returns a slice of all sessions in the registry, converted to serverpb.Sessions.
 func (r *SessionRegistry) SerializeAll() []serverpb.Session {
 	r.Lock()
@@ -404,10 +452,8 @@ func NewSession(
 	ctx context.Context, args SessionArgs, e *Executor, remote net.Addr, memMetrics *MemoryMetrics,
 ) *Session {
 	ctx = e.AnnotateCtx(ctx)
-	distSQLMode := DistSQLExecModeFromInt(DistSQLClusterExecMode.Get())
-	if e.cfg.TestingKnobs.OverrideDistSQLMode != nil {
-		distSQLMode = DistSQLExecModeFromInt(e.cfg.TestingKnobs.OverrideDistSQLMode.Get())
-	}
+	distSQLMode := DistSQLExecMode(DistSQLClusterExecMode.Get(&e.cfg.Settings.SV))
+
 	s := &Session{
 		Database:         args.Database,
 		DistSQLMode:      distSQLMode,
@@ -434,7 +480,8 @@ func NewSession(
 	s.PreparedStatements = makePreparedStatements(s)
 	s.PreparedPortals = makePreparedPortals(s)
 	s.Tracing.session = s
-	s.mu.ActiveQueries = make(map[queryHandle]struct{})
+	s.mu.ActiveQueries = make(map[uint128.Uint128]*queryMeta)
+	s.ActiveSyncQueries = make([]uint128.Uint128, 0)
 
 	remoteStr := "<admin>"
 	if remote != nil {
@@ -442,10 +489,10 @@ func NewSession(
 	}
 	s.ClientAddr = remoteStr
 
-	if traceSessionEventLogEnabled.Get() {
+	if traceSessionEventLogEnabled.Get(&e.cfg.Settings.SV) {
 		s.eventLog = trace.NewEventLog(fmt.Sprintf("sql [%s]", args.User), remoteStr)
 	}
-	s.context, s.cancel = context.WithCancel(ctx)
+	s.context, s.cancel = contextutil.WithCancel(ctx)
 
 	e.cfg.SessionRegistry.register(s)
 
@@ -465,7 +512,7 @@ func (s *Session) Finish(e *Executor) {
 		return
 	}
 
-	if s.mon == (mon.MemoryMonitor{}) {
+	if s.mon == (mon.BytesMonitor{}) {
 		// This check won't catch the cases where Finish is never called, but it's
 		// proven to be easier to remember to call Finish than it is to call
 		// StartMonitor.
@@ -484,13 +531,13 @@ func (s *Session) Finish(e *Executor) {
 	// TODO(nvanbenschoten): Once we have better support for cancelling ongoing
 	// statement execution by the infrastructure added to support CancelRequest,
 	// we should try to actively drain this queue instead of passively waiting
-	// for it to drain.
-	_ = s.parallelizeQueue.Wait()
+	// for it to drain. (andrei, 2017/09) - We now have support for statement
+	// cancellation. Now what?
+	_ = s.synchronizeParallelStmts(s.context)
 
 	// If we're inside a txn, roll it back.
 	if s.TxnState.State().kvTxnIsOpen() {
-		s.TxnState.updateStateAndCleanupOnErr(
-			errors.Errorf("session closing"), e)
+		_ = s.TxnState.updateStateAndCleanupOnErr(fmt.Errorf("session closing"), e)
 	}
 	if s.TxnState.State() != NoTxn {
 		s.TxnState.finishSQLTxn(s)
@@ -534,7 +581,7 @@ func (s *Session) Finish(e *Executor) {
 func (s *Session) EmergencyClose() {
 	// Ensure that all in-flight statements are done, so that monitor
 	// traffic is stopped.
-	_ = s.parallelizeQueue.Wait()
+	_ = s.synchronizeParallelStmts(s.context)
 
 	// Release the leases - to ensure other sessions don't get stuck.
 	s.tables.releaseTables(s.context)
@@ -576,6 +623,8 @@ func (s *Session) resetPlanner(p *planner, e *Executor, txn *client.Txn) {
 	p.session = s
 	// phaseTimes is an array, not a slice, so this performs a copy-by-value.
 	p.phaseTimes = s.phaseTimes
+	p.stmt = nil
+	p.cancelChecker = sqlbase.NewCancelChecker(s.Ctx())
 
 	p.semaCtx = parser.MakeSemaContext(s.User == security.RootUser)
 	p.semaCtx.Location = &s.Location
@@ -595,8 +644,23 @@ func (s *Session) resetPlanner(p *planner, e *Executor, txn *client.Txn) {
 // FinishPlan releases the resources that were consumed by the currently active
 // default planner. It does not check to see whether any other resources are
 // still pointing to the planner, so it should only be called when a connection
-// is entirely finished executing a statement.
+// is entirely finished executing a statement and all results have been sent.
 func (s *Session) FinishPlan() {
+	if len(s.ActiveSyncQueries) > 0 {
+		s.mu.Lock()
+		// Store the last sync query as the last active query.
+		lastQueryID := s.ActiveSyncQueries[len(s.ActiveSyncQueries)-1]
+		s.mu.LastActiveQuery = s.mu.ActiveQueries[lastQueryID].stmt
+		// All results have been sent to the client; so deregister all synchronous
+		// active queries from this session. Cannot deregister asynchronous ones
+		// because those might still be executing in the parallelizeQueue.
+		for _, queryID := range s.ActiveSyncQueries {
+			delete(s.mu.ActiveQueries, queryID)
+		}
+		s.mu.Unlock()
+		s.ActiveSyncQueries = make([]uint128.Uint128, 0)
+	}
+
 	s.planner = emptyPlanner
 }
 
@@ -612,11 +676,12 @@ func (s *Session) newPlanner(e *Executor, txn *client.Txn) *planner {
 // evalCtx creates a parser.EvalContext from the Session's current configuration.
 func (s *Session) evalCtx() parser.EvalContext {
 	return parser.EvalContext{
-		Location:   &s.Location,
-		Database:   s.Database,
-		SearchPath: s.SearchPath,
-		Ctx:        s.Ctx,
-		Mon:        &s.TxnState.mon,
+		Location:    &s.Location,
+		Database:    s.Database,
+		User:        s.User,
+		SearchPath:  s.SearchPath,
+		CtxProvider: s,
+		Mon:         &s.TxnState.mon,
 	}
 }
 
@@ -639,35 +704,107 @@ func (s *Session) setTestingVerifyMetadata(fn func(config.SystemConfig) error) {
 }
 
 // addActiveQuery adds a running query to the session's internal store of active
-// queries. Called from executor's execStmt and execStmtInParallel.
-func (s *Session) addActiveQuery(stmt Statement) queryHandle {
+// queries, as well as to the executor's query registry. Called from executor
+// before start of execution.
+func (s *Session) addActiveQuery(queryID uint128.Uint128, queryMeta *queryMeta) {
 	s.mu.Lock()
-	query := &queryMeta{
-		start: timeutil.Now(),
-		stmt:  stmt.AST,
-		phase: preparing,
-	}
-	s.mu.ActiveQueries[query] = struct{}{}
+	s.mu.ActiveQueries[queryID] = queryMeta
+	queryMeta.session = s
 	s.mu.Unlock()
-	return query
+	// addActiveQuery is called from the main goroutine of the session;
+	// and at this stage, this query is a synchronous query for our purposes.
+	// setQueryExecutionMode will remove this element if this query enters the
+	// parallelizeQueue.
+	s.ActiveSyncQueries = append(s.ActiveSyncQueries, queryID)
 }
 
 // removeActiveQuery removes a query from a session's internal store of active
-// queries. Called when a query finishes execution.
-func (s *Session) removeActiveQuery(query queryHandle) {
+// queries, as well as from the executor's query registry.
+// Called when a query finishes execution.
+func (s *Session) removeActiveQuery(queryID uint128.Uint128) {
 	s.mu.Lock()
-	delete(s.mu.ActiveQueries, query)
+	queryMeta, ok := s.mu.ActiveQueries[queryID]
+	if ok {
+		delete(s.mu.ActiveQueries, queryID)
+		s.mu.LastActiveQuery = queryMeta.stmt
+	}
 	s.mu.Unlock()
 }
 
 // setQueryExecutionMode is called upon start of execution of a query, and sets
 // the query's metadata to indicate whether it's distributed or not.
-func (s *Session) setQueryExecutionMode(query queryHandle, isDistributed bool) {
+func (s *Session) setQueryExecutionMode(
+	queryID uint128.Uint128, isDistributed bool, isParallel bool,
+) {
 	s.mu.Lock()
-	queryMeta := (*queryMeta)(query)
+	defer s.mu.Unlock()
+	queryMeta, ok := s.mu.ActiveQueries[queryID]
+	if !ok {
+		// Could be a statement that implements HiddenFromShowQueries.
+		// These statements have a query ID but do not have an entry
+		// in session.mu.ActiveQueries.
+		return
+	}
 	queryMeta.phase = executing
 	queryMeta.isDistributed = isDistributed
-	s.mu.Unlock()
+
+	if isParallel {
+		// We default to putting queries in ActiveSyncQueries. Since
+		// this query is not synchronous anymore, remove it from
+		// ActiveSyncQueries. We expect the last element in
+		// ActiveSyncQueries to be this query; because all execution
+		// up to this call of setQueryExecutionMode is synchronous.
+		lenSyncQueries := len(s.ActiveSyncQueries)
+		s.ActiveSyncQueries = s.ActiveSyncQueries[:lenSyncQueries-1]
+	}
+}
+
+// synchronizeParallelStmts waits for all statements in the parallelizeQueue to
+// finish. If errors are seen in the parallel batch, we attempt to turn these
+// errors into a single error we can send to the client. We do this by prioritizing
+// non-retryable errors over retryable errors.
+func (s *Session) synchronizeParallelStmts(ctx context.Context) error {
+	if errs := s.parallelizeQueue.Wait(); len(errs) > 0 {
+		s.TxnState.mu.Lock()
+		defer s.TxnState.mu.Unlock()
+
+		// Check that all errors are retryable. If any are not, return the
+		// first non-retryable error.
+		var retryErr *roachpb.HandledRetryableTxnError
+		for _, err := range errs {
+			switch t := err.(type) {
+			case *roachpb.HandledRetryableTxnError:
+				// Ignore retryable errors to previous incarnations of this transaction.
+				curTxn := s.TxnState.mu.txn.Proto()
+				errTxn := t.Transaction
+				if errTxn.ID == curTxn.ID && errTxn.Epoch == curTxn.Epoch {
+					retryErr = t
+				}
+			case *roachpb.UntrackedTxnError:
+				// Symptom of concurrent retry, ignore.
+			case *roachpb.TxnPrevAttemptError:
+				// Symptom of concurrent retry, ignore.
+			default:
+				return err
+			}
+		}
+
+		if retryErr == nil {
+			log.Fatalf(ctx, "found symptoms of a concurrent retry, but did "+
+				"not find the final retry error: %v", errs)
+		}
+
+		// If all errors are retryable, we return the one meant for the current
+		// incarnation of this transaction. Before doing so though, we need to bump
+		// the transaction epoch to invalidate any writes performed by any workers
+		// after the retry updated the txn's proto but before we synchronized (some
+		// of these writes might have been performed at the wrong epoch). Note
+		// that we don't need to lock the client.Txn because we're synchronized.
+		// See #17197.
+		s.TxnState.mu.txn.Proto().BumpEpoch()
+		return retryErr
+	}
+	return nil
 }
 
 // MaxSQLBytes is the maximum length in bytes of SQL statements serialized
@@ -685,13 +822,12 @@ func (s *Session) serialize() serverpb.Session {
 	var kvTxnID *uuid.UUID
 	txn := s.TxnState.mu.txn
 	if txn != nil {
-		kvTxnID = txn.ID()
+		id := txn.ID()
+		kvTxnID = &id
 	}
 
 	activeQueries := make([]serverpb.ActiveQuery, 0, len(s.mu.ActiveQueries))
-
-	for query := range s.mu.ActiveQueries {
-		sql := query.stmt.String()
+	truncateSQL := func(sql string) string {
 		if len(sql) > MaxSQLBytes {
 			sql = sql[:MaxSQLBytes-utf8.RuneLen('…')]
 			// Ensure the resulting string is valid utf8.
@@ -703,12 +839,22 @@ func (s *Session) serialize() serverpb.Session {
 			}
 			sql += "…"
 		}
+		return sql
+	}
+
+	for id, query := range s.mu.ActiveQueries {
+		sql := truncateSQL(query.stmt.String())
 		activeQueries = append(activeQueries, serverpb.ActiveQuery{
+			ID:            id.String(),
 			Start:         query.start.UTC(),
 			Sql:           sql,
 			IsDistributed: query.isDistributed,
 			Phase:         (serverpb.ActiveQuery_Phase)(query.phase),
 		})
+	}
+	lastActiveQuery := ""
+	if s.mu.LastActiveQuery != nil {
+		lastActiveQuery = truncateSQL(s.mu.LastActiveQuery.String())
 	}
 
 	return serverpb.Session{
@@ -718,6 +864,7 @@ func (s *Session) serialize() serverpb.Session {
 		Start:           s.phaseTimes[sessionInit].UTC(),
 		ActiveQueries:   activeQueries,
 		KvTxnID:         kvTxnID,
+		LastActiveQuery: lastActiveQuery,
 	}
 }
 
@@ -733,22 +880,32 @@ const (
 	// queries.
 	NoTxn TxnStateEnum = iota
 
-	// A txn is in scope, and we're currently executing statements from the first
-	// batch of statements using the transaction. If BEGIN was the last (or the
-	// only) statement in a batch, that batch doesn't count (the next batch will
-	// be considered the first one). The first batch of statements can be
-	// automatically retried in case of retryable errors since there's been no
-	// client logic relying on reads performed in the transaction.
+	// Like Open, a txn is in scope. The difference is that, while in the
+	// AutoRetry state, a retriable error will be handled by an automatic
+	// transaction retry, whereas we can't do that in Open. There's a caveat -
+	// even if we're in AutoRetry, we can't do automatic retries if any
+	// results for statements in the current transaction have already been
+	// delivered to the client.
+	// In principle, we can do automatic retries for the first batch of statements
+	// in a transaction. There is an extension to the rule, though: for
+	// example, is we get a batch with "BEGIN; SET TRANSACTION ISOLATION LEVEL
+	// foo; SAVEPOINT cockroach_restart;" followed by a 2nd batch, we can
+	// automatically retry the 2nd batch even though the statements in the first
+	// batch will not be executed again and their results have already been sent
+	// to the clients. We can do this because some statements are special in that
+	// their execution always generates exactly the same results to the consumer
+	// (i.e. the SQL client).
 	//
-	// A BEGIN statement makes the transaction enter this state (from a previous
-	// NoTxn state). The end of the first batch of statements, if executed
-	// successfully, will move the state to Open.
-	//
-	// TODO(andrei): It'd be cool if exiting this state would be based not on
-	// batches sent by the client, but results being sent by the server to the
-	// client (i.e. the client can send 100 batches but, if we haven't sent it any
-	// results yet, we know that we can still retry them all).
-	FirstBatch
+	// TODO(andrei): This state shouldn't exist; the decision about whether we can
+	// retry automatically or not should be entirely dynamic, based on which
+	// results we've delivered to the client already. It should have nothing to do
+	// with the client's batching of statements. For example, the client can send
+	// 100 batches but, if we haven't sent it any results yet, we should still be
+	// able to retry them all). Currently the splitting into batches is relevant
+	// because we don't keep track of statements from previous batches, so we
+	// would not be capable of retrying them even if we knew that no results have
+	// been delivered.
+	AutoRetry
 
 	// A txn is in scope.
 	Open
@@ -766,7 +923,7 @@ const (
 
 // Some states mean that a client.Txn is open, others don't.
 func (s TxnStateEnum) kvTxnIsOpen() bool {
-	return s == Open || s == FirstBatch || s == RestartWait
+	return s == Open || s == AutoRetry || s == RestartWait
 }
 
 // txnState contains state associated with an ongoing SQL txn.
@@ -780,7 +937,7 @@ type txnState struct {
 	//
 	// NOTE: Only state updates that are inconsequential to statement execution
 	// are allowed concurrently with the execution of the parallizeQueue (e.g.
-	// Open->FirstBatch).
+	// Open->AutoRetry).
 	state TxnStateEnum
 
 	// Mutable fields accessed from goroutines not synchronized by this txn's session,
@@ -794,8 +951,17 @@ type txnState struct {
 		txn *client.Txn
 	}
 
+	// If we're in a SQL txn, txnResults is the ResultsGroup that statements in
+	// this transaction should write results to.
+	txnResults ResultsGroup
+
 	// Ctx is the context for everything running in this SQL txn.
 	Ctx context.Context
+
+	// cancel is the cancellation function for the above context. Called upon
+	// COMMIT/ROLLBACK of the transaction to release resources associated with
+	// the context. nil when no txn is in progress.
+	cancel context.CancelFunc
 
 	// implicitTxn if set if the transaction was automatically created for a
 	// single statement.
@@ -804,11 +970,6 @@ type txnState struct {
 	// If set, the user declared the intention to retry the txn in case of retriable
 	// errors. The txn will enter a RestartWait state in case of such errors.
 	retryIntent bool
-
-	// The transaction will be retried in case of retriable error. The retry will be
-	// automatic (done by Txn.Exec()). This field behaves the same as retryIntent,
-	// except it's reset in between client round trips.
-	autoRetry bool
 
 	// A COMMIT statement has been processed. Useful for allowing the txn to
 	// survive retriable errors if it will be auto-retried (BEGIN; ... COMMIT; in
@@ -834,7 +995,7 @@ type txnState struct {
 	// planNode in the midst of performing a computation. We
 	// host this here instead of TxnState because TxnState is
 	// fully reset upon each call to resetForNewSQLTxn().
-	mon mon.MemoryMonitor
+	mon mon.BytesMonitor
 }
 
 // State returns the current state of the session.
@@ -850,7 +1011,7 @@ func (ts *txnState) SetState(val TxnStateEnum) {
 // TxnIsOpen returns true if we are presently inside a SQL txn, and the txn is
 // not in an error state.
 func (ts *txnState) TxnIsOpen() bool {
-	return ts.State() == Open || ts.State() == FirstBatch
+	return ts.State() == Open || ts.State() == AutoRetry
 }
 
 // resetForNewSQLTxn (re)initializes the txnState for a new transaction.
@@ -873,18 +1034,18 @@ func (ts *txnState) resetForNewSQLTxn(
 	isolation enginepb.IsolationType,
 	priority roachpb.UserPriority,
 ) {
-	if ts.sp != nil {
-		panic(fmt.Sprintf("txnState.reset() called on ts with active span. How come "+
-			"finishSQLTxn() wasn't called previously? ts: %+v", ts))
+	if ts.sp != nil || ts.txnResults != nil {
+		log.Fatalf(s.Ctx(),
+			"txnState.reset() called on ts with active span or active txnResults. "+
+				"How come finishSQLTxn() wasn't called previously? ts: %+v", ts)
 	}
 
 	ts.retryIntent = retryIntent
 	// Reset state vars to defaults.
-	ts.autoRetry = true
 	ts.commitSeen = false
 	ts.sqlTimestamp = sqlTimestamp
-
 	ts.implicitTxn = implicitTxn
+	ts.txnResults = s.ResultsWriter.NewResultsGroup()
 
 	// Create a context for this transaction. It will include a
 	// root span that will contain everything executed as part of the
@@ -919,9 +1080,10 @@ func (ts *txnState) resetForNewSQLTxn(
 	// and the two calls trample each other. We should figure out how to get
 	// traceTxnThreshold and debugTrace7881Enabled to integrate more nicely with
 	// session tracing.
-	if !s.Tracing.Enabled() && (traceTxnThreshold.Get() > 0 || debugTrace7881Enabled) {
+	st := s.execCfg.Settings
+	if !s.Tracing.Enabled() && (traceTxnThreshold.Get(&st.SV) > 0 || debugTrace7881Enabled) {
 		mode := tracing.SingleNodeRecording
-		if traceTxnThreshold.Get() > 0 {
+		if traceTxnThreshold.Get(&st.SV) > 0 {
 			mode = tracing.SnowballRecording
 		}
 		tracing.StartRecording(sp, mode)
@@ -935,14 +1097,14 @@ func (ts *txnState) resetForNewSQLTxn(
 	}
 
 	ts.sp = sp
-	ts.Ctx = ctx
-	ts.SetState(FirstBatch)
+	ts.Ctx, ts.cancel = contextutil.WithCancel(ctx)
+	ts.SetState(AutoRetry)
 	s.Tracing.onNewSQLTxn(ts.sp)
 
 	ts.mon.Start(ctx, &s.mon, mon.BoundAccount{})
 
 	ts.mu.Lock()
-	ts.mu.txn = client.NewTxn(e.cfg.DB)
+	ts.mu.txn = client.NewTxn(e.cfg.DB, e.cfg.NodeID.Get())
 	ts.mu.Unlock()
 	if ts.implicitTxn {
 		ts.mu.txn.SetDebugName(sqlImplicitTxnName)
@@ -963,7 +1125,7 @@ func (ts *txnState) resetForNewSQLTxn(
 // willBeRetried returns true if the SQL transaction is going to be retried
 // because of err.
 func (ts *txnState) willBeRetried() bool {
-	return ts.autoRetry || ts.retryIntent
+	return ts.State() == AutoRetry || ts.retryIntent
 }
 
 // resetStateAndTxn moves the txnState into a specified state, as a result of
@@ -974,7 +1136,7 @@ func (ts *txnState) resetStateAndTxn(state TxnStateEnum) {
 	}
 	if ts.mu.txn != nil && !ts.mu.txn.IsFinalized() {
 		panic(fmt.Sprintf(
-			"attempting to move SQL txn to state %v inconsistent with KV txn state: %s "+
+			"attempting to move SQL txn to state %s inconsistent with KV txn state: %s "+
 				"(finalized: false)", state, ts.mu.txn.Proto().Status))
 	}
 	ts.SetState(state)
@@ -983,13 +1145,23 @@ func (ts *txnState) resetStateAndTxn(state TxnStateEnum) {
 	ts.mu.Unlock()
 }
 
-// finishSQLTxn closes the root span for the current SQL txn.  This needs to be
-// called before resetForNewSQLTxn() is called for starting another SQL txn.
+// finishSQLTxn finalizes a transaction's results and closes the root span for
+// the current SQL txn. This needs to be called before resetForNewSQLTxn() is
+// called for starting another SQL txn.
 func (ts *txnState) finishSQLTxn(s *Session) {
 	ts.mon.Stop(ts.Ctx)
+	if ts.cancel != nil {
+		ts.cancel()
+		ts.cancel = nil
+	}
 	if ts.sp == nil {
 		panic("No span in context? Was resetForNewSQLTxn() called previously?")
 	}
+
+	// Finalize the transaction's results.
+	ts.txnResults.Close()
+	ts.txnResults = nil
+
 	sampledFor7881 := (ts.sp.BaggageItem(keyFor7881Sample) != "")
 	ts.sp.Finish()
 	if err := s.Tracing.onFinishSQLTxn(ts.sp); err != nil {
@@ -997,7 +1169,7 @@ func (ts *txnState) finishSQLTxn(s *Session) {
 	}
 	// TODO(andrei): we should find a cheap way to get a trace's duration without
 	// calling the expensive GetRecording().
-	durThreshold := traceTxnThreshold.Get()
+	durThreshold := traceTxnThreshold.Get(&s.execCfg.Settings.SV)
 	if sampledFor7881 || durThreshold > 0 {
 		if r := tracing.GetRecording(ts.sp); r != nil {
 			if sampledFor7881 || (durThreshold > 0 && timeutil.Since(ts.sqlTimestamp) >= durThreshold) {
@@ -1015,29 +1187,66 @@ func (ts *txnState) finishSQLTxn(s *Session) {
 }
 
 // updateStateAndCleanupOnErr updates txnState based on the type of error that we
-// received. If it's a retriable error and we're going to retry the txn,
-// then the state moves to RestartWait. Otherwise, the state moves to Aborted
-// and the KV txn is cleaned up.
-func (ts *txnState) updateStateAndCleanupOnErr(err error, e *Executor) {
+// received. If it's a retriable error and it looks like we're going to retry
+// the txn (we're either in the AutoRetry state, meaning that we can do
+// auto-retries, or the client is doing client-directed retries), then the state
+// moves to RestartWait. Otherwise, the state moves to Aborted and the KV txn is
+// cleaned up.
+// Note that even if we move to RestartWait here, this doesn't automatically
+// mean that we're going to auto-retry. It might be the case, for example, that
+// we've already streamed results to the client and so we can't auto-retry for
+// that reason. It is the responsibility of higher layers to catch this and
+// terminate the transaction, if appropriate.
+//
+// This method always returns an error. Usually it's the input err, except that
+// a retriable error meant for another txn is replaced with a non-retriable
+// error because higher layers are not supposed to consider it retriable.
+func (ts *txnState) updateStateAndCleanupOnErr(err error, e *Executor) error {
 	if err == nil {
 		panic("updateStateAndCleanupOnErr called with no error")
 	}
+	if ts.mu.txn == nil {
+		panic(fmt.Sprintf(
+			"updateStateAndCleanupOnErr called in state with no KV txn. State: %s",
+			ts.State()))
+	}
 	if retErr, ok := err.(*roachpb.HandledRetryableTxnError); !ok ||
 		!ts.willBeRetried() ||
-		!ts.mu.txn.IsRetryableErrMeantForTxn(*retErr) {
+		!ts.mu.txn.IsRetryableErrMeantForTxn(*retErr) ||
+		// If we ran a COMMIT, then we can only do auto-retries, not client-directed
+		// retries.
+		(ts.commitSeen && ts.State() != AutoRetry) {
 
 		// We can't or don't want to retry this txn, so the txn is over.
 		e.TxnAbortCount.Inc(1)
+
+		// If we got a retriable error but it was meant for another txn, we'll
+		// return a non-retriable error instead further down. We need to identify
+		// this here, before the call to ts.resetStateAndTxn().
+		var retriableErrForAnotherTxn bool
+		txnID := ts.mu.txn.Proto().ID
+		if ok && !ts.mu.txn.IsRetryableErrMeantForTxn(*retErr) {
+			retriableErrForAnotherTxn = true
+		}
+
 		// This call rolls back a PENDING transaction and cleans up all its
 		// intents.
 		ts.mu.txn.CleanupOnError(ts.Ctx, err)
 		ts.resetStateAndTxn(Aborted)
+
+		if retriableErrForAnotherTxn {
+			return errors.Wrapf(
+				retErr,
+				"retryable error from another txn. Current txn ID: %v", txnID)
+		}
 	} else {
 		// If we got a retriable error, move the SQL txn to the RestartWait state.
 		// Note that TransactionAborted is also a retriable error, handled here;
 		// in this case cleanup for the txn has been done for us under the hood.
 		ts.SetState(RestartWait)
+		ts.mu.txn.ResetDeadline()
 	}
+	return err
 }
 
 func (ts *txnState) setIsolationLevel(isolation enginepb.IsolationType) error {
@@ -1056,6 +1265,25 @@ func (ts *txnState) setPriority(userPriority roachpb.UserPriority) error {
 	return nil
 }
 
+// isSerializableRestart returns true if the KV transaction is serializable and
+// its timestamp has been pushed. Used to detect whether the SQL txn will be
+// allowed to commit.
+//
+// Note that this method allows for false negatives: sometimes the client only
+// figures out that it's been pushed when it sends an EndTransaction - i.e. it's
+// possible for the txn to have been pushed asynchoronously by some other
+// operation (usually, but not exclusively, by a high-priority txn with
+// conflicting writes).
+func (ts *txnState) isSerializableRestart() bool {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	txn := ts.mu.txn
+	if txn == nil {
+		return false
+	}
+	return txn.IsSerializableRestart()
+}
+
 type schemaChangerCollection struct {
 	// A schemaChangerCollection accumulates schemaChangers from potentially
 	// multiple user requests, part of the same SQL transaction. We need to
@@ -1063,15 +1291,10 @@ type schemaChangerCollection struct {
 	// from, so we can map failures back to the statement that produced them.
 	curGroupNum int
 
-	// The index of the current statement, relative to its group. For statements
-	// that have been received from the client in the same batch, the
-	// group consists of all statements in the same transaction.
-	curStatementIdx int
 	// schema change callbacks together with the index of the statement
 	// that enqueued it (within its group of statements).
 	schemaChangers []struct {
 		epoch int
-		idx   int
 		sc    SchemaChanger
 	}
 }
@@ -1081,9 +1304,8 @@ func (scc *schemaChangerCollection) queueSchemaChanger(schemaChanger SchemaChang
 		scc.schemaChangers,
 		struct {
 			epoch int
-			idx   int
 			sc    SchemaChanger
-		}{scc.curGroupNum, scc.curStatementIdx, schemaChanger})
+		}{scc.curGroupNum, schemaChanger})
 }
 
 // execSchemaChanges releases schema leases and runs the queued
@@ -1091,21 +1313,15 @@ func (scc *schemaChangerCollection) queueSchemaChanger(schemaChanger SchemaChang
 // scheduling the schema change has finished.
 //
 // The list of closures is cleared after (attempting) execution.
-//
-// Args:
-//  results: The results from all statements in the group that scheduled the
-//    schema changes we're about to execute. Results corresponding to the
-//    schema change statements will be changed in case an error occurs.
 func (scc *schemaChangerCollection) execSchemaChanges(
-	ctx context.Context, e *Executor, session *Session, results ResultList,
-) {
-	// Release the leases once a transaction is complete.
-	session.tables.releaseTables(ctx)
+	ctx context.Context, e *Executor, session *Session,
+) error {
 	if e.cfg.SchemaChangerTestingKnobs.SyncFilter != nil {
 		e.cfg.SchemaChangerTestingKnobs.SyncFilter(TestingSchemaChangerCollection{scc})
 	}
 	// Execute any schema changes that were scheduled, in the order of the
 	// statements that scheduled them.
+	var firstError error
 	for _, scEntry := range scc.schemaChangers {
 		sc := &scEntry.sc
 		sc.db = *e.cfg.DB
@@ -1113,7 +1329,7 @@ func (scc *schemaChangerCollection) execSchemaChanges(
 		sc.distSQLPlanner = e.distSQLPlanner
 		for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
 			evalCtx := createSchemaChangeEvalCtx(e.cfg.Clock.Now())
-			if err := sc.exec(ctx, evalCtx); err != nil {
+			if err := sc.exec(ctx, true /* inSession */, evalCtx); err != nil {
 				if shouldLogSchemaChangeError(err) {
 					log.Warningf(ctx, "error executing schema change: %s", err)
 				}
@@ -1127,8 +1343,8 @@ func (scc *schemaChangerCollection) execSchemaChanges(
 					// There's also another subtlety: we can only report results for
 					// statements in the current batch; we can't modify the results of older
 					// statements.
-					if scEntry.epoch == scc.curGroupNum {
-						results[scEntry.idx] = Result{Err: err}
+					if scEntry.epoch == scc.curGroupNum && firstError == nil {
+						firstError = err
 					}
 				} else {
 					// retryable error.
@@ -1139,6 +1355,7 @@ func (scc *schemaChangerCollection) execSchemaChanges(
 		}
 	}
 	scc.schemaChangers = scc.schemaChangers[:0]
+	return firstError
 }
 
 // maybeRecover catches SQL panics and does some log reporting before
@@ -1166,7 +1383,7 @@ func (s *Session) maybeRecover(action, stmt string) {
 	}
 }
 
-// SessionTracing holds the state used by SET TRACE {ON,OFF,LOCAL} statements in
+// SessionTracing holds the state used by SET TRACING {ON,OFF,LOCAL} statements in
 // the context of one SQL session.
 // It holds the current trace being collected (or the last trace collected, if
 // tracing is not currently ongoing).
@@ -1190,7 +1407,7 @@ type SessionTracing struct {
 
 	// txnRecording accumulates the recorded spans. Each []RawSpan represents the
 	// trace of a SQL transaction. The first element corresponds to the
-	// partially-recorded transaction in which SET TRACE ON was run (or its
+	// partially-recorded transaction in which SET TRACING ON was run (or its
 	// implicit txn, if there wasn't a SQL transaction already running). The last
 	// one will contain the partial-recording of the transaction in which SET
 	// TRACE OFF has been run.
@@ -1203,7 +1420,12 @@ type SessionTracing struct {
 // span that have already been created will not be traced).
 //
 // StopTracing() needs to be called to finish this trace.
-func (st *SessionTracing) StartTracing(recType tracing.RecordingType, traceKV bool) error {
+//
+// Args:
+// kvTracingEnabled: If set, the traces will also include "KV trace" messages -
+//   verbose messages around the interaction of SQL with KV. Some of the messages
+//   are per-row.
+func (st *SessionTracing) StartTracing(recType tracing.RecordingType, kvTracingEnabled bool) error {
 	if st.enabled {
 		return errors.Errorf("already tracing")
 	}
@@ -1217,7 +1439,7 @@ func (st *SessionTracing) StartTracing(recType tracing.RecordingType, traceKV bo
 
 	tracing.StartRecording(sp, recType)
 	st.enabled = true
-	st.kvTracingEnabled = traceKV
+	st.kvTracingEnabled = kvTracingEnabled
 	st.recordingType = recType
 	return nil
 }

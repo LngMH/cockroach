@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
@@ -102,13 +100,17 @@ func TestEval(t *testing.T) {
 		{`0xa`, `10`},
 		{`0xcafe1111`, `3405648145`},
 		// Hexadecimal bytes literals.
-		{`x'636174'`, `b'cat'`},
-		{`X'636174'`, `b'cat'`},
+		{`x'636174'`, `'\x636174'`},
+		{`X'636174'`, `'\x636174'`},
 		{`x'636174'::string`, `'cat'`},
+		{`e'\\x636174'::BYTES`, `'\x636174'`},
+		{`e'\\X636174'::BYTES`, `'\x636174'`},
+		{`e'\\x636174'::STRING::BYTES`, `'\x636174'`},
+		{`e'\\x636174'::STRING`, `e'\\x636174'`},
 		// String concatenation.
 		{`'a' || 'b'`, `'ab'`},
 		{`'a' || (1 + 2)::char`, `'a3'`},
-		{`b'hello' || 'world'`, `b'helloworld'`},
+		{`b'hello' || 'world'`, `'\x68656c6c6f776f726c64'`},
 		// Bit shift operators.
 		{`1 << 2`, `4`},
 		{`4 >> 2`, `1`},
@@ -546,8 +548,11 @@ func TestEval(t *testing.T) {
 		{`1::boolean`, `true`},
 		{`0::boolean`, `false`},
 		{`1::int`, `1`},
+		{`'1'::int`, `1`},
 		{`1::float`, `1.0`},
+		{`'1'::float`, `1.0`},
 		{`1::decimal`, `1`},
+		{`'1'::decimal`, `1`},
 		{`length(123::text)`, `3`},
 		{`1.1::boolean`, `true`},
 		{`0.0::boolean`, `false`},
@@ -569,13 +574,15 @@ func TestEval(t *testing.T) {
 		{`-1.5::int`, `-2`},
 		{`-2.5::int`, `-3`},
 		{`1.1::float`, `1.1`},
+		{`'1.1'::float`, `1.1`},
 		{`-1e+06::float`, `-1e+06`},
 		{`-9.99999e+05`, `-999999`},
 		{`999999.0`, `999999.0`},
 		{`1000000.0`, `1000000.0`},
-		{`-1e+06`, `-1000000`},
+		{`-1e+06`, `-1E+6`},
 		{`-9.99999e+05::decimal`, `-999999`},
 		{`999999.0::decimal`, `999999.0`},
+		{`'999999.0'::decimal`, `999999.0`},
 		{`1000000.0::decimal`, `1000000.0`},
 		{`length(1.23::text)`, `4`},
 		{`'t'::boolean`, `true`},
@@ -599,9 +606,9 @@ func TestEval(t *testing.T) {
 		{`CAST('123' AS int) + 1`, `124`},
 		{`CAST(NULL AS int)`, `NULL`},
 		{`'hello'::char(2)`, `'he'`},
-		{`'hello'::bytes`, `b'hello'`},
+		{`'hello'::bytes`, `'\x68656c6c6f'`},
 		{`b'hello'::string`, `'hello'`},
-		{`b'\xff'`, `b'\xff'`},
+		{`b'\xff'`, `'\xff'`},
 		{`123::text`, `'123'`},
 		{`date '2010-09-28'`, `'2010-09-28'`},
 		{`CAST('2010-09-28' AS date)`, `'2010-09-28'`},
@@ -626,7 +633,7 @@ func TestEval(t *testing.T) {
 		{`('2010-09-28'::date)::timestamp`, `'2010-09-28 00:00:00+00:00'`},
 		{`'2010-09-28 12:00:00.1-04'::timestamp`, `'2010-09-28 16:00:00.1+00:00'`},
 		{`'2010-09-28 12:00:00.1-04'::timestamp::text`, `'2010-09-28 16:00:00.1+00:00'`},
-		{`'2010-09-28 12:00:00.1-04'::timestamptz::text`, `'2010-09-28 16:00:00.1+00:00'`},
+		{`'2010-09-28 12:00:00.1-04'::timestamptz::text`, `'2010-09-28 12:00:00.1-04:00'`},
 		{`'12h2m1s23ms'::interval`, `'12h2m1s23ms'`},
 		{`'12h2m1s23ms'::interval::text`, `'12h2m1s23ms'`},
 		{`interval '1'`, `'1s'`},
@@ -666,7 +673,7 @@ func TestEval(t *testing.T) {
 		{`10123456::int::interval`, `'10s123ms456µs'`},
 		// Type annotation expressions.
 		{`ANNOTATE_TYPE('s', string)`, `'s'`},
-		{`ANNOTATE_TYPE('s', bytes)`, `b's'`},
+		{`ANNOTATE_TYPE('s', bytes)`, `'\x73'`},
 		{`ANNOTATE_TYPE('2010-09-28', date)`, `'2010-09-28'`},
 		{`ANNOTATE_TYPE('PT12H2M', interval)`, `'12h2m'`},
 		{`ANNOTATE_TYPE('2 02:12', interval)`, `'2d2h12m'`},
@@ -719,7 +726,7 @@ func TestEval(t *testing.T) {
 		{`extract_duration(millisecond from '20s30ms40µs'::interval)`, `20030`},
 		{`extract_duration(microsecond from '12345ns'::interval)`, `12`},
 		// Need two interval ops to verify the return type matches the return struct type.
-		{`'2010-09-28 12:00:00.1-04:00'::timestamptz - '0s'::interval - '0s'::interval`, `'2010-09-28 16:00:00.1+00:00'`},
+		{`'2010-09-28 12:00:00.1-04:00'::timestamptz - '0s'::interval - '0s'::interval`, `'2010-09-28 12:00:00.1-04:00'`},
 		{`'12h2m1s23ms'::interval + '1h'::interval`, `'13h2m1s23ms'`},
 		{`'12 hours 2 minutes 1 second'::interval + '1h'::interval`, `'13h2m1s'`},
 		{`'PT12H2M1S'::interval + '1h'::interval`, `'13h2m1s'`},
@@ -1039,22 +1046,24 @@ func TestEvalError(t *testing.T) {
 		{`'11h2m'::interval / 0`, `division by zero`},
 		{`'11h2m'::interval / 0.0::float`, `division by zero`},
 		{`'???'::bool`,
-			`could not parse '???' as type bool: strconv.ParseBool: parsing "???": invalid syntax`},
+			`could not parse "???" as type bool: strconv.ParseBool: parsing "???": invalid syntax`},
 		{`'foo'::int`,
-			`could not parse 'foo' as type int: strconv.ParseInt: parsing "foo": invalid syntax`},
+			`could not parse "foo" as type int: strconv.ParseInt: parsing "foo": invalid syntax`},
+		{`'3\r2'::int`,
+			`could not parse "3\\r2" as type int: strconv.ParseInt: parsing "3\\r2": invalid syntax`},
 		{`'bar'::float`,
-			`could not parse 'bar' as type float: strconv.ParseFloat: parsing "bar": invalid syntax`},
+			`could not parse "bar" as type float: strconv.ParseFloat: parsing "bar": invalid syntax`},
 		{`'baz'::decimal`,
-			`could not parse 'baz' as type decimal`},
+			`could not parse "baz" as type decimal`},
 		{`'2010-09-28 12:00:00.1q'::date`,
-			`could not parse '2010-09-28 12:00:00.1q' as type date`},
+			`could not parse "2010-09-28 12:00:00.1q" as type date`},
 		{`'2010-09-28 12:00.1 MST'::timestamp`,
-			`could not parse '2010-09-28 12:00.1 MST' as type timestamp`},
+			`could not parse "2010-09-28 12:00.1 MST" as type timestamp`},
 		{`'abcd'::interval`,
-			`could not parse 'abcd' as type interval: interval: missing unit`},
+			`could not parse "abcd" as type interval: interval: missing unit`},
 		{`'1- 2:3:4 9'::interval`,
-			`could not parse '1- 2:3:4 9' as type interval: invalid input syntax for type interval 1- 2:3:4 9`},
-		{`b'\xff\xfe\xfd'::string`, `invalid utf8: "\xff\xfe\xfd"`},
+			`could not parse "1- 2:3:4 9" as type interval: invalid input syntax for type interval 1- 2:3:4 9`},
+		{`e'\\x6sdfsd36174'::BYTES`, `could not parse "\\x6sdfsd36174" as type bytes: encoding/hex: odd length hex string`},
 		{`ARRAY[NULL, ARRAY[1, 2]]`, `multidimensional arrays must have array expressions with matching dimensions`},
 		{`ARRAY[ARRAY[1, 2], NULL]`, `multidimensional arrays must have array expressions with matching dimensions`},
 		{`ARRAY[ARRAY[1, 2], ARRAY[1]]`, `multidimensional arrays must have array expressions with matching dimensions`},
@@ -1088,6 +1097,7 @@ func TestEvalError(t *testing.T) {
 		{`'NaN'::decimal::int`, `integer out of range`},
 		{`'Inf'::float::int`, `integer out of range`},
 		{`'NaN'::float::int`, `integer out of range`},
+		{`'1.1'::int`, `could not parse "1.1" as type int`},
 	}
 	for _, d := range testData {
 		expr, err := ParseExpr(d.expr)
@@ -1198,7 +1208,7 @@ func TestClusterTimestampConversion(t *testing.T) {
 		ts := hlc.Timestamp{WallTime: d.walltime, Logical: d.logical}
 		ctx.SetClusterTimestamp(ts)
 		dec := ctx.GetClusterTimestamp()
-		final := dec.ToStandard()
+		final := dec.Text('f')
 		if final != d.expected {
 			t.Errorf("expected %s, but found %s", d.expected, final)
 		}

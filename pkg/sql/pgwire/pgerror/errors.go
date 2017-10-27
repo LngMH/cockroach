@@ -11,12 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package pgerror
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
@@ -44,17 +43,25 @@ func NewErrorf(code string, format string, args ...interface{}) *Error {
 	}
 }
 
-// AnnotateError adds a prefix to the message of an error, maintaining its pg
-// error code and source if it is a pgerror.Error.
-func AnnotateError(prefix string, err error) error {
-	if e, ok := err.(*Error); ok {
-		return &Error{
-			Message: fmt.Sprintf("%s %v", prefix, e.Message),
-			Code:    e.Code,
-			Source:  e.Source,
-		}
-	}
-	return fmt.Errorf("%s %v", prefix, err)
+// NewDangerousStatementErrorf creates a new Error for "rejected dangerous statements".
+func NewDangerousStatementErrorf(format string, args ...interface{}) *Error {
+	var buf bytes.Buffer
+	buf.WriteString("rejected: ")
+	fmt.Fprintf(&buf, format, args...)
+	buf.WriteString(" (sql_safe_updates = true)")
+	return NewError(CodeWarningError, buf.String())
+}
+
+// SetHintf annotates an Error object with a hint.
+func (pg *Error) SetHintf(f string, args ...interface{}) *Error {
+	pg.Hint = fmt.Sprintf(f, args...)
+	return pg
+}
+
+// SetDetailf annotates an Error object with details.
+func (pg *Error) SetDetailf(f string, args ...interface{}) *Error {
+	pg.Detail = fmt.Sprintf(f, args...)
+	return pg
 }
 
 // makeSrcCtx creates a Error_Source value with contextual information
@@ -79,19 +86,27 @@ func GetPGCause(err error) (*Error, bool) {
 // and a link to the passed issue. Recorded as "#<issue>" in tracking.
 func UnimplementedWithIssueErrorf(issue int, msg string, args ...interface{}) error {
 	feature := fmt.Sprintf("#%d", issue)
-	if len(args) > 0 {
-		msg = fmt.Sprintf(msg, args...)
-	}
-	msg = fmt.Sprintf(
-		"unimplemented: %s (see issue https://github.com/cockroachdb/cockroach/issues/%d)", msg, issue,
-	)
-	return Unimplemented(feature, msg)
+	var buf bytes.Buffer
+	buf.WriteString("unimplemented: ")
+	fmt.Fprintf(&buf, msg, args...)
+	return Unimplemented(
+		feature, buf.String(),
+	).SetHintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
+}
+
+// UnimplementedWithIssueError constructs an error with the given message
+// and a link to the passed issue. Recorded as "#<issue>" in tracking.
+func UnimplementedWithIssueError(issue int, msg string) error {
+	feature := fmt.Sprintf("#%d", issue)
+	return Unimplemented(
+		feature, "unimplemented: "+msg,
+	).SetHintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
 }
 
 // Unimplemented constructs an unimplemented feature error.
 //
 // `feature` is used for tracking, and is not included when the error printed.
-func Unimplemented(feature, msg string) error {
+func Unimplemented(feature, msg string) *Error {
 	err := NewError(CodeFeatureNotSupportedError, msg)
 	err.InternalCommand = feature
 	return err

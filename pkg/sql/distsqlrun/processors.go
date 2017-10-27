@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
@@ -30,25 +28,42 @@ import (
 	"github.com/pkg/errors"
 )
 
-// processor is a common interface implemented by all processors, used by the
+// Processor is a common interface implemented by all processors, used by the
 // higher-level flow orchestration code.
-type processor interface {
+type Processor interface {
+	// OutputTypes returns the column types of the results (that are to be fed
+	// through an output router).
+	OutputTypes() []sqlbase.ColumnType
+
 	// Run is the main loop of the processor.
 	// If wg is non-nil, wg.Done is called before exiting.
 	Run(ctx context.Context, wg *sync.WaitGroup)
 }
 
-// procOutputHelper is a helper type that performs filtering and projection on
+// ProcOutputHelper is a helper type that performs filtering and projection on
 // the output of a processor.
-type procOutputHelper struct {
+type ProcOutputHelper struct {
 	numInternalCols int
 	output          RowReceiver
 	rowAlloc        sqlbase.EncDatumRowAlloc
 
-	filter      *exprHelper
+	filter *exprHelper
+	// renderExprs is set if we have a rendering. Only one of renderExprs and
+	// outputCols can be set.
 	renderExprs []exprHelper
-	renderTypes []sqlbase.ColumnType
-	outputCols  []uint32
+	// outputCols is set if we have a projection. Only one of renderExprs and
+	// outputCols can be set.
+	outputCols []uint32
+
+	// outputTypes is the schema of the rows produced by the processor after
+	// post-processing (i.e. the rows that are pushed through a router).
+	//
+	// If renderExprs is set, these types correspond to the types of those
+	// expressions.
+	// If outpuCols is set, these types correspond to the types of
+	// those columns.
+	// If neither is set, this is the internal schema of the processor.
+	outputTypes []sqlbase.ColumnType
 
 	// offset is the number of rows that are suppressed.
 	offset uint64
@@ -59,10 +74,12 @@ type procOutputHelper struct {
 	rowIdx uint64
 }
 
-// init sets up a procOutputHelper. The types describe the internal schema of
+// Init sets up a ProcOutputHelper. The types describe the internal schema of
 // the processor (as described for each processor core spec); they can be
 // omitted if there is no filtering expression.
-func (h *procOutputHelper) init(
+// Note that the types slice may be stored directly; the caller should not
+// modify it.
+func (h *ProcOutputHelper) Init(
 	post *PostProcessSpec,
 	types []sqlbase.ColumnType,
 	evalCtx *parser.EvalContext,
@@ -93,15 +110,25 @@ func (h *procOutputHelper) init(
 			// nil indicates no projection; use an empty slice.
 			h.outputCols = make([]uint32, 0)
 		}
+		h.outputTypes = make([]sqlbase.ColumnType, len(h.outputCols))
+		for i, c := range h.outputCols {
+			h.outputTypes[i] = types[c]
+		}
 	} else if len(post.RenderExprs) > 0 {
 		h.renderExprs = make([]exprHelper, len(post.RenderExprs))
-		h.renderTypes = make([]sqlbase.ColumnType, len(post.RenderExprs))
+		h.outputTypes = make([]sqlbase.ColumnType, len(post.RenderExprs))
 		for i, expr := range post.RenderExprs {
 			if err := h.renderExprs[i].init(expr, types, evalCtx); err != nil {
 				return err
 			}
-			h.renderTypes[i] = sqlbase.DatumTypeToColumnType(h.renderExprs[i].expr.ResolvedType())
+			colTyp, err := sqlbase.DatumTypeToColumnType(h.renderExprs[i].expr.ResolvedType())
+			if err != nil {
+				return err
+			}
+			h.outputTypes[i] = colTyp
 		}
+	} else {
+		h.outputTypes = types
 	}
 
 	h.offset = post.Offset
@@ -116,7 +143,7 @@ func (h *procOutputHelper) init(
 
 // neededColumns calculates the set of internal processor columns that are
 // actually used by the post-processing stage.
-func (h *procOutputHelper) neededColumns() []bool {
+func (h *ProcOutputHelper) neededColumns() []bool {
 	needed := make([]bool, h.numInternalCols)
 	if h.outputCols == nil && h.renderExprs == nil {
 		// No projection or rendering; all columns are needed.
@@ -150,7 +177,7 @@ func (h *procOutputHelper) neededColumns() []bool {
 	return needed
 }
 
-// emitHelper is a utility wrapper on top of procOutputHelper.emitRow().
+// emitHelper is a utility wrapper on top of ProcOutputHelper.EmitRow().
 // It takes a row to emit and, if anything happens other than the normal
 // situation where the emitting succeeds and the consumer still needs rows, both
 // the (potentially many) inputs and the output are properly closed after
@@ -158,8 +185,8 @@ func (h *procOutputHelper) neededColumns() []bool {
 // which case nothing will be drained (this can happen when the caller has
 // already fully consumed the inputs).
 //
-// As opposed to emitRow(), this also supports metadata rows which bypass the
-// procOutputHelper and are routed directly to its output.
+// As opposed to EmitRow(), this also supports metadata rows which bypass the
+// ProcOutputHelper and are routed directly to its output.
 //
 // If the consumer signals the producer to drain, the message is relayed and all
 // the draining metadata is consumed and forwarded.
@@ -170,7 +197,7 @@ func (h *procOutputHelper) neededColumns() []bool {
 // both the inputs and the output have been properly closed.
 func emitHelper(
 	ctx context.Context,
-	output *procOutputHelper,
+	output *ProcOutputHelper,
 	row sqlbase.EncDatumRow,
 	meta ProducerMetadata,
 	inputs ...RowSource,
@@ -178,20 +205,19 @@ func emitHelper(
 	var consumerStatus ConsumerStatus
 	if !meta.Empty() {
 		if row != nil {
-			log.Fatalf(ctx, "both row data and metadata in the same emitHelper call. "+
-				"row: %s. meta: %+v", row, meta)
+			panic("both row data and metadata in the same emitHelper call")
 		}
-		// Bypass emitRow() and send directly to output.output.
+		// Bypass EmitRow() and send directly to output.output.
 		consumerStatus = output.output.Push(nil /* row */, meta)
 	} else {
 		var err error
-		consumerStatus, err = output.emitRow(ctx, row)
+		consumerStatus, err = output.EmitRow(ctx, row)
 		if err != nil {
 			output.output.Push(nil /* row */, ProducerMetadata{Err: err})
 			for _, input := range inputs {
 				input.ConsumerClosed()
 			}
-			output.close()
+			output.Close()
 			return false
 		}
 	}
@@ -207,7 +233,7 @@ func emitHelper(
 		for _, input := range inputs {
 			input.ConsumerClosed()
 		}
-		output.close()
+		output.Close()
 		return false
 	default:
 		log.Fatalf(ctx, "unexpected consumerStatus: %d", consumerStatus)
@@ -215,15 +241,15 @@ func emitHelper(
 	}
 }
 
-// emitRow sends a row through the post-processing stage. The same row can be
+// EmitRow sends a row through the post-processing stage. The same row can be
 // reused.
 //
 // It returns the consumer's status that was observed when pushing this row. If
-// an error is returned, it's coming from the procOutputHelper's filtering or
+// an error is returned, it's coming from the ProcOutputHelper's filtering or
 // rendering processing; the output has not been closed.
 //
 // Note: check out emitHelper() for a useful wrapper.
-func (h *procOutputHelper) emitRow(
+func (h *ProcOutputHelper) EmitRow(
 	ctx context.Context, row sqlbase.EncDatumRow,
 ) (ConsumerStatus, error) {
 	if h.rowIdx >= h.maxRowIdx {
@@ -237,7 +263,7 @@ func (h *procOutputHelper) emitRow(
 		}
 		if !passes {
 			if log.V(3) {
-				log.Infof(ctx, "filtered out row %s", row)
+				log.Infof(ctx, "filtered out row %s", row.String(h.filter.types))
 			}
 			return NeedMoreRows, nil
 		}
@@ -256,7 +282,7 @@ func (h *procOutputHelper) emitRow(
 			if err != nil {
 				return ConsumerClosed, err
 			}
-			outRow[i] = sqlbase.DatumToEncDatum(h.renderTypes[i], datum)
+			outRow[i] = sqlbase.DatumToEncDatum(h.outputTypes[i], datum)
 		}
 	} else if h.outputCols != nil {
 		// Projection.
@@ -284,8 +310,18 @@ func (h *procOutputHelper) emitRow(
 	return NeedMoreRows, nil
 }
 
-func (h *procOutputHelper) close() {
+// Close signals to the output that there will be no more rows.
+func (h *ProcOutputHelper) Close() {
 	h.output.ProducerDone()
+}
+
+type processorBase struct {
+	out ProcOutputHelper
+}
+
+// OutputTypes is part of the processor interface.
+func (pb *processorBase) OutputTypes() []sqlbase.ColumnType {
+	return pb.out.outputTypes
 }
 
 // noopProcessor is a processor that simply passes rows through from the
@@ -293,18 +329,19 @@ func (h *procOutputHelper) close() {
 // post-processing or in the last stage of a computation, where we may only
 // need the synchronizer to join streams.
 type noopProcessor struct {
+	processorBase
+
 	flowCtx *FlowCtx
 	input   RowSource
-	out     procOutputHelper
 }
 
-var _ processor = &noopProcessor{}
+var _ Processor = &noopProcessor{}
 
 func newNoopProcessor(
 	flowCtx *FlowCtx, input RowSource, post *PostProcessSpec, output RowReceiver,
 ) (*noopProcessor, error) {
 	n := &noopProcessor{flowCtx: flowCtx, input: input}
-	if err := n.out.init(post, input.Types(), &flowCtx.evalCtx, output); err != nil {
+	if err := n.out.Init(post, input.Types(), &flowCtx.EvalCtx, output); err != nil {
 		return nil, err
 	}
 	return n, nil
@@ -333,7 +370,7 @@ func (n *noopProcessor) Run(ctx context.Context, wg *sync.WaitGroup) {
 		row, meta := n.input.Next()
 		if row == nil && meta.Empty() {
 			sendTraceData(ctx, n.out.output)
-			n.out.close()
+			n.out.Close()
 			return
 		}
 		if !emitHelper(ctx, &n.out, row, meta, n.input) {
@@ -348,7 +385,7 @@ func newProcessor(
 	post *PostProcessSpec,
 	inputs []RowSource,
 	outputs []RowReceiver,
-) (processor, error) {
+) (Processor, error) {
 	if core.Noop != nil {
 		if err := checkNumInOut(inputs, outputs, 1, 1); err != nil {
 			return nil, err
@@ -422,8 +459,34 @@ func newProcessor(
 		}
 		return newAlgebraicSetOp(flowCtx, core.SetOp, inputs[0], inputs[1], post, outputs[0])
 	}
+	if core.ReadCSV != nil {
+		if err := checkNumInOut(inputs, outputs, 0, 1); err != nil {
+			return nil, err
+		}
+		if NewReadCSVProcessor == nil {
+			return nil, errors.New("ReadCSV processor unimplemented")
+		}
+		return NewReadCSVProcessor(flowCtx, *core.ReadCSV, outputs[0])
+	}
+	if core.SSTWriter != nil {
+		if err := checkNumInOut(inputs, outputs, 1, 1); err != nil {
+			return nil, err
+		}
+		if NewSSTWriterProcessor == nil {
+			return nil, errors.New("SSTWriter processor unimplemented")
+		}
+		return NewSSTWriterProcessor(flowCtx, *core.SSTWriter, inputs[0], outputs[0])
+	}
 	return nil, errors.Errorf("unsupported processor core %s", core)
 }
+
+// NewReadCSVProcessor is externally implemented and registered by
+// ccl/sqlccl/csv.go.
+var NewReadCSVProcessor func(*FlowCtx, ReadCSVSpec, RowReceiver) (Processor, error)
+
+// NewSSTWriterProcessor is externally implemented and registered by
+// ccl/sqlccl/csv.go.
+var NewSSTWriterProcessor func(*FlowCtx, SSTWriterSpec, RowSource, RowReceiver) (Processor, error)
 
 // Equals returns true if two aggregation specifiers are identical (and thus
 // will always yield the same result).
@@ -436,7 +499,7 @@ func (a AggregatorSpec_Aggregation) Equals(b AggregatorSpec_Aggregation) bool {
 			return false
 		}
 	} else {
-		if a.FilterColIdx == nil || *a.FilterColIdx != *b.FilterColIdx {
+		if b.FilterColIdx == nil || *a.FilterColIdx != *b.FilterColIdx {
 			return false
 		}
 	}

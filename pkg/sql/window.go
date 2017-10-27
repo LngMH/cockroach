@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package sql
 
@@ -157,7 +155,7 @@ func (n *windowNode) constructWindowDefinitions(
 	// Process each named window specification on the select clause.
 	namedWindowSpecs := make(map[string]*parser.WindowDef, len(sc.Window))
 	for _, windowDef := range sc.Window {
-		name := windowDef.Name.Normalize()
+		name := string(windowDef.Name)
 		if _, ok := namedWindowSpecs[name]; ok {
 			return errors.Errorf("window %q is already defined", name)
 		}
@@ -229,12 +227,12 @@ func constructWindowDef(
 	case def.RefName != "":
 		// SELECT rank() OVER (w) FROM t WINDOW w as (...)
 		// We copy the referenced window specification, and modify it if necessary.
-		refName = def.RefName.Normalize()
+		refName = string(def.RefName)
 		modifyRef = true
 	case def.Name != "":
 		// SELECT rank() OVER w FROM t WINDOW w as (...)
 		// We use the referenced window specification directly, without modification.
-		refName = def.Name.Normalize()
+		refName = string(def.Name)
 	}
 	if refName == "" {
 		return def, nil
@@ -464,32 +462,36 @@ func (n *windowNode) Values() parser.Datums {
 	return n.values.Values()
 }
 
-func (n *windowNode) Start(ctx context.Context) error { return n.plan.Start(ctx) }
+func (n *windowNode) Start(params runParams) error { return n.plan.Start(params) }
 
-func (n *windowNode) Next(ctx context.Context) (bool, error) {
+func (n *windowNode) Next(params runParams) (bool, error) {
 	for !n.populated {
-		next, err := n.plan.Next(ctx)
+		if err := params.p.cancelChecker.Check(); err != nil {
+			return false, err
+		}
+
+		next, err := n.plan.Next(params)
 		if err != nil {
 			return false, err
 		}
 		if !next {
 			n.populated = true
-			if err := n.computeWindows(ctx); err != nil {
+			if err := n.computeWindows(params.ctx); err != nil {
 				return false, err
 			}
-			if err := n.populateValues(ctx); err != nil {
+			if err := n.populateValues(params.ctx); err != nil {
 				return false, err
 			}
 			break
 		}
 
 		values := n.plan.Values()
-		if _, err := n.wrappedRenderVals.AddRow(ctx, values); err != nil {
+		if _, err := n.wrappedRenderVals.AddRow(params.ctx, values); err != nil {
 			return false, err
 		}
 	}
 
-	return n.values.Next(ctx)
+	return n.values.Next(params)
 }
 
 type partitionSorter struct {

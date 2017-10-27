@@ -62,32 +62,44 @@ CREATE TABLE orders (
 statement ok
 ALTER TABLE orders DROP CONSTRAINT fk_product_ref_products
 
-statement error unimplemented at or near "action"
+statement ok
 ALTER TABLE orders ADD FOREIGN KEY (product) REFERENCES products ON DELETE NO ACTION
 
-statement error unimplemented at or near "action"
+statement error pq: columns cannot be used by multiple foreign key constraints
 ALTER TABLE orders ADD FOREIGN KEY (product) REFERENCES products ON UPDATE NO ACTION
 
-statement error unimplemented at or near "cascade"
+statement ok
+ALTER TABLE orders DROP CONSTRAINT fk_product_ref_products
+
+statement ok
+ALTER TABLE orders ADD FOREIGN KEY (product) REFERENCES products ON UPDATE NO ACTION
+
+statement ok
+ALTER TABLE orders DROP CONSTRAINT fk_product_ref_products
+
+statement error pq: unsupported: ON DELETE CASCADE
 ALTER TABLE orders ADD FOREIGN KEY (product) REFERENCES products ON DELETE CASCADE
 
-statement error unimplemented at or near "cascade"
+statement error pq: unsupported: ON UPDATE CASCADE
 ALTER TABLE orders ADD FOREIGN KEY (product) REFERENCES products ON UPDATE CASCADE
 
-statement error unimplemented at or near "null"
+statement error pq: unsupported: ON DELETE SET NULL
 ALTER TABLE orders ADD FOREIGN KEY (product) REFERENCES products ON DELETE SET NULL
 
-statement error unimplemented at or near "null"
+statement error pq: unsupported: ON UPDATE SET NULL
 ALTER TABLE orders ADD FOREIGN KEY (product) REFERENCES products ON UPDATE SET NULL
 
-statement error unimplemented at or near "default"
+statement error pq: unsupported: ON DELETE SET DEFAULT
 ALTER TABLE orders ADD FOREIGN KEY (product) REFERENCES products ON DELETE SET DEFAULT
 
-statement error unimplemented at or near "default"
+statement error pq: unsupported: ON UPDATE SET DEFAULT
 ALTER TABLE orders ADD FOREIGN KEY (product) REFERENCES products ON UPDATE SET DEFAULT
 
-statement error unimplemented at or near "action"
+statement ok
 ALTER TABLE orders ADD FOREIGN KEY (product) REFERENCES products ON DELETE RESTRICT ON UPDATE NO ACTION
+
+statement ok
+ALTER TABLE orders DROP CONSTRAINT fk_product_ref_products
 
 statement ok
 ALTER TABLE orders ADD FOREIGN KEY (product) REFERENCES products ON DELETE RESTRICT ON UPDATE RESTRICT
@@ -100,7 +112,7 @@ CREATE DATABASE "user content"
 
 # "reviews" makes "products" have multiple inbound references, as well as making
 # "orders" have both directions, and makes sure that we're handling escaping and
-# cross-database referenced.
+# cross-database references.
 statement ok
 CREATE TABLE "user content"."customer reviews" (
   id INT PRIMARY KEY,
@@ -130,6 +142,36 @@ INSERT INTO "user content"."customer reviews" (id, product, body) VALUES (2, '79
 
 statement ok
 INSERT INTO "user content"."customer reviews" (id, product, body) VALUES (2, '780', 'would not buy again')
+
+statement ok
+CREATE TABLE "user content".review_stats (
+  id INT PRIMARY KEY,
+  upvotes INT,
+  CONSTRAINT reviewfk FOREIGN KEY (id) REFERENCES "user content"."customer reviews"
+)
+
+query TTTTT
+SHOW CONSTRAINTS FROM "user content".review_stats
+----
+review_stats  primary   PRIMARY KEY  id  NULL
+review_stats  reviewfk  FOREIGN KEY  id  customer reviews.[id]
+
+statement error pgcode 23503 foreign key violation: value \[5\] not found in customer reviews@primary \[id\]
+INSERT INTO "user content".review_stats (id, upvotes) VALUES (5, 1)
+
+statement ok
+INSERT INTO "user content".review_stats (id, upvotes) VALUES (2, 1)
+
+statement error pgcode 23503 foreign key violation: values \[2\] in columns \[id\] referenced in table "review_stats"
+DELETE FROM "user content"."customer reviews" WHERE id = 2
+
+statement ok
+ALTER TABLE "user content".review_stats DROP CONSTRAINT reviewfk
+
+query TTTTT
+SHOW CONSTRAINTS FROM "user content".review_stats
+----
+review_stats  primary   PRIMARY KEY  id  NULL
 
 statement ok
 DELETE FROM "user content"."customer reviews"
@@ -463,7 +505,12 @@ CREATE TABLE refpairs (a INT, b STRING, CONSTRAINT fk FOREIGN KEY (a, b) REFEREN
 
 # TODO(dt): remove ordering constraint on matching index
 statement ok
-CREATE TABLE refpairs_wrong_order (a INT, b STRING, FOREIGN KEY (a, b) REFERENCES pairs (src, dest), INDEX (b, a))
+CREATE TABLE refpairs_wrong_order (
+  a INT,
+  b STRING,
+  FOREIGN KEY (a, b) REFERENCES pairs (src, dest),
+  INDEX (b, a)
+)
 
 query TTBITTBB colnames
 SHOW INDEXES FROM refpairs_wrong_order
@@ -494,7 +541,13 @@ refpairs_c_between  refpairs_c_between_auto_index_fk_a_ref_pairs  false   2    b
 refpairs_c_between  refpairs_c_between_auto_index_fk_a_ref_pairs  false   3    rowid   ASC        false    true
 
 statement ok
-CREATE TABLE refpairs (a INT, b STRING, c INT, FOREIGN KEY (a, b) REFERENCES pairs (src, dest), INDEX (a, b, c))
+CREATE TABLE refpairs (
+  a INT,
+  b STRING,
+  c INT,
+  FOREIGN KEY (a, b) REFERENCES pairs (src, dest) ON UPDATE RESTRICT,
+  INDEX (a, b, c)
+)
 
 query TTBITTBB colnames
 SHOW INDEXES FROM refpairs
@@ -506,17 +559,32 @@ refpairs  refpairs_a_b_c_idx  false   2    b       ASC        false    false
 refpairs  refpairs_a_b_c_idx  false   3    c       ASC        false    false
 refpairs  refpairs_a_b_c_idx  false   4    rowid   ASC        false    true
 
+query TT
+SHOW CREATE TABLE refpairs
+----
+refpairs  CREATE TABLE refpairs (
+    a INT NULL,
+    b STRING NULL,
+    c INT NULL,
+    CONSTRAINT fk_a_ref_pairs FOREIGN KEY (a, b) REFERENCES pairs (src, dest) ON UPDATE RESTRICT,
+    INDEX refpairs_a_b_c_idx (a ASC, b ASC, c ASC),
+    FAMILY "primary" (a, b, c, rowid)
+)
+
 statement error pgcode 23503 foreign key violation: value \[100 'two'\] not found in pairs@pairs_src_dest_key \[src dest\]
 INSERT INTO refpairs VALUES (100, 'two'), (200, 'two')
 
 statement ok
-INSERT INTO refpairs VALUES (100, 'one'), (200, 'two')
+INSERT INTO refpairs VALUES (100, 'one', 3), (200, 'two', null)
 
 statement error pgcode 23503 foreign key violation: values \[200 'two'\] in columns \[src dest\] referenced in table "refpairs"
 UPDATE pairs SET dest = 'too' WHERE id = 2
 
 statement error pgcode 23503 foreign key violation: values \[200 'two'\] in columns \[src dest\] referenced in table "refpairs"
 DELETE FROM pairs WHERE id = 2
+
+statement error pgcode 23503 foreign key violation: values \[100 'one'\] in columns \[src dest\] referenced in table "refpairs"
+DELETE FROM pairs WHERE id = 1
 
 # since PKs are handled differently than other indexes, check pk<->pk ref with no other indexes in play.
 statement ok
@@ -681,58 +749,60 @@ DROP TABLE a
 statement ok
 DROP TABLE b
 
-# A CREATE TABLE with a FK reference within a transaction.
-statement ok
-CREATE TABLE referee (id INT PRIMARY KEY);
-
-statement ok
-BEGIN TRANSACTION
-
-statement ok
-CREATE TABLE refers (
-  a INT REFERENCES referee,
-  b INT,
-  INDEX b_idx (b)
-)
-
-# Add some schema changes within the same transaction to verify that a
-# table that isn't yet public can be modified.
-statement ok
-CREATE INDEX foo ON refers (a)
-
-statement ok
-ALTER INDEX refers@b_idx RENAME TO another_idx
-
-query TT
-SHOW CREATE TABLE refers
-----
-refers  CREATE TABLE refers (
-    a INT NULL,
-    b INT NULL,
-    INDEX another_idx (b ASC),
-    CONSTRAINT fk_a_ref_referee FOREIGN KEY (a) REFERENCES referee (id),
-    INDEX refers_auto_index_fk_a_ref_referee (a ASC),
-    FAMILY "primary" (a, b, rowid)
-)
-
-statement ok
-DROP INDEX refers@another_idx
-
-statement ok
-COMMIT
-
-# CREATE AND DROP a table with a fk in the same transaction.
-statement ok
-BEGIN TRANSACTION
-
-statement ok
-CREATE TABLE refers1 (a INT REFERENCES referee);
-
-statement ok
-DROP TABLE refers1
-
-statement ok
-COMMIT
+# TODO(vivek): uncomment with a fix to #17698
+#
+# # A CREATE TABLE with a FK reference within a transaction.
+# statement ok
+# CREATE TABLE referee (id INT PRIMARY KEY);
+#
+# statement ok
+# BEGIN TRANSACTION
+#
+# statement ok
+# CREATE TABLE refers (
+#   a INT REFERENCES referee,
+#   b INT,
+#   INDEX b_idx (b)
+# )
+#
+# # Add some schema changes within the same transaction to verify that a
+# # table that isn't yet public can be modified.
+# statement ok
+# CREATE INDEX foo ON refers (a)
+#
+# statement ok
+# ALTER INDEX refers@b_idx RENAME TO another_idx
+#
+# query TT
+# SHOW CREATE TABLE refers
+# ----
+# refers  CREATE TABLE refers (
+#     a INT NULL,
+#     b INT NULL,
+#     INDEX another_idx (b ASC),
+#     CONSTRAINT fk_a_ref_referee FOREIGN KEY (a) REFERENCES referee (id),
+#     INDEX refers_auto_index_fk_a_ref_referee (a ASC),
+#     FAMILY "primary" (a, b, rowid)
+# )
+#
+# statement ok
+# DROP INDEX refers@another_idx
+#
+# statement ok
+# COMMIT
+#
+# # CREATE AND DROP a table with a fk in the same transaction.
+# statement ok
+# BEGIN TRANSACTION
+#
+# statement ok
+# CREATE TABLE refers1 (a INT REFERENCES referee);
+#
+# statement ok
+# DROP TABLE refers1
+#
+# statement ok
+# COMMIT
 
 
 statement ok
@@ -773,3 +843,21 @@ ALTER TABLE employee
 
 statement ok
 SHOW CREATE TABLE employee;
+
+# Ensure that tables with an fk reference from their pk appear correctly in
+# SHOW CREATE TABLE (#17596).
+statement ok
+CREATE TABLE pkref_a (a INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE pkref_b (b INT PRIMARY KEY REFERENCES pkref_a ON UPDATE NO ACTION ON DELETE RESTRICT)
+
+query TT
+SHOW CREATE TABLE pkref_b
+----
+pkref_b  CREATE TABLE pkref_b (
+        b INT NOT NULL,
+        CONSTRAINT "primary" PRIMARY KEY (b ASC),
+        CONSTRAINT fk_b_ref_pkref_a FOREIGN KEY (b) REFERENCES pkref_a (a) ON DELETE RESTRICT,
+        FAMILY "primary" (b)
+)

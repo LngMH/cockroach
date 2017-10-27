@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package storage_test
 
@@ -49,7 +47,7 @@ func adminMergeArgs(key roachpb.Key) *roachpb.AdminMergeRequest {
 func createSplitRanges(
 	store *storage.Store,
 ) (*roachpb.RangeDescriptor, *roachpb.RangeDescriptor, *roachpb.Error) {
-	args := adminSplitArgs(roachpb.KeyMin, []byte("b"))
+	args := adminSplitArgs(roachpb.Key("b"))
 	if _, err := client.SendWrapped(context.Background(), rg1(store), args); err != nil {
 		return nil, nil, err
 	}
@@ -330,11 +328,11 @@ func TestStoreRangeMergeNonCollocated(t *testing.T) {
 	store := mtc.stores[0]
 
 	// Split into 3 ranges
-	argsSplit := adminSplitArgs(roachpb.KeyMin, []byte("d"))
+	argsSplit := adminSplitArgs(roachpb.Key("d"))
 	if _, pErr := client.SendWrapped(context.Background(), rg1(store), argsSplit); pErr != nil {
 		t.Fatalf("Can't split range %s", pErr)
 	}
-	argsSplit = adminSplitArgs(roachpb.KeyMin, []byte("b"))
+	argsSplit = adminSplitArgs(roachpb.Key("b"))
 	if _, pErr := client.SendWrapped(context.Background(), rg1(store), argsSplit); pErr != nil {
 		t.Fatalf("Can't split range %s", pErr)
 	}
@@ -442,7 +440,7 @@ func BenchmarkStoreRangeMerge(b *testing.B) {
 	store := createTestStoreWithConfig(b, stopper, storeCfg)
 
 	// Perform initial split of ranges.
-	sArgs := adminSplitArgs(roachpb.KeyMin, []byte("b"))
+	sArgs := adminSplitArgs(roachpb.Key("b"))
 	if _, err := client.SendWrapped(context.Background(), rg1(store), sArgs); err != nil {
 		b.Fatal(err)
 	}

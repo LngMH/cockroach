@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
@@ -95,9 +93,11 @@ func TestFormatStatement(t *testing.T) {
 			`CREATE DATABASE foo TEMPLATE = 'bar{baz}'`},
 
 		{`SET "time zone" = UTC`, FmtSimple,
-			`SET "time zone" = 'utc'`},
+			`SET "time zone" = utc`},
 		{`SET "time zone" = UTC`, FmtBareIdentifiers,
-			`SET time zone = 'utc'`},
+			`SET time zone = utc`},
+		{`SET "time zone" = UTC`, FmtBareStrings,
+			`SET "time zone" = utc`},
 	}
 
 	for i, test := range testData {
@@ -131,11 +131,15 @@ func TestFormatExpr(t *testing.T) {
 		{`'abc'`, FmtShowTypes,
 			`('abc')[string]`},
 		{`b'abc'`, FmtShowTypes,
-			`(b'abc')[bytes]`},
+			`('\x616263')[bytes]`},
 		{`interval '3s'`, FmtShowTypes,
 			`('3s')[interval]`},
 		{`date '2003-01-01'`, FmtShowTypes,
 			`('2003-01-01')[date]`},
+		{`timestamp '2003-01-01 00:00:00'`, FmtShowTypes,
+			`('2003-01-01 00:00:00+00:00')[timestamp]`},
+		{`timestamptz '2003-01-01 00:00:00+03'`, FmtShowTypes,
+			`('2003-01-01 00:00:00+03:00')[timestamptz]`},
 		{`greatest(unique_rowid(), 12)`, FmtShowTypes,
 			`(greatest((unique_rowid())[int], (12)[int]))[int]`},
 
@@ -147,6 +151,13 @@ func TestFormatExpr(t *testing.T) {
 		// escapes when included in array values. #16487
 		// {`ARRAY[e'j\x10k']`, FmtBareStrings,
 		//	 `ARRAY[j\x10k]`},
+
+		{`1`, FmtParsable, "1:::INT"},
+		{`9223372036854775807`, FmtParsable, "9223372036854775807:::INT"},
+		{`9223372036854775808`, FmtParsable, "9223372036854775808:::DECIMAL"},
+		{`-1`, FmtParsable, "(-1):::INT"},
+		{`-9223372036854775808`, FmtParsable, "(-9223372036854775808):::INT"},
+		{`-9223372036854775809`, FmtParsable, "-9223372036854775809:::DECIMAL"},
 
 		{`unique_rowid() + 123`, FmtParsable,
 			`unique_rowid() + 123:::INT`},
@@ -164,6 +175,10 @@ func TestFormatExpr(t *testing.T) {
 			`now() - '2003-01-01 00:00:00+00:00'`},
 		{`now() - timestamp '2003-01-01'`, FmtParsable,
 			`now() - '2003-01-01 00:00:00+00:00':::TIMESTAMP`},
+		{`'+Inf':::DECIMAL + '-Inf':::DECIMAL + 'NaN':::DECIMAL`, FmtParsable,
+			`('Infinity':::DECIMAL + '-Infinity':::DECIMAL) + 'NaN':::DECIMAL`},
+		{`'+Inf':::FLOAT + '-Inf':::FLOAT + 'NaN':::FLOAT`, FmtParsable,
+			`('+Inf':::FLOAT + '-Inf':::FLOAT) + 'NaN':::FLOAT`},
 
 		{`(123:::INT, 123:::DECIMAL)`, FmtCheckEquivalence,
 			`(123:::INT, 123:::DECIMAL)`},

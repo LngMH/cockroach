@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package server
 
@@ -21,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -40,25 +39,30 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 func getAdminJSONProto(
-	ts serverutils.TestServerInterface, path string, response proto.Message,
+	ts serverutils.TestServerInterface, path string, response protoutil.Message,
 ) error {
 	return serverutils.GetJSONProto(ts, adminPrefix+path, response)
 }
 
 func postAdminJSONProto(
-	ts serverutils.TestServerInterface, path string, request, response proto.Message,
+	ts serverutils.TestServerInterface, path string, request, response protoutil.Message,
 ) error {
 	return serverutils.PostJSONProto(ts, adminPrefix+path, request, response)
 }
@@ -66,7 +70,7 @@ func postAdminJSONProto(
 // getText fetches the HTTP response body as text in the form of a
 // byte slice from the specified URL.
 func getText(ts serverutils.TestServerInterface, url string) ([]byte, error) {
-	httpClient, err := ts.GetHTTPClient()
+	httpClient, err := ts.GetAuthenticatedHTTPClient()
 	if err != nil {
 		return nil, err
 	}
@@ -104,6 +108,10 @@ func TestAdminDebugExpVar(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
+
+	// This test accesses the debug pages, which currently use the TODO singleton.
+	st := cluster.MakeTestingClusterSettings()
+	settings.SetCanonicalValuesContainer(&st.SV)
 
 	jI, err := getJSON(s, debugURL(s)+"vars")
 	if err != nil {
@@ -227,7 +235,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
-	ac := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
 	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 	defer span.Finish()
 
@@ -238,12 +246,11 @@ func TestAdminAPIDatabases(t *testing.T) {
 	session.StartUnlimitedMonitor()
 	defer session.Finish(ts.sqlExecutor)
 	query := "CREATE DATABASE " + testdb
-	createRes := ts.sqlExecutor.ExecuteStatements(session, query, nil)
-	defer createRes.Close(ctx)
-
-	if createRes.ResultList[0].Err != nil {
-		t.Fatal(createRes.ResultList[0].Err)
+	createRes, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, query, nil, 1)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer createRes.Close(ctx)
 
 	var resp serverpb.DatabasesResponse
 	if err := getAdminJSONProto(s, "databases", &resp); err != nil {
@@ -266,11 +273,11 @@ func TestAdminAPIDatabases(t *testing.T) {
 	privileges := []string{"SELECT", "UPDATE"}
 	testuser := "testuser"
 	grantQuery := "GRANT " + strings.Join(privileges, ", ") + " ON DATABASE " + testdb + " TO " + testuser
-	grantRes := s.(*TestServer).sqlExecutor.ExecuteStatements(session, grantQuery, nil)
-	defer grantRes.Close(ctx)
-	if grantRes.ResultList[0].Err != nil {
-		t.Fatal(grantRes.ResultList[0].Err)
+	grantRes, err := s.(*TestServer).sqlExecutor.ExecuteStatementsBuffered(session, grantQuery, nil, 1)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer grantRes.Close(ctx)
 
 	var details serverpb.DatabaseDetailsResponse
 	if err := getAdminJSONProto(s, "databases/"+testdb, &details); err != nil {
@@ -364,7 +371,7 @@ func TestAdminAPITableDoesNotExist(t *testing.T) {
 	}
 
 	const badTablePath = "databases/system/tables/" + fakename
-	const tableErrPattern = `table \\"system.` + fakename + `\\" does not exist`
+	const tableErrPattern = `relation \\"system.` + fakename + `\\" does not exist`
 	if err := getAdminJSONProto(s, badTablePath, nil); !testutils.IsError(err, tableErrPattern) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, tableErrPattern)
 	}
@@ -390,7 +397,7 @@ func TestAdminAPITableSQLInjection(t *testing.T) {
 
 	const fakeTable = "users;DROP DATABASE system;"
 	const path = "databases/system/tables/" + fakeTable
-	const errPattern = `table \"system.\\\"` + fakeTable + `\\\"\" does not exist`
+	const errPattern = `relation \"system.` + fakeTable + `\" does not exist`
 	if err := getAdminJSONProto(s, path, nil); !testutils.IsError(err, regexp.QuoteMeta(errPattern)) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, errPattern)
 	}
@@ -414,7 +421,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 			escDBName := parser.Name(tc.dbName).String()
 			escTblName := parser.Name(tc.tblName).String()
 
-			ac := log.AmbientContext{Tracer: tracing.NewTracer()}
+			ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
 			ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 			defer span.Finish()
 
@@ -436,11 +443,11 @@ func TestAdminAPITableDetails(t *testing.T) {
 			}
 
 			for _, q := range setupQueries {
-				res := ts.sqlExecutor.ExecuteStatements(session, q, nil)
-				defer res.Close(ctx)
-				if res.ResultList[0].Err != nil {
-					t.Fatalf("error executing '%s': %s", q, res.ResultList[0].Err)
+				res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, q, nil, 1)
+				if err != nil {
+					t.Fatalf("error executing '%s': %s", q, err)
 				}
+				res.Close(ctx)
 			}
 
 			// Perform API call.
@@ -517,13 +524,13 @@ func TestAdminAPITableDetails(t *testing.T) {
 				const createTableCol = "CreateTable"
 				showCreateTableQuery := fmt.Sprintf("SHOW CREATE TABLE %s.%s", escDBName, escTblName)
 
-				resSet := ts.sqlExecutor.ExecuteStatements(session, showCreateTableQuery, nil)
-				defer resSet.Close(ctx)
-				res := resSet.ResultList[0]
-				if res.Err != nil {
-					t.Fatalf("error executing '%s': %s", showCreateTableQuery, res.Err)
+				resSet, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, showCreateTableQuery, nil, 1)
+				if err != nil {
+					t.Fatalf("error executing '%s': %s", showCreateTableQuery, err)
 				}
+				defer resSet.Close(ctx)
 
+				res := resSet.ResultList[0]
 				scanner := makeResultScanner(res.Columns)
 				var createStmt string
 				if err := scanner.Scan(res.Rows.At(0), createTableCol, &createStmt); err != nil {
@@ -556,7 +563,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	ts := s.(*TestServer)
 
 	// Create database and table.
-	ac := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
 	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 	defer span.Finish()
 	session := sql.NewSession(
@@ -567,11 +574,11 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 		"CREATE TABLE test.tbl (val STRING)",
 	}
 	for _, q := range setupQueries {
-		res := ts.sqlExecutor.ExecuteStatements(session, q, nil)
-		defer res.Close(ctx)
-		if res.ResultList[0].Err != nil {
-			t.Fatalf("error executing '%s': %s", q, res.ResultList[0].Err)
+		res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, q, nil, 1)
+		if err != nil {
+			t.Fatalf("error executing '%s': %s", q, err)
 		}
+		res.Close(ctx)
 	}
 
 	// Function to verify the zone for table "test.tbl" as returned by the Admin
@@ -616,7 +623,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 
 	// Function to store a zone config for a given object ID.
 	setZone := func(zoneCfg config.ZoneConfig, id sqlbase.ID) {
-		zoneBytes, err := zoneCfg.Marshal()
+		zoneBytes, err := protoutil.Marshal(&zoneCfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -624,11 +631,11 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 		params := parser.MakePlaceholderInfo()
 		params.SetValue(`1`, parser.NewDInt(parser.DInt(id)))
 		params.SetValue(`2`, parser.NewDBytes(parser.DBytes(zoneBytes)))
-		res := ts.sqlExecutor.ExecuteStatements(session, query, &params)
-		defer res.Close(ctx)
-		if res.ResultList[0].Err != nil {
-			t.Fatalf("error executing '%s': %s", query, res.ResultList[0].Err)
+		res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, query, &params, 1)
+		if err != nil {
+			t.Fatalf("error executing '%s': %s", query, err)
 		}
+		res.Close(ctx)
 	}
 
 	// Verify zone matches cluster default.
@@ -666,7 +673,7 @@ func TestAdminAPIUsers(t *testing.T) {
 	ts := s.(*TestServer)
 
 	// Create sample users.
-	ac := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
 	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 	defer span.Finish()
 	session := sql.NewSession(
@@ -674,15 +681,13 @@ func TestAdminAPIUsers(t *testing.T) {
 	session.StartUnlimitedMonitor()
 	defer session.Finish(ts.sqlExecutor)
 	query := `
-INSERT INTO system.users (username, hashedPassword)
+INSERT INTO system.users (username, "hashedPassword")
 VALUES ('admin', 'abc'), ('bob', 'xyz')`
-	res := ts.sqlExecutor.ExecuteStatements(session, query, nil)
-	defer res.Close(ctx)
-	if a, e := len(res.ResultList), 1; a != e {
-		t.Fatalf("len(results) %d != %d", a, e)
-	} else if res.ResultList[0].Err != nil {
-		t.Fatal(res.ResultList[0].Err)
+	res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, query, nil, 1)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer res.Close(ctx)
 
 	// Query the API for users.
 	var resp serverpb.UsersResponse
@@ -711,7 +716,7 @@ func TestAdminAPIEvents(t *testing.T) {
 	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
-	ac := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
 	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 	defer span.Finish()
 	session := sql.NewSession(
@@ -725,13 +730,14 @@ func TestAdminAPIEvents(t *testing.T) {
 		"CREATE TABLE api_test.tbl3 (a INT)",
 		"DROP TABLE api_test.tbl1",
 		"DROP TABLE api_test.tbl2",
+		"SET CLUSTER SETTING kv.allocator.load_based_lease_rebalancing.enabled = false;",
 	}
 	for _, q := range setupQueries {
-		res := ts.sqlExecutor.ExecuteStatements(session, q, nil)
-		defer res.Close(ctx)
-		if res.ResultList[0].Err != nil {
-			t.Fatalf("error executing '%s': %s", q, res.ResultList[0].Err)
+		res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, q, nil, 1)
+		if err != nil {
+			t.Fatalf("error executing '%s': %s", q, err)
 		}
+		res.Close(ctx)
 	}
 
 	const allEvents = ""
@@ -748,6 +754,7 @@ func TestAdminAPIEvents(t *testing.T) {
 		{sql.EventLogCreateDatabase, false, 0, 1},
 		{sql.EventLogDropTable, false, 0, 2},
 		{sql.EventLogCreateTable, false, 0, 3},
+		{sql.EventLogSetClusterSetting, false, 0, 4},
 		{sql.EventLogCreateTable, true, 0, 3},
 		{sql.EventLogCreateTable, true, -1, 3},
 		{sql.EventLogCreateTable, true, 2, 2},
@@ -803,7 +810,7 @@ func TestAdminAPIEvents(t *testing.T) {
 					}
 				}
 
-				if e.TargetID == 0 {
+				if e.TargetID == 0 && e.EventType != string(sql.EventLogSetClusterSetting) {
 					t.Errorf("%d: missing/empty TargetID", i)
 				}
 				if e.ReportingID == 0 {
@@ -820,10 +827,6 @@ func TestAdminAPIEvents(t *testing.T) {
 	}
 }
 
-const settingKey = "testing.b"
-
-var _ = settings.RegisterBoolSetting(settingKey, "", true)
-
 func TestAdminAPISettings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -833,6 +836,9 @@ func TestAdminAPISettings(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
 
+	// Any bool that defaults to true will work here.
+	const settingKey = "diagnostics.reporting.report_metrics"
+	st := s.ClusterSettings()
 	allKeys := settings.Keys()
 
 	checkSetting := func(t *testing.T, k string, v serverpb.SettingsResponse_Value) {
@@ -842,7 +848,7 @@ func TestAdminAPISettings(t *testing.T) {
 		}
 		typ := ref.Typ()
 
-		if ref.String() != v.Value {
+		if ref.String(&st.SV) != v.Value {
 			t.Errorf("%s: expected value %s, got %s", k, ref, v.Value)
 		}
 
@@ -1023,18 +1029,45 @@ func TestClusterAPI(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
 
-	// We need to retry, because the cluster ID isn't set until after
-	// bootstrapping.
-	testutils.SucceedsSoon(t, func() error {
-		var resp serverpb.ClusterResponse
-		if err := getAdminJSONProto(s, "cluster", &resp); err != nil {
-			return err
+	for _, reportingOn := range []bool{true, false} {
+		for _, enterpriseOn := range []bool{true, false} {
+			testName := fmt.Sprintf("reportingEnabled=%t, enterprise=%t", reportingOn, enterpriseOn)
+			t.Run(testName, func(t *testing.T) {
+				settings := &s.ClusterSettings().SV
+				log.DiagnosticsReportingEnabled.Override(settings, reportingOn)
+
+				// Override server license check.
+				if enterpriseOn {
+					oldLicenseCheck := LicenseCheckFn
+					LicenseCheckFn = func(_ *cluster.Settings, _ uuid.UUID, _, _ string) error {
+						return nil
+					}
+					defer func() {
+						LicenseCheckFn = oldLicenseCheck
+					}()
+				}
+
+				// We need to retry, because the cluster ID isn't set until after
+				// bootstrapping.
+				testutils.SucceedsSoon(t, func() error {
+					var resp serverpb.ClusterResponse
+					if err := getAdminJSONProto(s, "cluster", &resp); err != nil {
+						return err
+					}
+					if a, e := resp.ClusterID, s.(*TestServer).node.ClusterID.String(); a != e {
+						return errors.Errorf("cluster ID %s != expected %s", a, e)
+					}
+					if a, e := resp.ReportingEnabled, reportingOn; a != e {
+						return errors.Errorf("reportingEnabled = %t, wanted %t", a, e)
+					}
+					if a, e := resp.EnterpriseEnabled, enterpriseOn; a != e {
+						return errors.Errorf("enterpriseEnabled = %t, wanted %t", a, e)
+					}
+					return nil
+				})
+			})
 		}
-		if a, e := resp.ClusterID, s.(*TestServer).node.ClusterID.String(); a != e {
-			return errors.Errorf("cluster ID %s != expected %s", a, e)
-		}
-		return nil
-	})
+	}
 }
 
 func TestHealthAPI(t *testing.T) {
@@ -1052,18 +1085,128 @@ func TestHealthAPI(t *testing.T) {
 	// Expire this node's liveness record by pausing heartbeats and advancing the
 	// server's clock.
 	ts := s.(*TestServer)
-	ts.nodeLiveness.PauseHeartbeat(true)
+	defer ts.nodeLiveness.DisableAllHeartbeatsForTest()()
 	self, err := ts.nodeLiveness.Self()
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Clock().Update(self.Expiration.Add(1, 0))
+	s.Clock().Update(hlc.Timestamp(self.Expiration).Add(1, 0))
 
-	expected := "node is not live"
+	// Health API is not accessible if the node is not accessible, because it
+	// cannot verify the authentication session.
+	expected := "500 Internal Server Error"
 	var resp serverpb.HealthResponse
-	if err := getAdminJSONProto(s, "health", &resp); !testutils.IsError(err, expected) {
-		t.Errorf("expected %q error, got %v", expected, err)
+	for {
+		if err := getAdminJSONProto(s, "health", &resp); !testutils.IsError(err, expected) {
+			type timeouter interface {
+				Timeout() bool
+			}
+			if _, ok := err.(timeouter); ok {
+				// Special case for `*http.httpError` which can happen since we
+				// have timeouts on our requests and things may not be going so smoothly
+				// on the server side. See:
+				// https://github.com/cockroachdb/cockroach/issues/18469
+				log.Warningf(context.Background(), "ignoring timeout error: %s (%T)", err, err)
+				continue
+			}
+			t.Errorf("expected %q error, got %v (%T)", expected, err, err)
+		}
+		break
 	}
+}
+
+func TestAdminAPIJobs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+	sqlDB := sqlutils.MakeSQLRunner(t, conn)
+
+	testJobs := []struct {
+		id      int64
+		status  jobs.Status
+		details jobs.Details
+	}{
+		{1, jobs.StatusRunning, jobs.RestoreDetails{}},
+		{2, jobs.StatusRunning, jobs.BackupDetails{}},
+		{3, jobs.StatusSucceeded, jobs.BackupDetails{}},
+	}
+	for _, job := range testJobs {
+		payload := jobs.Payload{Details: jobs.WrapPayloadDetails(job.details)}
+		payloadBytes, err := protoutil.Marshal(&payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sqlDB.Exec(
+			`INSERT INTO system.jobs (id, status, payload) VALUES ($1, $2, $3)`,
+			job.id, job.status, payloadBytes,
+		)
+	}
+
+	const invalidJobType = math.MaxInt32
+
+	testCases := []struct {
+		uri         string
+		expectedIDs []int64
+	}{
+		{"jobs", []int64{3, 2, 1}},
+		{"jobs?limit=1", []int64{3}},
+		{"jobs?status=running", []int64{2, 1}},
+		{"jobs?status=succeeded", []int64{3}},
+		{"jobs?status=pending", []int64{}},
+		{"jobs?status=garbage", []int64{}},
+		{fmt.Sprintf("jobs?type=%d", jobs.TypeBackup), []int64{3, 2}},
+		{fmt.Sprintf("jobs?type=%d", jobs.TypeRestore), []int64{1}},
+		{fmt.Sprintf("jobs?type=%d", invalidJobType), []int64{}},
+		{fmt.Sprintf("jobs?status=running&type=%d", jobs.TypeBackup), []int64{2}},
+	}
+	for i, testCase := range testCases {
+		var res serverpb.JobsResponse
+		if err := getAdminJSONProto(s, testCase.uri, &res); err != nil {
+			t.Fatal(err)
+		}
+		resIDs := []int64{}
+		for _, job := range res.Jobs {
+			resIDs = append(resIDs, job.ID)
+		}
+		if e, a := testCase.expectedIDs, resIDs; !reflect.DeepEqual(e, a) {
+			t.Errorf("%d: expected job IDs %v, but got %v", i, e, a)
+		}
+	}
+}
+
+func TestAdminAPIQueryPlan(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+	sqlDB := sqlutils.MakeSQLRunner(t, conn)
+
+	sqlDB.Exec(`CREATE DATABASE api_test`)
+	sqlDB.Exec(`CREATE TABLE api_test.t1 (id int primary key, name string)`)
+	sqlDB.Exec(`CREATE TABLE api_test.t2 (id int primary key, name string)`)
+
+	testCases := []struct {
+		query string
+		exp   []string
+	}{
+		{"SELECT sum(id) FROM api_test.t1", []string{"nodeNames\":[\"1\"]", "Out: @1"}},
+		{"SELECT sum(1) FROM api_test.t1 JOIN api_test.t2 on t1.id = t2.id", []string{"nodeNames\":[\"1\"]", "Out: @1", "MergeJoiner"}},
+	}
+	for i, testCase := range testCases {
+		var res serverpb.QueryPlanResponse
+		queryParam := url.QueryEscape(testCase.query)
+		if err := getAdminJSONProto(s, fmt.Sprintf("queryplan?query=%s", queryParam), &res); err != nil {
+			t.Errorf("%d: got error %s", i, err)
+		}
+
+		for _, exp := range testCase.exp {
+			if !strings.Contains(res.DistSQLPhysicalQueryPlan, exp) {
+				t.Errorf("%d: expected response %s to contain %s", i, res, exp)
+			}
+		}
+	}
+
 }
 
 func TestAdminAPIRangeLog(t *testing.T) {
@@ -1100,11 +1243,50 @@ func TestAdminAPIRangeLog(t *testing.T) {
 			}
 
 			for _, event := range resp.Events {
-				if event.RangeID != roachpb.RangeID(tc.rangeID) &&
-					event.OtherRangeID != roachpb.RangeID(tc.rangeID) {
+				if event.Event.RangeID != roachpb.RangeID(tc.rangeID) &&
+					event.Event.OtherRangeID != roachpb.RangeID(tc.rangeID) {
 					t.Errorf("expected rangeID or otherRangeID to be r%d, got r%d and r%d",
-						tc.rangeID, event.RangeID, event.OtherRangeID)
+						tc.rangeID, event.Event.RangeID, event.Event.OtherRangeID)
 				}
+			}
+		})
+	}
+}
+
+func TestAdminAPIFullRangeLog(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+
+	expectedRanges, err := ExpectedInitialRangeCount(kvDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedEvents := expectedRanges - 1 // one for each split
+
+	testCases := []struct {
+		hasLimit bool
+		limit    int
+		expected int
+	}{
+		{false, 0, expectedEvents},
+		{true, 0, expectedEvents},
+		{true, -1, expectedEvents},
+		{true, 1, 1},
+	}
+
+	for _, tc := range testCases {
+		url := "rangelog"
+		if tc.hasLimit {
+			url += fmt.Sprintf("?limit=%d", tc.limit)
+		}
+		t.Run(url, func(t *testing.T) {
+			var resp serverpb.RangeLogResponse
+			if err := getAdminJSONProto(s, url, &resp); err != nil {
+				t.Fatal(err)
+			}
+			if e, a := tc.expected, len(resp.Events); e != a {
+				t.Fatalf("expected %d events, got %d", e, a)
 			}
 		})
 	}

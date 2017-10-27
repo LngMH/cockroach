@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
@@ -80,13 +78,6 @@ func (n Name) Normalize() string {
 		return lower
 	}
 	return norm.NFC.String(lower)
-}
-
-// ReNormalizeName performs the same work as NormalizeName but when
-// the string originates from the database. We define a different
-// function so as to be able to track usage of this function (cf. #8200).
-func ReNormalizeName(name string) string {
-	return Name(name).Normalize()
 }
 
 // ToStrings converts the name list to an array of regular strings.

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer@cockroachlabs.com)
 
 package storage_test
 
@@ -48,9 +46,15 @@ func TestStoreRangeLease(t *testing.T) {
 			defer mtc.Stop()
 			mtc.Start(t, 1)
 
-			splitKeys := []roachpb.Key{roachpb.Key("a"), roachpb.Key("b"), roachpb.Key("c")}
+			// NodeLivenessKeyMax is a static split point, so this is always
+			// the start key of the first range that uses epoch-based
+			// leases. Splitting on it here is redundant, but we want to include
+			// it in our tests of lease types below.
+			splitKeys := []roachpb.Key{
+				keys.NodeLivenessKeyMax, roachpb.Key("a"), roachpb.Key("b"), roachpb.Key("c"),
+			}
 			for _, splitKey := range splitKeys {
-				splitArgs := adminSplitArgs(splitKey, splitKey)
+				splitArgs := adminSplitArgs(splitKey)
 				if _, pErr := client.SendWrapped(context.Background(), mtc.distSenders[0], splitArgs); pErr != nil {
 					t.Fatal(pErr)
 				}
@@ -110,7 +114,7 @@ func TestStoreRangeLeaseSwitcheroo(t *testing.T) {
 	mtc.Start(t, 1)
 
 	splitKey := roachpb.Key("a")
-	splitArgs := adminSplitArgs(splitKey, splitKey)
+	splitArgs := adminSplitArgs(splitKey)
 	if _, pErr := client.SendWrapped(context.Background(), mtc.distSenders[0], splitArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -175,7 +179,7 @@ func TestStoreGossipSystemData(t *testing.T) {
 	mtc.Start(t, 1)
 
 	splitKey := keys.SystemConfigSplitKey
-	splitArgs := adminSplitArgs(splitKey, splitKey)
+	splitArgs := adminSplitArgs(splitKey)
 	if _, pErr := client.SendWrapped(context.Background(), mtc.distSenders[0], splitArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -226,6 +230,47 @@ func TestStoreGossipSystemData(t *testing.T) {
 		}
 		if getNodeLiveness() == (storage.Liveness{}) {
 			return errors.New("node liveness not gossiped")
+		}
+		return nil
+	})
+}
+
+// TestGossipSystemConfigOnLeaseChange verifies that the system-config gets
+// re-gossiped on lease transfer even if it hasn't changed. This helps prevent
+// situations where a previous leaseholder can restart and not receive the
+// system config because it was the original source of it within the gossip
+// network.
+func TestGossipSystemConfigOnLeaseChange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	sc := storage.TestStoreConfig(nil)
+	sc.TestingKnobs.DisableReplicateQueue = true
+	mtc := &multiTestContext{storeConfig: &sc}
+	defer mtc.Stop()
+	const numStores = 3
+	mtc.Start(t, numStores)
+
+	rangeID := mtc.stores[0].LookupReplica(roachpb.RKey(keys.SystemConfigSpan.Key), nil).RangeID
+	mtc.replicateRange(rangeID, 1, 2)
+
+	initialStoreIdx := -1
+	for i := range mtc.stores {
+		if mtc.stores[i].Gossip().InfoOriginatedHere(gossip.KeySystemConfig) {
+			initialStoreIdx = i
+		}
+	}
+	if initialStoreIdx == -1 {
+		t.Fatalf("no store has gossiped system config; gossip contents: %+v", mtc.stores[0].Gossip().GetInfoStatus())
+	}
+
+	newStoreIdx := (initialStoreIdx + 1) % numStores
+	mtc.transferLease(context.TODO(), rangeID, initialStoreIdx, newStoreIdx)
+
+	testutils.SucceedsSoon(t, func() error {
+		if mtc.stores[initialStoreIdx].Gossip().InfoOriginatedHere(gossip.KeySystemConfig) {
+			return errors.New("system config still most recently gossiped by original leaseholder")
+		}
+		if !mtc.stores[newStoreIdx].Gossip().InfoOriginatedHere(gossip.KeySystemConfig) {
+			return errors.New("system config not most recently gossiped by new leaseholder")
 		}
 		return nil
 	})

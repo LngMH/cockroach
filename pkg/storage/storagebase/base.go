@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package storagebase
 
@@ -32,6 +30,14 @@ type FilterArgs struct {
 	Sid   roachpb.StoreID
 	Req   roachpb.Request
 	Hdr   roachpb.Header
+}
+
+// ProposalFilterArgs groups the arguments to ReplicaProposalFilter.
+type ProposalFilterArgs struct {
+	Ctx   context.Context
+	Cmd   RaftCommand
+	CmdID CmdIDKey
+	Req   roachpb.BatchRequest
 }
 
 // ApplyFilterArgs groups the arguments to a ReplicaApplyFilter.
@@ -54,6 +60,10 @@ func (f *FilterArgs) InRaftCmd() bool {
 // with the returned error.
 type ReplicaCommandFilter func(args FilterArgs) *roachpb.Error
 
+// ReplicaProposalFilter can be used in testing to influence the error returned
+// from proposals after a request is evaluated but before it is proposed.
+type ReplicaProposalFilter func(args ProposalFilterArgs) *roachpb.Error
+
 // A ReplicaApplyFilter can be used in testing to influence the error returned
 // from proposals after they apply.
 type ReplicaApplyFilter func(args ApplyFilterArgs) *roachpb.Error
@@ -62,3 +72,25 @@ type ReplicaApplyFilter func(args ApplyFilterArgs) *roachpb.Error
 // response returned to a waiting client after a replica command has
 // been processed. This filter is invoked only by the command proposer.
 type ReplicaResponseFilter func(roachpb.BatchRequest, *roachpb.BatchResponse) *roachpb.Error
+
+// CommandQueueAction is an action taken by a BatchRequest's batchCmdSet on the
+// CommandQueue.
+type CommandQueueAction int
+
+const (
+	// CommandQueueWaitForPrereqs represents the state of a batchCmdSet when it
+	// has just inserted itself into the CommandQueue and is beginning to wait
+	// for prereqs to finish execution.
+	CommandQueueWaitForPrereqs CommandQueueAction = iota
+	// CommandQueueCancellation represents the state of a batchCmdSet when it
+	// is cancelled while waiting for prerequisites to finish and is forced to
+	// remove itself from the CommandQueue without executing.
+	CommandQueueCancellation
+	// CommandQueueBeginExecuting represents the state of a batchCmdSet when it
+	// has finished waiting for all prereqs to finish execution and is now free
+	// to execute itself.
+	CommandQueueBeginExecuting
+	// CommandQueueFinishExecuting represents the state of a batchCmdSet when it
+	// has finished executing and will remove itself from the CommandQueue.
+	CommandQueueFinishExecuting
+)

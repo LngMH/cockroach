@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package sql_test
 
@@ -30,7 +28,6 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -96,23 +93,21 @@ func testMonotonicInserts(t *testing.T, distSQLMode sql.DistSQLExecMode) {
 	if testing.Short() {
 		t.Skip("short flag")
 	}
-
-	distSQLOverride := &settings.EnumSetting{}
-	settings.TestingSetEnum(&distSQLOverride, int64(distSQLMode))
-
+	ctx := context.Background()
 	tc := testcluster.StartTestCluster(
 		t, 3,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationAuto,
-			ServerArgs: base.TestServerArgs{
-				Knobs: base.TestingKnobs{
-					SQLExecutor: &sql.ExecutorTestingKnobs{OverrideDistSQLMode: distSQLOverride},
-				},
-			},
+			ServerArgs:      base.TestServerArgs{},
 		},
 	)
-	defer tc.Stopper().Stop(context.TODO())
-	ctx := context.Background()
+	defer tc.Stopper().Stop(ctx)
+
+	for _, server := range tc.Servers {
+		st := server.ClusterSettings()
+		st.Manual.Store(true)
+		sql.DistSQLClusterExecMode.Override(&st.SV, int64(distSQLMode))
+	}
 
 	var clients []mtClient
 	for i := range tc.Conns {
@@ -140,7 +135,7 @@ INSERT INTO mono.mono VALUES(-1, '0', -1, -1)`); err != nil {
 
 		var exRow, insRow mtRow
 		var attempt int
-		if err := crdb.ExecuteTx(client.DB, func(tx *gosql.Tx) error {
+		if err := crdb.ExecuteTx(ctx, client.DB, nil, func(tx *gosql.Tx) error {
 			attempt++
 			l("attempt %d", attempt)
 			if err := tx.QueryRow(`SELECT cluster_logical_timestamp()`).Scan(

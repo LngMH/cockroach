@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Jordan Lewis (jordan@cockroachlabs.com)
 
 package distsqlrun
 
@@ -21,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -37,7 +36,7 @@ type columnBackfiller struct {
 	updateExprs []parser.TypedExpr
 }
 
-var _ processor = &columnBackfiller{}
+var _ Processor = &columnBackfiller{}
 var _ chunkBackfiller = &columnBackfiller{}
 
 // ColumnMutationFilter is a filter that allows mutations that add or drop
@@ -73,12 +72,6 @@ func (cb *columnBackfiller) init() error {
 	// colIdxMap maps ColumnIDs to indices into desc.Columns and desc.Mutations.
 	var colIdxMap map[sqlbase.ColumnID]int
 
-	// Note if there is a new non nullable column with no default value.
-	// If that's the case, and we end up reading a non-zero amount of data,
-	// we need a throw an error since the old columns will already violate the
-	// not null constraint.
-	// TODO(jordan): detect this earlier. #14455
-	addingNonNullableColumn := false
 	if len(desc.Mutations) > 0 {
 		for _, m := range desc.Mutations {
 			if ColumnMutationFilter(m) {
@@ -86,22 +79,19 @@ func (cb *columnBackfiller) init() error {
 				case sqlbase.DescriptorMutation_ADD:
 					desc := *m.GetColumn()
 					cb.added = append(cb.added, desc)
-					if desc.DefaultExpr == nil && !desc.Nullable {
-						addingNonNullableColumn = true
-					}
 				case sqlbase.DescriptorMutation_DROP:
 					cb.dropped = append(cb.dropped, *m.GetColumn())
 				}
 			}
 		}
 	}
-	defaultExprs, err := sqlbase.MakeDefaultExprs(cb.added, &parser.Parser{}, &cb.flowCtx.evalCtx)
+	defaultExprs, err := sqlbase.MakeDefaultExprs(cb.added, &parser.Parser{}, &cb.flowCtx.EvalCtx)
 	if err != nil {
 		return err
 	}
 
 	cb.updateCols = append(cb.added, cb.dropped...)
-	if len(cb.dropped) > 0 || addingNonNullableColumn || len(defaultExprs) > 0 {
+	if len(cb.dropped) > 0 || len(defaultExprs) > 0 {
 		// Populate default values.
 		cb.updateExprs = make([]parser.TypedExpr, len(cb.updateCols))
 		for j := range cb.added {
@@ -127,13 +117,18 @@ func (cb *columnBackfiller) init() error {
 		colIdxMap[c.ID] = i
 	}
 	return cb.fetcher.Init(
-		&desc, colIdxMap, &desc.PrimaryIndex, false, false, desc.Columns, valNeededForCol, false,
+		&desc, colIdxMap, &desc.PrimaryIndex, false, false, desc.Columns,
+		valNeededForCol, false, &cb.alloc,
 	)
 }
 
 // runChunk implements the chunkBackfiller interface.
 func (cb *columnBackfiller) runChunk(
-	ctx context.Context, mutations []sqlbase.DescriptorMutation, sp roachpb.Span, chunkSize int64,
+	ctx context.Context,
+	mutations []sqlbase.DescriptorMutation,
+	sp roachpb.Span,
+	chunkSize int64,
+	readAsOf hlc.Timestamp,
 ) (roachpb.Key, error) {
 	tableDesc := cb.backfiller.spec.Table
 	err := cb.flowCtx.clientDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
@@ -168,7 +163,8 @@ func (cb *columnBackfiller) runChunk(
 		requestedCols = append(requestedCols, tableDesc.Columns...)
 		requestedCols = append(requestedCols, cb.added...)
 		ru, err := sqlbase.MakeRowUpdater(
-			txn, &tableDesc, fkTables, cb.updateCols, requestedCols, sqlbase.RowUpdaterOnlyColumns,
+			txn, &tableDesc, fkTables, cb.updateCols, requestedCols,
+			sqlbase.RowUpdaterOnlyColumns, &cb.alloc,
 		)
 		if err != nil {
 			return err
@@ -190,7 +186,7 @@ func (cb *columnBackfiller) runChunk(
 		// populated and deleted by the OLTP commands but not otherwise
 		// read or used
 		if err := cb.fetcher.StartScan(
-			ctx, txn, []roachpb.Span{sp}, true /* limitBatches */, chunkSize,
+			ctx, txn, []roachpb.Span{sp}, true /* limitBatches */, chunkSize, false, /* traceKV */
 		); err != nil {
 			log.Errorf(ctx, "scan error: %s", err)
 			return err
@@ -201,7 +197,7 @@ func (cb *columnBackfiller) runChunk(
 		b := txn.NewBatch()
 		rowLength := 0
 		for i := int64(0); i < chunkSize; i++ {
-			row, err := cb.fetcher.NextRowDecoded(ctx, false /* traceKV */)
+			row, err := cb.fetcher.NextRowDecoded(ctx)
 			if err != nil {
 				return err
 			}
@@ -211,7 +207,7 @@ func (cb *columnBackfiller) runChunk(
 			// Evaluate the new values. This must be done separately for
 			// each row so as to handle impure functions correctly.
 			for j, e := range cb.updateExprs {
-				val, err := e.Eval(&cb.flowCtx.evalCtx)
+				val, err := e.Eval(&cb.flowCtx.EvalCtx)
 				if err != nil {
 					return sqlbase.NewInvalidSchemaDefinitionError(err)
 				}
@@ -235,7 +231,7 @@ func (cb *columnBackfiller) runChunk(
 		}
 		// Write the new row values.
 		if err := txn.CommitInBatch(ctx, b); err != nil {
-			return ConvertBackfillError(&cb.spec.Table, b)
+			return ConvertBackfillError(ctx, &cb.spec.Table, b)
 		}
 		return nil
 	})

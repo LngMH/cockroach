@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Veteran Lu (23907238@qq.com)
 
 package roachpb
 
@@ -21,6 +18,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/kr/pretty"
 )
 
@@ -218,9 +217,13 @@ func TestIntentSpanIterate(t *testing.T) {
 func TestBatchResponseCombine(t *testing.T) {
 	br := &BatchResponse{}
 	{
+		txn := MakeTransaction(
+			"test", nil /* baseKey */, NormalUserPriority,
+			enginepb.SERIALIZABLE, hlc.Timestamp{WallTime: 123}, 0, /* maxOffsetNs */
+		)
 		brTxn := &BatchResponse{
 			BatchResponse_Header: BatchResponse_Header{
-				Txn: &Transaction{Name: "test"},
+				Txn: &txn,
 			},
 		}
 		if err := br.Combine(brTxn, nil); err != nil {

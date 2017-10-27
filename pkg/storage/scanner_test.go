@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -34,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // Test implementation of a range set backed by btree.BTree.
@@ -56,7 +55,7 @@ func newTestRangeSet(count int, t *testing.T) *testRangeSet {
 		repl := &Replica{
 			RangeID: desc.RangeID,
 		}
-		repl.mu.state.Stats = enginepb.MVCCStats{
+		repl.mu.state.Stats = &enginepb.MVCCStats{
 			KeyBytes:  1,
 			ValBytes:  2,
 			KeyCount:  1,
@@ -192,7 +191,7 @@ func TestScannerAddToQueues(t *testing.T) {
 	// We don't want to actually consume entries from the queues during this test.
 	q1.setDisabled(true)
 	q2.setDisabled(true)
-	s := newReplicaScanner(log.AmbientContext{}, 1*time.Millisecond, 0, ranges)
+	s := newReplicaScanner(log.AmbientContext{Tracer: tracing.NewTracer()}, 1*time.Millisecond, 0, ranges)
 	s.AddQueues(q1, q2)
 	mc := hlc.NewManualClock(123)
 	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
@@ -244,7 +243,7 @@ func TestScannerTiming(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			ranges := newTestRangeSet(count, t)
 			q := &testQueue{}
-			s := newReplicaScanner(log.AmbientContext{}, duration, 0, ranges)
+			s := newReplicaScanner(log.AmbientContext{Tracer: tracing.NewTracer()}, duration, 0, ranges)
 			s.AddQueues(q)
 			mc := hlc.NewManualClock(123)
 			clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
@@ -284,16 +283,16 @@ func TestScannerPaceInterval(t *testing.T) {
 	for _, duration := range durations {
 		startTime := timeutil.Now()
 		ranges := newTestRangeSet(count, t)
-		s := newReplicaScanner(log.AmbientContext{}, duration, 0, ranges)
+		s := newReplicaScanner(log.AmbientContext{Tracer: tracing.NewTracer()}, duration, 0, ranges)
 		interval := s.paceInterval(startTime, startTime)
 		logErrorWhenNotCloseTo(duration/count, interval)
 		// The range set is empty
 		ranges = newTestRangeSet(0, t)
-		s = newReplicaScanner(log.AmbientContext{}, duration, 0, ranges)
+		s = newReplicaScanner(log.AmbientContext{Tracer: tracing.NewTracer()}, duration, 0, ranges)
 		interval = s.paceInterval(startTime, startTime)
 		logErrorWhenNotCloseTo(duration, interval)
 		ranges = newTestRangeSet(count, t)
-		s = newReplicaScanner(log.AmbientContext{}, duration, 0, ranges)
+		s = newReplicaScanner(log.AmbientContext{Tracer: tracing.NewTracer()}, duration, 0, ranges)
 		// Move the present to duration time into the future
 		interval = s.paceInterval(startTime, startTime.Add(duration))
 		logErrorWhenNotCloseTo(0, interval)
@@ -307,7 +306,7 @@ func TestScannerDisabled(t *testing.T) {
 	const count = 3
 	ranges := newTestRangeSet(count, t)
 	q := &testQueue{}
-	s := newReplicaScanner(log.AmbientContext{}, 1*time.Millisecond, 0, ranges)
+	s := newReplicaScanner(log.AmbientContext{Tracer: tracing.NewTracer()}, 1*time.Millisecond, 0, ranges)
 	s.AddQueues(q)
 	mc := hlc.NewManualClock(123)
 	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
@@ -359,7 +358,7 @@ func TestScannerDisabled(t *testing.T) {
 func TestScannerDisabledWithZeroInterval(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ranges := newTestRangeSet(1, t)
-	s := newReplicaScanner(log.AmbientContext{}, 0*time.Millisecond, 0, ranges)
+	s := newReplicaScanner(log.AmbientContext{Tracer: tracing.NewTracer()}, 0*time.Millisecond, 0, ranges)
 	if !s.GetDisabled() {
 		t.Errorf("expected scanner to be disabled")
 	}
@@ -370,7 +369,7 @@ func TestScannerEmptyRangeSet(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ranges := newTestRangeSet(0, t)
 	q := &testQueue{}
-	s := newReplicaScanner(log.AmbientContext{}, time.Hour, 0, ranges)
+	s := newReplicaScanner(log.AmbientContext{Tracer: tracing.NewTracer()}, time.Hour, 0, ranges)
 	s.AddQueues(q)
 	mc := hlc.NewManualClock(123)
 	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)

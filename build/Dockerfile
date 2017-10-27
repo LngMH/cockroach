@@ -1,4 +1,4 @@
-FROM ubuntu:xenial-20170619
+FROM ubuntu:xenial-20170915
 
 MAINTAINER Tamir Duberstein <tamird@gmail.com>
 
@@ -59,6 +59,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libncurses-dev \
     make \
     nodejs \
+    openjdk-8-jre \
     openssh-client \
     patch \
     python \
@@ -78,14 +79,55 @@ RUN mkdir crosstool-ng \
  && rm -rf crosstool-ng
 
 COPY x86_64-unknown-linux-gnu.defconfig x86_64-unknown-linux-musl.defconfig x86_64-w64-mingw.defconfig ./
-RUN mkdir build src && cd build \
- && rm -rf * && DEFCONFIG=../x86_64-unknown-linux-gnu.defconfig  /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build \
- && rm -rf * && DEFCONFIG=../x86_64-unknown-linux-musl.defconfig /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build \
- && rm -rf * && DEFCONFIG=../x86_64-w64-mingw.defconfig          /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build \
- && cd .. \
- && rm -rf build src
+RUN mkdir src \
+ && mkdir build && (cd build && DEFCONFIG=../x86_64-unknown-linux-gnu.defconfig  /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build) && rm -rf build \
+ && mkdir build && (cd build && DEFCONFIG=../x86_64-unknown-linux-musl.defconfig /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build) && rm -rf build \
+ && mkdir build && (cd build && DEFCONFIG=../x86_64-w64-mingw.defconfig          /usr/local/ct-ng/bin/ct-ng defconfig && /usr/local/ct-ng/bin/ct-ng build) && rm -rf build \
+ && rm -rf src
 
 RUN apt-get autoremove -y gcc g++
+
+# Build & install libtinfo (terminfo) for the linux targets.
+# (on BSD or BSD-derived like macOS it's already built-in; on windows we don't need it.)
+#
+# The patch is needed to work around a bug in Debian mawk, see
+# http://lists.gnu.org/archive/html/bug-ncurses/2015-08/msg00008.html
+COPY ncurses.patch ./
+#
+# Run the two builds.
+# As per the Debian rule file for ncurses, the two configure tests for
+# the type of bool and poll(2) are broken when cross-compiling, so we
+# need to feed the test results manually to configure via an environment
+# variable; see debian/rules on the Debian ncurses source package.
+#
+# The configure other settings in ncurses.conf are also sourced from the
+# Debian source package.
+#
+COPY ncurses.conf ./
+RUN mkdir ncurses \
+ && curl -fsSL http://ftp.gnu.org/gnu/ncurses/ncurses-6.0.tar.gz | tar --strip-components=1 -C ncurses -xz \
+ && cd ncurses \
+ && patch -p0 <../ncurses.patch \
+ && export cf_cv_type_of_bool='unsigned char' \
+ && export cf_cv_working_poll=yes \
+ && mkdir build-x86_64-unknown-linux-musl \
+ && (cd build-x86_64-unknown-linux-musl \
+    && CC=/x-tools/x86_64-unknown-linux-musl/bin/x86_64-unknown-linux-musl-cc \
+       CXX=/x-tools/x86_64-unknown-linux-musl/bin/x86_64-unknown-linux-musl-c++ \
+       ../configure --prefix=/x-tools/x86_64-unknown-linux-musl/x86_64-unknown-linux-musl/sysroot/usr \
+         --host=x86_64-unknown-linux-musl \
+         $(cat /ncurses.conf) --without-shared --without-dlsym \
+    && (cd ncurses && make all && make install.tinfo)) \
+ && mkdir build-x86_64-unknown-linux-gnu \
+ && (cd build-x86_64-unknown-linux-gnu \
+    && CC=/x-tools/x86_64-unknown-linux-gnu/bin/x86_64-unknown-linux-gnu-cc \
+       CXX=/x-tools/x86_64-unknown-linux-gnu/bin/x86_64-unknown-linux-gnu-c++ \
+       ../configure --prefix=/x-tools/x86_64-unknown-linux-gnu/x86_64-unknown-linux-gnu/sysroot/usr \
+         --host=x86_64-unknown-linux-gnu \
+         $(cat /ncurses.conf) \
+    && (cd ncurses && make all && make install.tinfo)) \
+ && cd .. \
+ && rm -rf ncurses ncurses.conf ncurses.patch
 
 # Build an msan-enabled build of libc++, following instructions from
 # https://github.com/google/sanitizers/wiki/MemorySanitizerLibcxxHowTo
@@ -101,17 +143,14 @@ RUN git clone --depth 1 https://github.com/tpoechtrager/osxcross.git \
  && mv osxcross/target /x-tools/x86_64-apple-darwin13 \
  && rm -rf osxcross
 
-# BEGIN https://github.com/docker-library/golang/blob/master/1.8/alpine/Dockerfile
+# BEGIN https://github.com/docker-library/golang/blob/94e49ca/1.9/alpine3.6/Dockerfile
 
-COPY parallelbuilds-go1.8.patch /
-RUN curl -fsSL https://storage.googleapis.com/golang/go1.8.3.src.tar.gz -o golang.tar.gz \
- && echo '5f5dea2447e7dcfdc50fa6b94c512e58bfba5673c039259fd843f68829d99fa6  golang.tar.gz' | sha256sum -c - \
+RUN curl -fsSL https://storage.googleapis.com/golang/go1.9.src.tar.gz -o golang.tar.gz \
+ && echo 'a4ab229028ed167ba1986825751463605264e44868362ca8e7accc8be057e993  golang.tar.gz' | sha256sum -c - \
  && tar -C /usr/local -xzf golang.tar.gz \
  && rm golang.tar.gz \
  && cd /usr/local/go/src \
- && patch -p2 -i /parallelbuilds-go1.8.patch \
  && GOROOT_BOOTSTRAP=$(go env GOROOT) CC=clang CXX=clang++ ./make.bash \
- && rm -rf /*.patch \
  && apt-get autoremove -y golang
 
 ENV GOPATH /go
@@ -120,7 +159,7 @@ ENV PATH $GOPATH/bin:/usr/local/go/bin:$PATH
 RUN mkdir -p "$GOPATH/src" "$GOPATH/bin" && chmod -R 777 "$GOPATH"
 WORKDIR $GOPATH
 
-# END https://github.com/docker-library/golang/blob/master/1.8/alpine/Dockerfile
+# END https://github.com/docker-library/golang/blob/94e49ca/1.9/alpine3.6/Dockerfile
 
 RUN chmod -R a+w $(go env GOTOOLDIR)
 

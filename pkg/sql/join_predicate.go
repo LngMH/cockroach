@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
@@ -168,8 +166,8 @@ func makeUsingPredicate(
 ) (*joinPredicate, *dataSourceInfo, error) {
 	seenNames := make(map[string]struct{})
 
-	for _, unnormalizedColName := range colNames {
-		colName := unnormalizedColName.Normalize()
+	for _, syntaxColName := range colNames {
+		colName := string(syntaxColName)
 		// Check for USING(x,x)
 		if _, ok := seenNames[colName]; ok {
 			return nil, nil, fmt.Errorf("column %q appears more than once in USING clause", colName)
@@ -223,8 +221,8 @@ func makeEqualityPredicate(
 
 	// Find out which columns are involved in EqualityPredicate.
 	for i := range leftColNames {
-		leftColName := leftColNames[i].Normalize()
-		rightColName := rightColNames[i].Normalize()
+		leftColName := string(leftColNames[i])
+		rightColName := string(rightColNames[i])
 
 		// Find the column name on the left.
 		leftIdx, leftType, err := pickUsingColumn(left.sourceColumns, leftColName, "left")
@@ -294,25 +292,25 @@ func makeEqualityPredicate(
 			if alias.name == anonymousTable {
 				continue
 			}
-			newRange := make([]int, len(alias.columnRange))
-			for i, colIdx := range alias.columnRange {
-				newRange[i] = colIdx + offset
+			var newSet util.FastIntSet
+			for colIdx, ok := alias.columnSet.Next(0); ok; colIdx, ok = alias.columnSet.Next(colIdx + 1) {
+				newSet.Add(colIdx + offset)
 			}
-			aliases = append(aliases, sourceAlias{name: alias.name, columnRange: newRange})
+			aliases = append(aliases, sourceAlias{name: alias.name, columnSet: newSet})
 		}
 	}
 	collectAliases(left.sourceAliases, numMergedEqualityColumns)
 	collectAliases(right.sourceAliases, numMergedEqualityColumns+len(left.sourceColumns))
 
-	anonymousAlias := sourceAlias{name: anonymousTable, columnRange: nil}
+	anonymousAlias := sourceAlias{name: anonymousTable}
 	var hiddenLeftNames, hiddenRightNames []string
 
 	// All the merged columns at the beginning belong to the
 	// anonymous data source.
 	for i := 0; i < numMergedEqualityColumns; i++ {
-		anonymousAlias.columnRange = append(anonymousAlias.columnRange, i)
-		hiddenLeftNames = append(hiddenLeftNames, parser.ReNormalizeName(left.sourceColumns[i].Name))
-		hiddenRightNames = append(hiddenRightNames, parser.ReNormalizeName(right.sourceColumns[i].Name))
+		anonymousAlias.columnSet.Add(i)
+		hiddenLeftNames = append(hiddenLeftNames, left.sourceColumns[leftEqualityIndices[i]].Name)
+		hiddenRightNames = append(hiddenRightNames, right.sourceColumns[rightEqualityIndices[i]].Name)
 	}
 
 	// Now collect the other table-less columns into the anonymous data
@@ -324,16 +322,16 @@ func makeEqualityPredicate(
 			if alias.name != anonymousTable {
 				continue
 			}
-			for _, colIdx := range alias.columnRange {
+			for colIdx, ok := alias.columnSet.Next(0); ok; colIdx, ok = alias.columnSet.Next(colIdx + 1) {
 				isHidden := false
 				for _, hiddenName := range hiddenNames {
-					if parser.ReNormalizeName(cols[colIdx].Name) == hiddenName {
+					if cols[colIdx].Name == hiddenName {
 						isHidden = true
 						break
 					}
 				}
 				if !isHidden {
-					anonymousAlias.columnRange = append(anonymousAlias.columnRange, colIdx+offset)
+					anonymousAlias.columnSet.Add(colIdx + offset)
 				}
 			}
 		}
@@ -343,7 +341,7 @@ func makeEqualityPredicate(
 	collectAnonymousAliases(right.sourceAliases, hiddenRightNames, right.sourceColumns,
 		numMergedEqualityColumns+len(left.sourceColumns))
 
-	if anonymousAlias.columnRange != nil {
+	if !anonymousAlias.columnSet.Empty() {
 		aliases = append(aliases, anonymousAlias)
 	}
 
@@ -473,7 +471,7 @@ func pickUsingColumn(
 		if col.Hidden {
 			continue
 		}
-		if parser.ReNormalizeName(col.Name) == colName {
+		if col.Name == colName {
 			idx = j
 		}
 	}

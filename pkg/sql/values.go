@@ -11,22 +11,26 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
 	"container/heap"
 	"fmt"
-	"sort"
 	"strconv"
 
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
+
+func newValuesListLenErr(exp, got int) error {
+	return errors.Errorf("VALUES lists must all be the same length, expected %d columns, found %d",
+		exp, got)
+}
 
 type valuesNode struct {
 	n        *parser.ValuesClause
@@ -36,12 +40,16 @@ type valuesNode struct {
 	tuples   [][]parser.TypedExpr
 	rows     *sqlbase.RowContainer
 
+	// isConst is set if the valuesNode only contains constant expressions (no
+	// subqueries). In this case, rows will be evaluated during the first call
+	// to planNode.Start and memoized for future consumption. A valuesNode with
+	// isConst = true can serve its values multiple times. See valuesNode.Reset.
+	isConst bool
+
 	// rowsPopped is used for heaps, it indicates the number of rows that were
 	// "popped". These rows are still part of the underlying sqlbase.RowContainer, in the
 	// range [rows.Len()-n.rowsPopped, rows.Len).
 	rowsPopped int
-
-	desiredTypes []parser.Type // This can be removed when we only type check once.
 
 	nextRow       int  // The index of the next row.
 	invertSorting bool // Inverts the sorting predicate.
@@ -54,6 +62,7 @@ func (p *planner) newContainerValuesNode(columns sqlbase.ResultColumns, capacity
 		rows: sqlbase.NewRowContainer(
 			p.session.TxnState.makeBoundAccount(), sqlbase.ColTypeInfoFromResCols(columns), capacity,
 		),
+		isConst: true,
 	}
 }
 
@@ -61,9 +70,9 @@ func (p *planner) ValuesClause(
 	ctx context.Context, n *parser.ValuesClause, desiredTypes []parser.Type,
 ) (planNode, error) {
 	v := &valuesNode{
-		p:            p,
-		n:            n,
-		desiredTypes: desiredTypes,
+		p:       p,
+		n:       n,
+		isConst: true,
 	}
 	if len(n.Tuples) == 0 {
 		return v, nil
@@ -76,9 +85,12 @@ func (p *planner) ValuesClause(
 
 	v.columns = make(sqlbase.ResultColumns, 0, numCols)
 
+	defer func(prev bool) { p.hasSubqueries = prev }(p.hasSubqueries)
+	p.hasSubqueries = false
+
 	for num, tuple := range n.Tuples {
 		if a, e := len(tuple.Exprs), numCols; a != e {
-			return nil, fmt.Errorf("VALUES lists must all be the same length, %d for %d", a, e)
+			return nil, newValuesListLenErr(e, a)
 		}
 
 		// Chop off prefix of tupleBuf and limit its capacity.
@@ -115,11 +127,21 @@ func (p *planner) ValuesClause(
 		v.tuples = append(v.tuples, tupleRow)
 	}
 
+	// TODO(nvanbenschoten): if v.isConst, we should be able to evaluate n.rows
+	// ahead of time. This requires changing the contract for planNode.Close such
+	// that it must always be called unless an error is returned from a planNode
+	// constructor. This would simplify the Close contract, but would make some
+	// code (like in planner.SelectClause) more messy.
+	v.isConst = !p.hasSubqueries
 	return v, nil
 }
 
-func (n *valuesNode) Start(ctx context.Context) error {
-	if n.n == nil {
+// Start implements the planNode interface.
+func (n *valuesNode) Start(params runParams) error {
+	if n.rows != nil {
+		if !n.isConst {
+			log.Fatalf(params.ctx, "valuesNode evaluted twice")
+		}
 		return nil
 	}
 
@@ -146,7 +168,7 @@ func (n *valuesNode) Start(ctx context.Context) error {
 				}
 			}
 		}
-		if _, err := n.rows.AddRow(ctx, row); err != nil {
+		if _, err := n.rows.AddRow(params.ctx, row); err != nil {
 			return err
 		}
 	}
@@ -158,12 +180,22 @@ func (n *valuesNode) Values() parser.Datums {
 	return n.rows.At(n.nextRow - 1)
 }
 
-func (n *valuesNode) Next(context.Context) (bool, error) {
+func (n *valuesNode) Next(runParams) (bool, error) {
 	if n.nextRow >= n.rows.Len() {
 		return false, nil
 	}
 	n.nextRow++
 	return true, nil
+}
+
+// Reset resets the valuesNode processing state without requiring recomputation
+// of the values tuples if the valuesNode is processed again. Reset can only
+// be called if valuesNode.isConst.
+func (n *valuesNode) Reset(ctx context.Context) {
+	if !n.isConst {
+		log.Fatalf(ctx, "valuesNode.Reset can only be called on constant valuesNodes")
+	}
+	n.nextRow = 0
 }
 
 func (n *valuesNode) Close(ctx context.Context) {
@@ -236,9 +268,9 @@ func (n *valuesNode) ResetLen() {
 }
 
 // SortAll sorts all values in the valuesNode.rows slice.
-func (n *valuesNode) SortAll() {
+func (n *valuesNode) SortAll(cancelChecker *sqlbase.CancelChecker) {
 	n.invertSorting = false
-	sort.Sort(n)
+	sqlbase.Sort(n, cancelChecker)
 }
 
 // InitMaxHeap initializes the valuesNode.rows slice as a max-heap.

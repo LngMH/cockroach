@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: XisiHuang (cockhuangxh@163.com)
 
 package sql
 
@@ -60,14 +58,14 @@ func (p *planner) RenameDatabase(ctx context.Context, n *parser.RenameDatabase) 
 
 	if n.Name == n.NewName {
 		// Noop.
-		return &emptyNode{}, nil
+		return &zeroNode{}, nil
 	}
 
 	// Check if any views depend on tables in the database. Because our views
 	// are currently just stored as strings, they explicitly specify the database
 	// name. Rather than trying to rewrite them with the changed DB name, we
 	// simply disallow such renames for now.
-	tbNames, err := getTableNames(ctx, p.txn, p.getVirtualTabler(), dbDesc)
+	tbNames, err := getTableNames(ctx, p.txn, p.getVirtualTabler(), dbDesc, false)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +102,7 @@ func (p *planner) RenameDatabase(ctx context.Context, n *parser.RenameDatabase) 
 	if err := p.renameDatabase(ctx, dbDesc, string(n.NewName)); err != nil {
 		return nil, err
 	}
-	return &emptyNode{}, nil
+	return &zeroNode{}, nil
 }
 
 // RenameTable renames the table or view.
@@ -141,13 +139,13 @@ func (p *planner) RenameTable(ctx context.Context, n *parser.RenameTable) (planN
 		if tableDesc == nil {
 			if n.IfExists {
 				// Noop.
-				return &emptyNode{}, nil
+				return &zeroNode{}, nil
 			}
 			// Key does not exist, but we want it to: error out.
-			return nil, sqlbase.NewUndefinedViewError(oldTn.String())
+			return nil, sqlbase.NewUndefinedRelationError(oldTn)
 		}
 		if tableDesc.State != sqlbase.TableDescriptor_PUBLIC {
-			return nil, sqlbase.NewUndefinedViewError(oldTn.String())
+			return nil, sqlbase.NewUndefinedRelationError(oldTn)
 		}
 	} else {
 		tableDesc, err = getTableDesc(ctx, p.txn, p.getVirtualTabler(), oldTn)
@@ -157,13 +155,13 @@ func (p *planner) RenameTable(ctx context.Context, n *parser.RenameTable) (planN
 		if tableDesc == nil {
 			if n.IfExists {
 				// Noop.
-				return &emptyNode{}, nil
+				return &zeroNode{}, nil
 			}
 			// Key does not exist, but we want it to: error out.
-			return nil, sqlbase.NewUndefinedTableError(oldTn.String())
+			return nil, sqlbase.NewUndefinedRelationError(oldTn)
 		}
 		if tableDesc.State != sqlbase.TableDescriptor_PUBLIC {
-			return nil, sqlbase.NewUndefinedTableError(oldTn.String())
+			return nil, sqlbase.NewUndefinedRelationError(oldTn)
 		}
 	}
 
@@ -193,7 +191,7 @@ func (p *planner) RenameTable(ctx context.Context, n *parser.RenameTable) (planN
 	// oldTn and newTn are already normalized, so we can compare directly here.
 	if oldTn.Database() == newTn.Database() && oldTn.Table() == newTn.Table() {
 		// Noop.
-		return &emptyNode{}, nil
+		return &zeroNode{}, nil
 	}
 
 	tableDesc.SetName(newTn.Table())
@@ -243,13 +241,10 @@ func (p *planner) RenameTable(ctx context.Context, n *parser.RenameTable) (planN
 		if err := expectDescriptorID(systemConfig, newTbKey, descID); err != nil {
 			return err
 		}
-		if err := expectDescriptor(systemConfig, descKey, descDesc); err != nil {
-			return err
-		}
-		return nil
+		return expectDescriptor(systemConfig, descKey, descDesc)
 	})
 
-	return &emptyNode{}, nil
+	return &zeroNode{}, nil
 }
 
 // RenameIndex renames the index.
@@ -262,17 +257,16 @@ func (p *planner) RenameIndex(ctx context.Context, n *parser.RenameIndex) (planN
 		return nil, err
 	}
 
-	tableDesc, err := mustGetTableDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
+	tableDesc, err := MustGetTableDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
 	if err != nil {
 		return nil, err
 	}
 
-	normIdxName := n.Index.Index.Normalize()
-	idx, _, err := tableDesc.FindIndexByName(n.Index.Index)
+	idx, _, err := tableDesc.FindIndexByName(string(n.Index.Index))
 	if err != nil {
 		if n.IfExists {
 			// Noop.
-			return &emptyNode{}, nil
+			return &zeroNode{}, nil
 		}
 		// Index does not exist, but we want it to: error out.
 		return nil, err
@@ -293,18 +287,17 @@ func (p *planner) RenameIndex(ctx context.Context, n *parser.RenameIndex) (planN
 	if n.NewName == "" {
 		return nil, errEmptyIndexName
 	}
-	normNewIdxName := n.NewName.Normalize()
 
-	if normIdxName == normNewIdxName {
+	if n.Index.Index == n.NewName {
 		// Noop.
-		return &emptyNode{}, nil
+		return &zeroNode{}, nil
 	}
 
-	if _, _, err := tableDesc.FindIndexByName(n.NewName); err == nil {
-		return nil, fmt.Errorf("index name %q already exists", n.NewName)
+	if _, _, err := tableDesc.FindIndexByName(string(n.NewName)); err == nil {
+		return nil, fmt.Errorf("index name %q already exists", string(n.NewName))
 	}
 
-	tableDesc.RenameIndexDescriptor(idx, normNewIdxName)
+	tableDesc.RenameIndexDescriptor(idx, string(n.NewName))
 
 	if err := tableDesc.SetUpVersion(); err != nil {
 		return nil, err
@@ -317,7 +310,7 @@ func (p *planner) RenameIndex(ctx context.Context, n *parser.RenameIndex) (planN
 		return nil, err
 	}
 	p.notifySchemaChange(tableDesc, sqlbase.InvalidMutationID)
-	return &emptyNode{}, nil
+	return &zeroNode{}, nil
 }
 
 // RenameColumn renames the column.
@@ -337,7 +330,7 @@ func (p *planner) RenameColumn(ctx context.Context, n *parser.RenameColumn) (pla
 	if tableDesc == nil {
 		if n.IfExists {
 			// Noop.
-			return &emptyNode{}, nil
+			return &zeroNode{}, nil
 		}
 		// Key does not exist, but we want it to: error out.
 		return nil, fmt.Errorf("table %q does not exist", tn.Table())
@@ -350,8 +343,6 @@ func (p *planner) RenameColumn(ctx context.Context, n *parser.RenameColumn) (pla
 	if n.NewName == "" {
 		return nil, errEmptyColumnName
 	}
-	normNewColName := n.NewName.Normalize()
-	normColName := n.Name.Normalize()
 
 	col, _, err := tableDesc.FindColumnByName(n.Name)
 	// n.IfExists only applies to table, no need to check here.
@@ -372,9 +363,9 @@ func (p *planner) RenameColumn(ctx context.Context, n *parser.RenameColumn) (pla
 		}
 	}
 
-	if normColName == normNewColName {
+	if n.Name == n.NewName {
 		// Noop.
-		return &emptyNode{}, nil
+		return &zeroNode{}, nil
 	}
 
 	if _, _, err := tableDesc.FindColumnByName(n.NewName); err == nil {
@@ -388,7 +379,7 @@ func (p *planner) RenameColumn(ctx context.Context, n *parser.RenameColumn) (pla
 				return err, false, nil
 			}
 			if c, ok := v.(*parser.ColumnItem); ok {
-				if c.ColumnName.Normalize() == normColName {
+				if string(c.ColumnName) == string(n.Name) {
 					c.ColumnName = n.NewName
 				}
 			}
@@ -416,7 +407,7 @@ func (p *planner) RenameColumn(ctx context.Context, n *parser.RenameColumn) (pla
 		}
 	}
 	// Rename the column in the indexes.
-	tableDesc.RenameColumnDescriptor(col, normNewColName)
+	tableDesc.RenameColumnDescriptor(col, string(n.NewName))
 
 	if err := tableDesc.SetUpVersion(); err != nil {
 		return nil, err
@@ -430,7 +421,7 @@ func (p *planner) RenameColumn(ctx context.Context, n *parser.RenameColumn) (pla
 		return nil, err
 	}
 	p.notifySchemaChange(tableDesc, sqlbase.InvalidMutationID)
-	return &emptyNode{}, nil
+	return &zeroNode{}, nil
 }
 
 // TODO(a-robinson): Support renaming objects depended on by views once we have

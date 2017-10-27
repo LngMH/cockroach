@@ -11,14 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package sql
 
 import (
 	"fmt"
 	"sort"
+
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 
 	"golang.org/x/net/context"
 
@@ -80,12 +80,13 @@ type virtualSchemaEntry struct {
 	orderedTableNames []string
 }
 
-func (e virtualSchemaEntry) tableNames() parser.TableNames {
+func (e virtualSchemaEntry) tableNames(dbNameOriginallyOmitted bool) parser.TableNames {
 	var res parser.TableNames
 	for _, tableName := range e.orderedTableNames {
 		tn := parser.TableName{
-			DatabaseName: parser.Name(e.desc.Name),
-			TableName:    parser.Name(tableName),
+			DatabaseName:            parser.Name(e.desc.Name),
+			TableName:               parser.Name(tableName),
+			DBNameOriginallyOmitted: dbNameOriginallyOmitted,
 		}
 		res = append(res, tn)
 	}
@@ -197,7 +198,7 @@ func initVirtualTableDesc(
 		return sqlbase.TableDescriptor{}, err
 	}
 	create := stmt.(*parser.CreateTable)
-	return p.makeTableDesc(ctx, create, 0, keys.VirtualDescriptorID, emptyPrivileges, nil)
+	return p.makeTableDesc(ctx, create, 0, keys.VirtualDescriptorID, hlc.Timestamp{}, emptyPrivileges, nil)
 }
 
 // getVirtualSchemaEntry retrieves a virtual schema entry given a database name.
@@ -237,11 +238,11 @@ func (e *Executor) IsVirtualDatabase(name string) bool {
 func (vs *virtualSchemaHolder) getVirtualTableEntry(
 	tn *parser.TableName,
 ) (virtualTableEntry, error) {
-	if db, ok := vs.getVirtualSchemaEntry(tn.DatabaseName.Normalize()); ok {
-		if t, ok := db.tables[tn.TableName.Normalize()]; ok {
+	if db, ok := vs.getVirtualSchemaEntry(string(tn.DatabaseName)); ok {
+		if t, ok := db.tables[string(tn.TableName)]; ok {
 			return t, nil
 		}
-		return virtualTableEntry{}, sqlbase.NewUndefinedTableError(tn.String())
+		return virtualTableEntry{}, sqlbase.NewUndefinedRelationError(tn)
 	}
 	return virtualTableEntry{}, nil
 }

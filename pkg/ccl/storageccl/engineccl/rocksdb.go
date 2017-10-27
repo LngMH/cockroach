@@ -19,26 +19,17 @@ import (
 
 // TODO(tamird): why does rocksdb not link jemalloc,snappy statically?
 
-// #cgo CPPFLAGS: -I../../../../c-deps/rocksdb/include
+// #cgo CPPFLAGS: -I../../../../c-deps/libroach/include
+// #cgo LDFLAGS: -lroachccl
+// #cgo LDFLAGS: -lroach
 // #cgo LDFLAGS: -lprotobuf
 // #cgo LDFLAGS: -lrocksdb
 // #cgo LDFLAGS: -lsnappy
-// #cgo CXXFLAGS: -std=c++11 -Werror -Wall -Wno-sign-compare
 // #cgo linux LDFLAGS: -lrt -lpthread
 // #cgo windows LDFLAGS: -lrpcrt4
 //
-// // Building this package will trigger "unresolved symbol" errors
-// // because it depends on C symbols defined in pkg/storage/engine,
-// // which aren't linked until the final binary is built. This is the
-// // platform voodoo to make the linker ignore these errors.
-// //
-// // TODO(tamird, #14673): make this package compile on Windows
-// // (and without these flags elsewhere).
-// #cgo darwin LDFLAGS: -Wl,-undefined -Wl,dynamic_lookup
-// #cgo !darwin LDFLAGS: -Wl,-unresolved-symbols=ignore-all
-//
 // #include <stdlib.h>
-// #include "db.h"
+// #include <libroachccl.h>
 import "C"
 
 // VerifyBatchRepr asserts that all keys in a BatchRepr are between the specified
@@ -61,11 +52,11 @@ func VerifyBatchRepr(
 		for r.Next() {
 			switch r.BatchType() {
 			case engine.BatchTypeValue:
-				mvccKey, err := engine.DecodeKey(r.UnsafeKey())
+				mvccKey, err := r.MVCCKey()
 				if err != nil {
 					return enginepb.MVCCStats{}, errors.Wrapf(err, "verifying key/value checksums")
 				}
-				v := roachpb.Value{RawBytes: r.UnsafeValue()}
+				v := roachpb.Value{RawBytes: r.Value()}
 				if err := v.Verify(mvccKey.Key); err != nil {
 					return enginepb.MVCCStats{}, err
 				}
@@ -93,6 +84,7 @@ func VerifyBatchRepr(
 //
 // `cannot use engine.GoToCSlice(repr) (type engine.C.struct___0) as type C.struct___0 in argument to _Cfunc_DBBatchReprVerify`
 //
+// The issue is tracked upstream at https://github.com/golang/go/issues/13467.
 // At worst, we could split these out into a separate file in storage/engine and
 // use `go generate` to copy it here so they stay in sync.
 

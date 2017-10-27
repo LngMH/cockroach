@@ -7,7 +7,7 @@ set env(TERM) vt100
 if {[pwd] == "/"} {
   set ::env(HOME) "/logs"
 } else {
-  system "mkdir logs"
+  system "mkdir -p logs"
 }
 
 # Keep the history in a test location, so as to not override the
@@ -35,7 +35,12 @@ proc report {text} {
     # Docker is obnoxious in that it doesn't support setting `umask`.
     # Also CockroachDB doesn't honor umask anyway.
     # So we simply come after the fact and adjust the permissions.
-    system "find logs -exec chmod a+rw '{}' \\;"
+    #
+    # The find may race with a cockroach process shutting down in the
+    # background; cockroach might be deleting files as they are being
+    # found, causing chmod to not find its target file. We ignore
+    # these errors.
+    system "find logs -exec chmod a+rw '{}' \\; || true"
 }
 
 # Catch signals
@@ -73,6 +78,15 @@ proc interrupt {} {
     report "INTERRUPT TO FOREGROUND PROCESS"
     send "\003"
     sleep 0.4
+}
+
+# Convenience function that sends Ctrl+D to the monitored process.
+# Leaves some upfront delay to let the readline process the time
+# to initialize the key binding.
+proc send_eof {} {
+    report "EOF TO FOREGROUND PROCESS"
+    sleep 0.4
+    send "\004"
 }
 
 # Convenience functions to start/shutdown the server.

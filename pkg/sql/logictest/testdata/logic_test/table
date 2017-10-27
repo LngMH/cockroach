@@ -79,7 +79,7 @@ query TTBTT colnames
 SHOW COLUMNS FROM d
 ----
 Field Type   Null  Default Indices
-id    INT    false NULL    {primary}
+id    INT    false NULL    {"primary"}
 
 statement ok
 CREATE TABLE e (
@@ -90,7 +90,7 @@ query TTBTT colnames
 SHOW COLUMNS FROM e
 ----
 Field Type   Null   Default Indices
-id    INT    false  NULL    {primary}
+id    INT    false  NULL    {"primary"}
 
 statement ok
 CREATE TABLE f (
@@ -104,9 +104,9 @@ query TTBTT colnames
 SHOW COLUMNS FROM f
 ----
 Field Type   Null  Default Indices
-a     INT   false  NULL    {primary}
-b     INT   false  NULL    {primary}
-c     INT   false  NULL    {primary}
+a     INT   false  NULL    {"primary"}
+b     INT   false  NULL    {"primary"}
+c     INT   false  NULL    {"primary"}
 
 query T
 SHOW TABLES FROM test
@@ -127,7 +127,7 @@ SHOW COLUMNS FROM users
 query error database "foo" does not exist
 SHOW COLUMNS FROM foo.users
 
-query error table "test.users" does not exist
+query error relation "test.users" does not exist
 SHOW COLUMNS FROM test.users
 
 query error no database specified
@@ -136,7 +136,7 @@ SHOW INDEXES FROM users
 query error database "foo" does not exist
 SHOW INDEXES FROM foo.users
 
-query error table "test.users" does not exist
+query error relation "test.users" does not exist
 SHOW INDEXES FROM test.users
 
 statement ok
@@ -160,8 +160,8 @@ query TTBTT colnames
 SHOW COLUMNS FROM test.users
 ----
 Field       Type        Null    Default Indices
-id          INT         false   NULL    {primary,foo,bar}
-name        STRING      false   NULL    {foo,bar}
+id          INT         false   NULL    {"primary","foo","bar"}
+name        STRING      false   NULL    {"foo","bar"}
 title       STRING      true    NULL    {}
 nickname    STRING      true    NULL	{}
 username    STRING(10)  true    NULL	{}
@@ -430,16 +430,6 @@ ALTER TABLE smtng.something ADD COLUMN IF NOT EXISTS MODEL_ID INT
 
 statement ok
 ALTER TABLE smtng.something ADD COLUMN IF NOT EXISTS NAME STRING
-
-query error pq: unimplemented: ARRAY column types are unsupported \(see issue https://github.com/cockroachdb/cockroach/issues/2115\)
-CREATE TABLE IF NOT EXISTS test.int_array_test (
-  arr INT[]
-)
-
-query error pq: unimplemented: VECTOR column types are unsupported \(see issue https://github.com/cockroachdb/cockroach/issues/2115\)
-CREATE TABLE IF NOT EXISTS test.int_array_test (
-  arr INT2VECTOR
-)
 
 # Regression test for #13725
 statement ok

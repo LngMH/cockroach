@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package distsqlrun
 
@@ -29,5 +27,6 @@ func MakeEvalContext(evalCtx parser.EvalContext) EvalContext {
 		ClusterTimestamp:   evalCtx.GetClusterTimestampRaw(),
 		Location:           evalCtx.GetLocation().String(),
 		Database:           evalCtx.Database,
+		User:               evalCtx.User,
 	}
 }

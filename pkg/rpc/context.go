@@ -11,22 +11,20 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package rpc
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
+	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
 	"github.com/rubyist/circuitbreaker"
 	"golang.org/x/net/context"
 	"golang.org/x/sync/syncmap"
@@ -42,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 func init() {
@@ -66,10 +65,9 @@ const (
 	initialConnWindowSize = initialWindowSize * 16 // for a connection
 )
 
-// SourceAddr provides a way to specify a source/local address for outgoing
-// connections. It should only ever be set by testing code, and is not thread
-// safe (so it must be initialized before the server starts).
-var SourceAddr = func() net.Addr {
+// sourceAddr is the environment-provided local address for outgoing
+// connections.
+var sourceAddr = func() net.Addr {
 	const envKey = "COCKROACH_SOURCE_IP_ADDRESS"
 	if sourceAddr, ok := envutil.EnvString(envKey, 0); ok {
 		sourceIP := net.ParseIP(sourceAddr)
@@ -85,9 +83,24 @@ var SourceAddr = func() net.Addr {
 
 var enableRPCCompression = envutil.EnvOrDefaultBool("COCKROACH_ENABLE_RPC_COMPRESSION", true)
 
+func spanInclusionFunc(
+	parentSpanCtx opentracing.SpanContext, method string, req, resp interface{},
+) bool {
+	return parentSpanCtx != nil && !tracing.IsNoopContext(parentSpanCtx)
+}
+
 // NewServer is a thin wrapper around grpc.NewServer that registers a heartbeat
 // service.
 func NewServer(ctx *Context) *grpc.Server {
+	return NewServerWithInterceptor(ctx, nil)
+}
+
+// NewServerWithInterceptor is like NewServer, but accepts an additional
+// interceptor which is called before streaming and unary RPCs and may inject an
+// error.
+func NewServerWithInterceptor(
+	ctx *Context, interceptor func(fullMethod string) error,
+) *grpc.Server {
 	opts := []grpc.ServerOption{
 		// The limiting factor for lowering the max message size is the fact
 		// that a single large kv can be sent over the network in one message.
@@ -107,6 +120,13 @@ func NewServer(ctx *Context) *grpc.Server {
 		// streams/requests on either the client or server.
 		grpc.MaxConcurrentStreams(math.MaxInt32),
 		grpc.RPCDecompressor(snappyDecompressor{}),
+		// By default, gRPC disconnects clients that send "too many" pings,
+		// but we don't really care about that, so configure the server to be
+		// as permissive as possible.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             time.Nanosecond,
+			PermitWithoutStream: true,
+		}),
 	}
 	// Compression is enabled separately from decompression to allow staged
 	// rollout.
@@ -120,11 +140,64 @@ func NewServer(ctx *Context) *grpc.Server {
 		}
 		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsConfig)))
 	}
+
+	var unaryInterceptor grpc.UnaryServerInterceptor
+	var streamInterceptor grpc.StreamServerInterceptor
+
 	if tracer := ctx.AmbientCtx.Tracer; tracer != nil {
-		opts = append(opts, grpc.UnaryInterceptor(
-			otgrpc.OpenTracingServerInterceptor(tracer),
-		))
+		// We use a SpanInclusionFunc to save a bit of unnecessary work when
+		// tracing is disabled.
+		unaryInterceptor = otgrpc.OpenTracingServerInterceptor(
+			tracer,
+			otgrpc.IncludingSpans(otgrpc.SpanInclusionFunc(spanInclusionFunc)),
+		)
+		// TODO(tschottdorf): should set up tracing for stream-based RPCs as
+		// well. The otgrpc package has no such facility, but there's also this:
+		//
+		// https://github.com/grpc-ecosystem/go-grpc-middleware/tree/master/tracing/opentracing
 	}
+
+	// TODO(tschottdorf): when setting up the interceptors below, could make the
+	// functions a wee bit more performant by hoisting some of the nil checks
+	// out. Doubt measurements can tell the difference though.
+
+	if interceptor != nil {
+		prevUnaryInterceptor := unaryInterceptor
+		unaryInterceptor = func(
+			ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler,
+		) (interface{}, error) {
+			if err := interceptor(info.FullMethod); err != nil {
+				return nil, err
+			}
+			if prevUnaryInterceptor != nil {
+				return prevUnaryInterceptor(ctx, req, info, handler)
+			}
+			return handler(ctx, req)
+		}
+	}
+
+	if interceptor != nil {
+		prevStreamInterceptor := streamInterceptor
+		streamInterceptor = func(
+			srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler,
+		) error {
+			if err := interceptor(info.FullMethod); err != nil {
+				return err
+			}
+			if prevStreamInterceptor != nil {
+				return prevStreamInterceptor(srv, stream, info, handler)
+			}
+			return handler(srv, stream)
+		}
+	}
+
+	if unaryInterceptor != nil {
+		opts = append(opts, grpc.UnaryInterceptor(unaryInterceptor))
+	}
+	if streamInterceptor != nil {
+		opts = append(opts, grpc.StreamInterceptor(streamInterceptor))
+	}
+
 	s := grpc.NewServer(opts...)
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              ctx.LocalClock,
@@ -218,9 +291,9 @@ func NewContext(
 }
 
 // GetLocalInternalServerForAddr returns the context's internal batch server
-// for addr, if it exists.
-func (ctx *Context) GetLocalInternalServerForAddr(addr string) roachpb.InternalServer {
-	if addr == ctx.Addr {
+// for target, if it exists.
+func (ctx *Context) GetLocalInternalServerForAddr(target string) roachpb.InternalServer {
+	if target == ctx.Addr {
 		return ctx.localInternalServer
 	}
 	return nil
@@ -245,6 +318,56 @@ func (ctx *Context) removeConn(key string, meta *connMeta) {
 	}
 }
 
+// GRPCDialOptions returns the minimal `grpc.DialOption`s necessary to connect
+// to a server created with `NewServer`.
+//
+// At the time of writing, this is being used for making net.Pipe-based
+// connections, so only those options that affect semantics are included. In
+// particular, performance tuning options are omitted. Decompression is
+// necessarily included to support compression-enabled servers, and compression
+// is included for symmetry. These choices are admittedly subjective.
+func (ctx *Context) GRPCDialOptions() ([]grpc.DialOption, error) {
+	var dialOpts []grpc.DialOption
+	if ctx.Insecure {
+		dialOpts = append(dialOpts, grpc.WithInsecure())
+	} else {
+		tlsConfig, err := ctx.GetClientTLSConfig()
+		if err != nil {
+			return nil, err
+		}
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	}
+
+	// The limiting factor for lowering the max message size is the fact
+	// that a single large kv can be sent over the network in one message.
+	// Our maximum kv size is unlimited, so we need this to be very large.
+	//
+	// TODO(peter,tamird): need tests before lowering.
+	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
+		grpc.MaxCallRecvMsgSize(math.MaxInt32),
+		grpc.MaxCallSendMsgSize(math.MaxInt32),
+	))
+
+	dialOpts = append(dialOpts, grpc.WithDecompressor(snappyDecompressor{}))
+	// Compression is enabled separately from decompression to allow staged
+	// rollout.
+	if ctx.rpcCompression {
+		dialOpts = append(dialOpts, grpc.WithCompressor(snappyCompressor{}))
+	}
+
+	if tracer := ctx.AmbientCtx.Tracer; tracer != nil {
+		// We use a SpanInclusionFunc to circumvent the interceptor's work when
+		// tracing is disabled. Otherwise, the interceptor causes an increase in
+		// the number of packets (even with an empty context!). See #17177.
+		interceptor := otgrpc.OpenTracingClientInterceptor(
+			tracer,
+			otgrpc.IncludingSpans(otgrpc.SpanInclusionFunc(spanInclusionFunc)),
+		)
+		dialOpts = append(dialOpts, grpc.WithUnaryInterceptor(interceptor))
+	}
+	return dialOpts, nil
+}
+
 // GRPCDial calls grpc.Dial with the options appropriate for the context.
 func (ctx *Context) GRPCDial(target string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	value, ok := ctx.conns.Load(target)
@@ -256,36 +379,13 @@ func (ctx *Context) GRPCDial(target string, opts ...grpc.DialOption) (*grpc.Clie
 
 	meta := value.(*connMeta)
 	meta.Do(func() {
-		var dialOpt grpc.DialOption
-		if ctx.Insecure {
-			dialOpt = grpc.WithInsecure()
-		} else {
-			tlsConfig, err := ctx.GetClientTLSConfig()
-			if err != nil {
-				meta.dialErr = err
-				return
-			}
-			dialOpt = grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig))
+		dialOpts, err := ctx.GRPCDialOptions()
+		if err != nil {
+			meta.dialErr = err
+			return
 		}
 
-		var dialOpts []grpc.DialOption
-		dialOpts = append(dialOpts, dialOpt)
-		// The limiting factor for lowering the max message size is the fact
-		// that a single large kv can be sent over the network in one message.
-		// Our maximum kv size is unlimited, so we need this to be very large.
-		//
-		// TODO(peter,tamird): need tests before lowering.
-		dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(math.MaxInt32),
-			grpc.MaxCallSendMsgSize(math.MaxInt32),
-		))
 		dialOpts = append(dialOpts, grpc.WithBackoffMaxDelay(maxBackoff))
-		dialOpts = append(dialOpts, grpc.WithDecompressor(snappyDecompressor{}))
-		// Compression is enabled separately from decompression to allow staged
-		// rollout.
-		if ctx.rpcCompression {
-			dialOpts = append(dialOpts, grpc.WithCompressor(snappyCompressor{}))
-		}
 		dialOpts = append(dialOpts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			// Send periodic pings on the connection.
 			Time: base.NetworkTimeout,
@@ -297,23 +397,20 @@ func (ctx *Context) GRPCDial(target string, opts ...grpc.DialOption) (*grpc.Clie
 			// Do the pings even when there are no ongoing RPCs.
 			PermitWithoutStream: true,
 		}))
+		dialOpts = append(dialOpts,
+			grpc.WithInitialWindowSize(initialWindowSize),
+			grpc.WithInitialConnWindowSize(initialConnWindowSize))
 		dialOpts = append(dialOpts, opts...)
 
-		if SourceAddr != nil {
+		if sourceAddr != nil {
 			dialOpts = append(dialOpts, grpc.WithDialer(
 				func(addr string, timeout time.Duration) (net.Conn, error) {
 					dialer := net.Dialer{
 						Timeout:   timeout,
-						LocalAddr: SourceAddr,
+						LocalAddr: sourceAddr,
 					}
 					return dialer.Dial("tcp", addr)
 				},
-			))
-		}
-
-		if tracer := ctx.AmbientCtx.Tracer; tracer != nil {
-			dialOpts = append(dialOpts, grpc.WithUnaryInterceptor(
-				otgrpc.OpenTracingClientInterceptor(tracer),
 			))
 		}
 
@@ -365,14 +462,18 @@ var ErrNotHeartbeated = errors.New("not yet heartbeated")
 // ConnHealth returns whether the most recent heartbeat succeeded or not.
 // This should not be used as a definite status of a node's health and just used
 // to prioritize healthy nodes over unhealthy ones.
-func (ctx *Context) ConnHealth(remoteAddr string) error {
-	if value, ok := ctx.conns.Load(remoteAddr); ok {
+func (ctx *Context) ConnHealth(target string) error {
+	if ctx.GetLocalInternalServerForAddr(target) != nil {
+		// The local server is always considered healthy.
+		return nil
+	}
+	if value, ok := ctx.conns.Load(target); ok {
 		return value.(*connMeta).heartbeatErr.Load().(errValue).error
 	}
 	return ErrNotConnected
 }
 
-func (ctx *Context) runHeartbeat(meta *connMeta, remoteAddr string) error {
+func (ctx *Context) runHeartbeat(meta *connMeta, target string) error {
 	maxOffset := ctx.LocalClock.MaxOffset()
 
 	request := PingRequest{
@@ -408,15 +509,6 @@ func (ctx *Context) runHeartbeat(meta *connMeta, remoteAddr string) error {
 		}
 		meta.heartbeatErr.Store(errValue{err})
 
-		// HACK: work around https://github.com/grpc/grpc-go/issues/1026
-		// Getting a "connection refused" error from the "write" system call
-		// has confused grpc's error handling and this connection is permanently
-		// broken.
-		// TODO(bdarnell): remove this when the upstream bug is fixed.
-		if err != nil && strings.Contains(err.Error(), "write: connection refused") {
-			return nil
-		}
-
 		if err == nil {
 			receiveTime := ctx.LocalClock.PhysicalTime()
 
@@ -436,10 +528,10 @@ func (ctx *Context) runHeartbeat(meta *connMeta, remoteAddr string) error {
 				// now.
 				request.Offset.MeasuredAt = receiveTime.UnixNano()
 				request.Offset.Uncertainty = (pingDuration / 2).Nanoseconds()
-				remoteTimeNow := time.Unix(0, response.ServerTime).Add(pingDuration / 2)
+				remoteTimeNow := timeutil.Unix(0, response.ServerTime).Add(pingDuration / 2)
 				request.Offset.Offset = remoteTimeNow.Sub(receiveTime).Nanoseconds()
 			}
-			ctx.RemoteClocks.UpdateOffset(ctx.masterCtx, remoteAddr, request.Offset, pingDuration)
+			ctx.RemoteClocks.UpdateOffset(ctx.masterCtx, target, request.Offset, pingDuration)
 
 			if cb := ctx.HeartbeatCB; cb != nil {
 				cb()

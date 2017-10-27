@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package roachpb
 
@@ -20,10 +18,10 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/gogo/protobuf/proto"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/pkg/errors"
-	"github.com/rlmcpherson/s3gof3r"
 )
 
 // UserPriority is a custom type for transaction's user priority.
@@ -86,15 +84,6 @@ const (
 	updatesTSCache  // commands which read data at a timestamp
 )
 
-// GetTxnID returns the transaction ID if the header has a transaction
-// or else nil.
-func (h Header) GetTxnID() *uuid.UUID {
-	if h.Txn == nil {
-		return nil
-	}
-	return h.Txn.ID
-}
-
 // IsReadOnly returns true iff the request is read-only.
 func IsReadOnly(args Request) bool {
 	flags := args.flags()
@@ -131,7 +120,7 @@ func UpdatesTimestampCache(args Request) bool {
 
 // Request is an interface for RPC requests.
 type Request interface {
-	proto.Message
+	protoutil.Message
 	// Header returns the request header.
 	Header() Span
 	// SetHeader sets the request header.
@@ -164,7 +153,7 @@ func (tlr *TransferLeaseRequest) prevLease() Lease {
 
 // Response is an interface for RPC responses.
 type Response interface {
-	proto.Message
+	protoutil.Message
 	// Header returns the response header.
 	Header() ResponseHeader
 	// SetHeader sets the response header.
@@ -799,16 +788,19 @@ func NewConditionalPut(key Key, value, expValue Value) Request {
 	}
 }
 
-// NewInitPut returns a Request initialized to put the value at key,
-// as long as the key doesn't exist, returning an error if the key
-// exists and the existing value is different from value.
-func NewInitPut(key Key, value Value) Request {
+// NewInitPut returns a Request initialized to put the value at key, as long as
+// the key doesn't exist, returning a ConditionFailedError if the key exists and
+// the existing value is different from value. If failOnTombstones is set to
+// true, tombstones count as mismatched values and will cause a
+// ConditionFailedError.
+func NewInitPut(key Key, value Value, failOnTombstones bool) Request {
 	value.InitChecksum(key)
 	return &InitPutRequest{
 		Span: Span{
 			Key: key,
 		},
-		Value: value,
+		Value:            value,
+		FailOnTombstones: failOnTombstones,
 	}
 }
 
@@ -957,11 +949,10 @@ func (*ImportRequest) flags() int                   { return isAdmin | isAlone }
 func (*AdminScatterRequest) flags() int             { return isAdmin | isAlone | isRange }
 func (*AddSSTableRequest) flags() int               { return isWrite | isAlone | isRange }
 
-// Keys returns credentials in an s3gof3r.Keys
-func (b *ExportStorage_S3) Keys() s3gof3r.Keys {
-	return s3gof3r.Keys{
-		AccessKey: b.AccessKey,
-		SecretKey: b.Secret,
+// Keys returns credentials in an aws.Config.
+func (b *ExportStorage_S3) Keys() *aws.Config {
+	return &aws.Config{
+		Credentials: credentials.NewStaticCredentials(b.AccessKey, b.Secret, ""),
 	}
 }
 

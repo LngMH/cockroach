@@ -11,14 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
 import (
-	"fmt"
-
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
@@ -30,8 +26,6 @@ import (
 // computationally, by means of a "generator function" (called
 // "set-generating function" in PostgreSQL).
 type valueGenerator struct {
-	p *planner
-
 	// expr holds the function call that needs to be performed,
 	// including its arguments that need evaluation, to obtain the
 	// generator object.
@@ -48,8 +42,6 @@ type valueGenerator struct {
 // makeGenerator creates a valueGenerator instance that wraps a call to a
 // generator function.
 func (p *planner) makeGenerator(ctx context.Context, t *parser.FuncExpr) (planNode, error) {
-	origName := t.Func.String()
-
 	if err := p.parser.AssertNoAggregationOrWindowing(t, "FROM", p.session.SearchPath); err != nil {
 		return nil, err
 	}
@@ -66,28 +58,20 @@ func (p *planner) makeGenerator(ctx context.Context, t *parser.FuncExpr) (planNo
 		return nil, errors.Errorf("FROM expression is not a generator: %s", t)
 	}
 
-	var columns sqlbase.ResultColumns
-	if len(tType.Cols) == 1 {
-		columns = sqlbase.ResultColumns{sqlbase.ResultColumn{Name: origName, Typ: tType.Cols[0]}}
-	} else {
-		columns = make(sqlbase.ResultColumns, len(tType.Cols))
-		for i, t := range tType.Cols {
-			columns[i] = sqlbase.ResultColumn{
-				Name: fmt.Sprintf("column%d", i+1),
-				Typ:  t,
-			}
-		}
+	columns := make(sqlbase.ResultColumns, len(tType.Cols))
+	for i := range columns {
+		columns[i].Name = tType.Labels[i]
+		columns[i].Typ = tType.Cols[i]
 	}
 
 	return &valueGenerator{
-		p:       p,
 		expr:    normalized,
 		columns: columns,
 	}, nil
 }
 
-func (n *valueGenerator) Start(context.Context) error {
-	expr, err := n.expr.Eval(&n.p.evalCtx)
+func (n *valueGenerator) Start(params runParams) error {
+	expr, err := n.expr.Eval(&params.p.evalCtx)
 	if err != nil {
 		return err
 	}
@@ -107,8 +91,13 @@ func (n *valueGenerator) Start(context.Context) error {
 	return nil
 }
 
-func (n *valueGenerator) Next(context.Context) (bool, error) { return n.gen.Next() }
-func (n *valueGenerator) Values() parser.Datums              { return n.gen.Values() }
+func (n *valueGenerator) Next(params runParams) (bool, error) {
+	if err := params.p.cancelChecker.Check(); err != nil {
+		return false, err
+	}
+	return n.gen.Next()
+}
+func (n *valueGenerator) Values() parser.Datums { return n.gen.Values() }
 
 func (n *valueGenerator) Close(context.Context) {
 	if n.gen != nil {

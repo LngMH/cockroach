@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package cli
 
@@ -225,7 +223,7 @@ func runListCerts(cmd *cobra.Command, args []string) error {
 		addRow(cert, fmt.Sprintf("user: %s", user))
 	}
 
-	return printQueryOutput(os.Stdout, certTableHeaders, newRowSliceIter(rows), "", cliCtx.tableDisplayFormat)
+	return printQueryOutput(os.Stdout, certTableHeaders, newRowSliceIter(rows))
 }
 
 var certCmds = []*cobra.Command{

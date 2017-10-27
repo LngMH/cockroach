@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package kv
 
@@ -29,9 +26,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/tscache"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -546,10 +543,7 @@ func TestTxnTimestampRegression(t *testing.T) {
 		}
 
 		// Write now to keyB, which will get a higher timestamp than keyB was written at.
-		if err := txn.Put(ctx, keyB, "value2"); err != nil {
-			return err
-		}
-		return nil
+		return txn.Put(ctx, keyB, "value2")
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -591,7 +585,7 @@ func TestTxnLongDelayBetweenWritesWithConcurrentRead(t *testing.T) {
 	// Wait till txnA finish put(a).
 	<-ch
 	// Delay for longer than the cache window.
-	s.Manual.Increment((storage.MinTSCacheWindow + time.Second).Nanoseconds())
+	s.Manual.Increment((tscache.MinTSCacheWindow + time.Second).Nanoseconds())
 	if err := s.DB.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 		// Use snapshot isolation.
 		if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {

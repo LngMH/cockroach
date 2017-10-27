@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (peter@cockroachlabs.com)
 
 package cli
 
@@ -103,9 +101,10 @@ func TestRunQuery(t *testing.T) {
 	// Use a buffer as the io.Writer.
 	var b bytes.Buffer
 
+	cliCtx.tableDisplayFormat = tableDisplayPretty
+
 	// Non-query statement.
-	if err := runQueryAndFormatResults(conn, &b, makeQuery(`SET DATABASE=system`),
-		tableDisplayPretty); err != nil {
+	if err := runQueryAndFormatResults(conn, &b, makeQuery(`SET DATABASE=system`)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -118,7 +117,7 @@ SET
 	b.Reset()
 
 	// Use system database for sample query/output as they are fairly fixed.
-	cols, rows, _, err := runQuery(conn, makeQuery(`SHOW COLUMNS FROM system.namespace`), false)
+	cols, rows, err := runQuery(conn, makeQuery(`SHOW COLUMNS FROM system.namespace`), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,8 +128,8 @@ SET
 	}
 
 	expectedRows := [][]string{
-		{`parentID`, `INT`, `false`, `NULL`, `{primary}`},
-		{`name`, `STRING`, `false`, `NULL`, `{primary}`},
+		{`parentID`, `INT`, `false`, `NULL`, `"{\"primary\"}"`},
+		{`name`, `STRING`, `false`, `NULL`, `"{\"primary\"}"`},
 		{`id`, `INT`, `true`, `NULL`, `{}`},
 	}
 	if !reflect.DeepEqual(expectedRows, rows) {
@@ -138,18 +137,18 @@ SET
 	}
 
 	if err := runQueryAndFormatResults(conn, &b,
-		makeQuery(`SHOW COLUMNS FROM system.namespace`), tableDisplayPretty); err != nil {
+		makeQuery(`SHOW COLUMNS FROM system.namespace`)); err != nil {
 		t.Fatal(err)
 	}
 
 	expected = `
-+----------+--------+-------+---------+-----------+
-|  Field   |  Type  | Null  | Default |  Indices  |
-+----------+--------+-------+---------+-----------+
-| parentID | INT    | false | NULL    | {primary} |
-| name     | STRING | false | NULL    | {primary} |
-| id       | INT    | true  | NULL    | {}        |
-+----------+--------+-------+---------+-----------+
++----------+--------+-------+---------+-------------+
+|  Field   |  Type  | Null  | Default |   Indices   |
++----------+--------+-------+---------+-------------+
+| parentID | INT    | false | NULL    | {"primary"} |
+| name     | STRING | false | NULL    | {"primary"} |
+| id       | INT    | true  | NULL    | {}          |
++----------+--------+-------+---------+-------------+
 (3 rows)
 `
 
@@ -160,8 +159,7 @@ SET
 
 	// Test placeholders.
 	if err := runQueryAndFormatResults(conn, &b,
-		makeQuery(`SELECT * FROM system.namespace WHERE name=$1`, "descriptor"),
-		tableDisplayPretty); err != nil {
+		makeQuery(`SELECT * FROM system.namespace WHERE name=$1`, "descriptor")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -180,7 +178,7 @@ SET
 
 	// Test multiple results.
 	if err := runQueryAndFormatResults(conn, &b,
-		makeQuery(`SELECT 1; SELECT 2, 3; SELECT 'hello'`), tableDisplayPretty); err != nil {
+		makeQuery(`SELECT 1; SELECT 2, 3; SELECT 'hello'`)); err != nil {
 		t.Fatal(err)
 	}
 

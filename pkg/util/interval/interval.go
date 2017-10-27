@@ -11,6 +11,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 )
 
 // ErrInvertedRange is returned if an interval is used where the start value is greater
@@ -57,6 +59,10 @@ type inclusiveOverlapper struct{}
 
 // Overlap checks where a and b overlap in the inclusive way.
 func (overlapper inclusiveOverlapper) Overlap(a Range, b Range) bool {
+	return overlapsInclusive(a, b)
+}
+
+func overlapsInclusive(a Range, b Range) bool {
 	return a.Start.Compare(b.End) <= 0 && b.Start.Compare(a.End) <= 0
 }
 
@@ -68,6 +74,10 @@ type exclusiveOverlapper struct{}
 
 // Overlap checks where a and b overlap in the exclusive way.
 func (overlapper exclusiveOverlapper) Overlap(a Range, b Range) bool {
+	return overlapsExclusive(a, b)
+}
+
+func overlapsExclusive(a Range, b Range) bool {
 	return a.Start.Compare(b.End) < 0 && b.Start.Compare(a.End) < 0
 }
 
@@ -185,6 +195,8 @@ type Tree interface {
 	// Iterator creates an iterator to iterate over all intervals stored in the
 	// tree, in-order.
 	Iterator() TreeIterator
+	// Clear this tree.
+	Clear()
 }
 
 // TreeIterator iterates over all intervals stored in the interval tree, in-order.
@@ -195,8 +207,13 @@ type TreeIterator interface {
 	Next() (Interface, bool)
 }
 
+var useBTreeImpl = envutil.EnvOrDefaultBool("COCKROACH_INTERVAL_BTREE", false)
+
 // NewTree creates a new interval tree with the given overlapper function. It
 // uses the augmented Left-Leaning Red Black tree implementation.
 func NewTree(overlapper Overlapper) Tree {
-	return newLLBRTree(overlapper)
+	if useBTreeImpl {
+		return newBTree(overlapper)
+	}
+	return newLLRBTree(overlapper)
 }

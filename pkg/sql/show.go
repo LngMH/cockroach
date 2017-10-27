@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
@@ -32,36 +30,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
-const (
-	checkSchemaQuery = `
-		SELECT SCHEMA_NAME
-		FROM "".information_schema.schemata
-		WHERE SCHEMA_NAME=$1
-		LIMIT 1`
-	checkTableQuery = `
-		SELECT TABLE_SCHEMA
-		FROM "".information_schema.tables
-		WHERE
-			TABLE_SCHEMA=$1 AND
-			TABLE_NAME=$2
-		LIMIT 1`
-	checkTablePrivilegesQuery = `
-		SELECT TABLE_NAME
-		FROM "".information_schema.table_privileges
-		WHERE
-			TABLE_SCHEMA=$1 AND
-			TABLE_NAME=$2 AND
-			GRANTEE=$3
-		LIMIT 1`
-)
-
 // checkDBExists checks if the database exists by using the security.RootUser.
 func checkDBExists(ctx context.Context, p *planner, db string) error {
-	values, err := p.queryRowsAsRoot(ctx, checkSchemaQuery, db)
-	if err != nil {
-		return err
-	}
-	if len(values) == 0 {
+	if _, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), db); err != nil {
 		return sqlbase.NewUndefinedDatabaseError(db)
 	}
 	return nil
@@ -69,43 +40,28 @@ func checkDBExists(ctx context.Context, p *planner, db string) error {
 
 // checkTableExists checks if the table exists by using the security.RootUser.
 func checkTableExists(ctx context.Context, p *planner, tn *parser.TableName) error {
-	values, err := p.queryRowsAsRoot(ctx, checkTableQuery, tn.Database(), tn.Table())
-	if err != nil {
-		return err
-	}
-	if len(values) == 0 {
-		return sqlbase.NewUndefinedTableError(tn.String())
+	if _, err := MustGetTableOrViewDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/); err != nil {
+		return sqlbase.NewUndefinedRelationError(tn)
 	}
 	return nil
 }
 
-// checkTablePrivileges checks if the user has been granted privileges to
-// see the specified table.
-func checkTablePrivileges(ctx context.Context, p *planner, tn *parser.TableName) error {
-	// Skip the checking if the table is a virtual table.
-	if virDesc, err := p.session.virtualSchemas.getVirtualTableDesc(tn); err != nil {
-		return err
-	} else if virDesc != nil {
-		return nil
+func (p *planner) ShowClusterSetting(
+	ctx context.Context, n *parser.ShowClusterSetting,
+) (planNode, error) {
+
+	if err := p.RequireSuperUser("SHOW CLUSTER SETTINGS"); err != nil {
+		return nil, err
 	}
 
-	values, err := p.queryRowsAsRoot(
-		ctx, checkTablePrivilegesQuery, tn.Database(), tn.Table(), p.session.User)
-	if err != nil {
-		return err
-	}
-	if len(values) == 0 {
-		return fmt.Errorf("user %s has no privileges on table %s", p.session.User, tn.String())
-	}
-	return nil
-}
+	name := strings.ToLower(n.Name)
 
-func (p *planner) showClusterSetting(ctx context.Context, name string) (planNode, error) {
 	if name == "all" {
 		return p.delegateQuery(ctx, "SHOW CLUSTER SETTINGS",
 			"TABLE crdb_internal.cluster_settings", nil, nil)
 	}
 
+	st := p.session.execCfg.Settings
 	val, ok := settings.Lookup(name)
 	if !ok {
 		return nil, errors.Errorf("unknown setting: %q", name)
@@ -114,7 +70,7 @@ func (p *planner) showClusterSetting(ctx context.Context, name string) (planNode
 	switch val.(type) {
 	case *settings.IntSetting, *settings.EnumSetting:
 		dType = parser.TypeInt
-	case *settings.StringSetting, *settings.ByteSizeSetting:
+	case *settings.StringSetting, *settings.ByteSizeSetting, *settings.StateMachineSetting:
 		dType = parser.TypeString
 	case *settings.BoolSetting:
 		dType = parser.TypeBool
@@ -134,19 +90,51 @@ func (p *planner) showClusterSetting(ctx context.Context, name string) (planNode
 			d := parser.DNull
 			switch s := val.(type) {
 			case *settings.IntSetting:
-				d = parser.NewDInt(parser.DInt(s.Get()))
+				d = parser.NewDInt(parser.DInt(s.Get(&st.SV)))
 			case *settings.StringSetting:
-				d = parser.NewDString(s.String())
+				d = parser.NewDString(s.String(&st.SV))
+			case *settings.StateMachineSetting:
+				// Show consistent values for statemachine settings. This isn't necessary
+				// for correctness, but helpful for testability.
+				ie := InternalExecutor{LeaseManager: p.LeaseMgr()}
+				datums, err := ie.QueryRowInTransaction(
+					ctx, "retrieve-prev-setting", p.txn,
+					"SELECT value FROM system.settings WHERE name = $1",
+					name,
+				)
+				if err != nil {
+					return nil, err
+				}
+				var prevRawVal []byte
+				if len(datums) != 0 {
+					dStr, ok := datums[0].(*parser.DString)
+					if !ok {
+						return nil, errors.New("the existing value is not a string")
+					}
+					prevRawVal = []byte(string(*dStr))
+				}
+				// Note that if no entry is found, we pretend that an entry
+				// exists which is the version used for the running binary. This
+				// may not be 100.00% correct, but it will do. The input is
+				// checked more thoroughly when a user tries to change the
+				// value, and the corresponding sql migration that makes sure
+				// the above select finds something usually runs pretty quickly
+				// when the cluster is bootstrapped.
+				_, obj, err := s.Validate(&st.SV, prevRawVal, nil)
+				if err != nil {
+					return nil, errors.Errorf("unable to read existing value: %s", err)
+				}
+				d = parser.NewDString(obj.(fmt.Stringer).String())
 			case *settings.BoolSetting:
-				d = parser.MakeDBool(parser.DBool(s.Get()))
+				d = parser.MakeDBool(parser.DBool(s.Get(&st.SV)))
 			case *settings.FloatSetting:
-				d = parser.NewDFloat(parser.DFloat(s.Get()))
+				d = parser.NewDFloat(parser.DFloat(s.Get(&st.SV)))
 			case *settings.DurationSetting:
-				d = &parser.DInterval{Duration: duration.Duration{Nanos: s.Get().Nanoseconds()}}
+				d = &parser.DInterval{Duration: duration.Duration{Nanos: s.Get(&st.SV).Nanoseconds()}}
 			case *settings.EnumSetting:
-				d = parser.NewDInt(parser.DInt(s.Get()))
+				d = parser.NewDInt(parser.DInt(s.Get(&st.SV)))
 			case *settings.ByteSizeSetting:
-				d = parser.NewDString(s.String())
+				d = parser.NewDString(s.String(&st.SV))
 			}
 
 			v := p.newContainerValuesNode(columns, 0)
@@ -160,13 +148,9 @@ func (p *planner) showClusterSetting(ctx context.Context, name string) (planNode
 }
 
 // Show a session-local variable name.
-func (p *planner) Show(ctx context.Context, n *parser.Show) (planNode, error) {
+func (p *planner) ShowVar(ctx context.Context, n *parser.ShowVar) (planNode, error) {
 	origName := n.Name
 	name := strings.ToLower(n.Name)
-
-	if n.ClusterSetting {
-		return p.showClusterSetting(ctx, name)
-	}
 
 	if name == "all" {
 		return p.delegateQuery(ctx, "SHOW SESSION ALL", "TABLE crdb_internal.session_variables",
@@ -217,9 +201,12 @@ func (p *planner) ShowColumns(ctx context.Context, n *parser.ShowColumns) (planN
 }
 
 // showTableDetails extracts information about the given table using
-// the given query patterns in SQL. The query pattern must accept two
-// formatting parameters: the database and the table name, in that
-// order. They will be pre-formatted as SQL string literals.
+// the given query patterns in SQL. The query pattern must accept
+// the following formatting parameters:
+// %[1]s the database name as SQL string literal.
+// %[2]s the unqualified table name as SQL string literal.
+// %[3]s the given table name as SQL string literal.
+// %[4]s the database name as SQL identifier.
 func (p *planner) showTableDetails(
 	ctx context.Context, showType string, t parser.NormalizableTableName, query string,
 ) (planNode, error) {
@@ -233,39 +220,20 @@ func (p *planner) showTableDetails(
 		if err := checkDBExists(ctx, p, db); err != nil {
 			return err
 		}
-		if err := checkTableExists(ctx, p, tn); err != nil {
+		desc, err := MustGetTableOrViewDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /* allowAdding */)
+		if err != nil {
 			return err
 		}
-		return checkTablePrivileges(ctx, p, tn)
+		return p.anyPrivilege(desc)
 	}
 
 	return p.delegateQuery(ctx, showType,
 		fmt.Sprintf(query,
-			parser.EscapeSQLString(tn.Database()),
-			parser.EscapeSQLString(tn.Table())),
+			parser.EscapeSQLString(db),
+			parser.EscapeSQLString(tn.Table()),
+			parser.EscapeSQLString(tn.String()),
+			tn.DatabaseName.String()),
 		initialCheck, nil)
-}
-
-// showCreateInterleave returns an INTERLEAVE IN PARENT clause for the specified
-// index, if applicable.
-func (p *planner) showCreateInterleave(
-	ctx context.Context, idx *sqlbase.IndexDescriptor,
-) (string, error) {
-	if len(idx.Interleave.Ancestors) == 0 {
-		return "", nil
-	}
-	intl := idx.Interleave
-	parentTable, err := sqlbase.GetTableDescFromID(ctx, p.txn, intl.Ancestors[len(intl.Ancestors)-1].TableID)
-	if err != nil {
-		return "", err
-	}
-	var sharedPrefixLen int
-	for _, ancestor := range intl.Ancestors {
-		sharedPrefixLen += int(ancestor.SharedPrefixLen)
-	}
-	interleavedColumnNames := quoteNames(idx.ColumnNames[:sharedPrefixLen]...)
-	s := fmt.Sprintf(" INTERLEAVE IN PARENT %s (%s)", parser.Name(parentTable.Name), interleavedColumnNames)
-	return s, nil
 }
 
 // ShowCreateTable returns a CREATE TABLE statement for the specified table.
@@ -273,215 +241,41 @@ func (p *planner) showCreateInterleave(
 func (p *planner) ShowCreateTable(
 	ctx context.Context, n *parser.ShowCreateTable,
 ) (planNode, error) {
-	tn, err := n.Table.NormalizeWithDatabaseName(p.session.Database)
-	if err != nil {
-		return nil, err
-	}
-
-	desc, err := mustGetTableDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
-	if err != nil {
-		return nil, err
-	}
-	if err := p.anyPrivilege(desc); err != nil {
-		return nil, err
-	}
-
-	columns := sqlbase.ResultColumns{
-		{Name: "Table", Typ: parser.TypeString},
-		{Name: "CreateTable", Typ: parser.TypeString},
-	}
-
-	return &delayedNode{
-		name:    "SHOW CREATE TABLE " + tn.String(),
-		columns: columns,
-		constructor: func(ctx context.Context, p *planner) (planNode, error) {
-			v := p.newContainerValuesNode(columns, 0)
-
-			s, err := p.showCreateTable(ctx, tn.TableName, desc)
-			if err != nil {
-				v.rows.Close(ctx)
-				return nil, err
-			}
-
-			if _, err := v.rows.AddRow(ctx, parser.Datums{
-				parser.NewDString(tn.String()),
-				parser.NewDString(s),
-			}); err != nil {
-				v.rows.Close(ctx)
-				return nil, err
-			}
-			return v, nil
-		},
-	}, nil
-}
-
-func (p *planner) showCreateTable(
-	ctx context.Context, tn parser.Name, desc *sqlbase.TableDescriptor,
-) (string, error) {
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "CREATE TABLE %s (", tn)
-	var primary string
-	for i, col := range desc.VisibleColumns() {
-		if i != 0 {
-			buf.WriteString(",")
-		}
-		buf.WriteString("\n\t")
-		buf.WriteString(col.SQLString())
-		if desc.IsPhysicalTable() && desc.PrimaryIndex.ColumnIDs[0] == col.ID {
-			// Only set primary if the primary key is on a visible column (not rowid).
-			primary = fmt.Sprintf(",\n\tCONSTRAINT %s PRIMARY KEY (%s)",
-				quoteNames(desc.PrimaryIndex.Name),
-				desc.PrimaryIndex.ColNamesString(),
-			)
-		}
-	}
-	buf.WriteString(primary)
-	for _, idx := range desc.Indexes {
-		if fk := idx.ForeignKey; fk.IsSet() {
-			fkTable, err := p.session.tables.getTableVersionByID(ctx, p.txn, fk.Table)
-			if err != nil {
-				return "", err
-			}
-			fkIdx, err := fkTable.FindIndexByID(fk.Index)
-			if err != nil {
-				return "", err
-			}
-			fmt.Fprintf(&buf, ",\n\tCONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
-				parser.Name(fk.Name),
-				quoteNames(idx.ColumnNames...),
-				parser.Name(fkTable.Name),
-				quoteNames(fkIdx.ColumnNames...),
-			)
-		}
-		interleave, err := p.showCreateInterleave(ctx, &idx)
-		if err != nil {
-			return "", err
-		}
-		fmt.Fprintf(&buf, ",\n\t%s%s",
-			idx.SQLString(""),
-			interleave,
-		)
-
-	}
-	for _, fam := range desc.Families {
-		activeColumnNames := make([]string, 0, len(fam.ColumnNames))
-		for i, colID := range fam.ColumnIDs {
-			if _, err := desc.FindActiveColumnByID(colID); err == nil {
-				activeColumnNames = append(activeColumnNames, fam.ColumnNames[i])
-			}
-		}
-		fmt.Fprintf(&buf, ",\n\tFAMILY %s (%s)",
-			quoteNames(fam.Name),
-			quoteNames(activeColumnNames...),
-		)
-	}
-
-	for _, e := range desc.Checks {
-		fmt.Fprintf(&buf, ",\n\t")
-		if len(e.Name) > 0 {
-			fmt.Fprintf(&buf, "CONSTRAINT %s ", quoteNames(e.Name))
-		}
-		fmt.Fprintf(&buf, "CHECK (%s)", e.Expr)
-	}
-
-	buf.WriteString("\n)")
-
-	interleave, err := p.showCreateInterleave(ctx, &desc.PrimaryIndex)
-	if err != nil {
-		return "", err
-	}
-	buf.WriteString(interleave)
-
-	return buf.String(), nil
-}
-
-// quoteName quotes and adds commas between names.
-func quoteNames(names ...string) string {
-	nameList := make(parser.NameList, len(names))
-	for i, n := range names {
-		nameList[i] = parser.Name(n)
-	}
-	return parser.AsString(nameList)
+	// We make the check whether the name points to a table or not in
+	// SQL, so as to avoid a double lookup (a first one to check if the
+	// descriptor is of the right type, another to populate the
+	// create_statements vtable).
+	const showCreateTableQuery = `
+     SELECT %[3]s AS "Table",
+            IFNULL(create_statement,
+                   crdb_internal.force_error('` + pgerror.CodeUndefinedTableError + `',
+                                             %[1]s || '.' || %[2]s || ' is not a table')::string
+            ) AS "CreateTable"
+       FROM (SELECT create_statement FROM %[4]s.crdb_internal.create_statements
+              WHERE database_name = %[1]s AND descriptor_name = %[2]s AND descriptor_type = 'table'
+              UNION ALL VALUES (NULL) ORDER BY 1 DESC) LIMIT 1
+  `
+	return p.showTableDetails(ctx, "SHOW CREATE TABLE", n.Table, showCreateTableQuery)
 }
 
 // ShowCreateView returns a CREATE VIEW statement for the specified view.
 // Privileges: Any privilege on view.
 func (p *planner) ShowCreateView(ctx context.Context, n *parser.ShowCreateView) (planNode, error) {
-	tn, err := n.View.NormalizeWithDatabaseName(p.session.Database)
-	if err != nil {
-		return nil, err
-	}
-
-	desc, err := mustGetViewDesc(ctx, p.txn, p.getVirtualTabler(), tn)
-	if err != nil {
-		return nil, err
-	}
-	if err := p.anyPrivilege(desc); err != nil {
-		return nil, err
-	}
-
-	columns := sqlbase.ResultColumns{
-		{Name: "View", Typ: parser.TypeString},
-		{Name: "CreateView", Typ: parser.TypeString},
-	}
-	return &delayedNode{
-		name:    "SHOW CREATE VIEW " + tn.String(),
-		columns: columns,
-		constructor: func(ctx context.Context, p *planner) (planNode, error) {
-			v := p.newContainerValuesNode(columns, 0)
-
-			var buf bytes.Buffer
-			fmt.Fprintf(&buf, "CREATE VIEW %s ", tn.TableName)
-
-			// Determine whether custom column names were specified when the view
-			// was created, and include them if so.
-			customColNames := false
-			stmt, err := parser.ParseOne(desc.ViewQuery)
-			if err != nil {
-				return nil, errors.Wrapf(err, "failed to parse underlying query from view %q", tn)
-			}
-			sel, ok := stmt.(*parser.Select)
-			if !ok {
-				return nil, errors.Errorf("failed to parse underlying query from view %q as a select", tn)
-			}
-
-			// When constructing the Select plan, make sure we don't require any
-			// privileges on the underlying tables.
-			p.skipSelectPrivilegeChecks = true
-			defer func() { p.skipSelectPrivilegeChecks = false }()
-
-			sourcePlan, err := p.Select(ctx, sel, []parser.Type{})
-			if err != nil {
-				return nil, err
-			}
-			for i, col := range planColumns(sourcePlan) {
-				if col.Name != desc.Columns[i].Name {
-					customColNames = true
-					break
-				}
-			}
-			if customColNames {
-				buf.WriteByte('(')
-				for i, col := range desc.Columns {
-					if i > 0 {
-						buf.WriteString(", ")
-					}
-					parser.Name(col.Name).Format(&buf, parser.FmtSimple)
-				}
-				buf.WriteString(") ")
-			}
-
-			fmt.Fprintf(&buf, "AS %s", desc.ViewQuery)
-			if _, err := v.rows.AddRow(ctx, parser.Datums{
-				parser.NewDString(n.View.String()),
-				parser.NewDString(buf.String()),
-			}); err != nil {
-				v.rows.Close(ctx)
-				return nil, err
-			}
-			return v, nil
-		},
-	}, nil
+	// We make the check whether the name points to a view or not in
+	// SQL, so as to avoid a double lookup (a first one to check if the
+	// descriptor is of the right type, another to populate the
+	// create_statements vtable).
+	const showCreateViewQuery = `
+     SELECT %[3]s AS "View",
+            IFNULL(create_statement,
+                   crdb_internal.force_error('` + pgerror.CodeUndefinedTableError + `',
+                                             %[1]s || '.' || %[2]s || ' is not a view')::string
+            ) AS "CreateView"
+       FROM (SELECT create_statement FROM %[4]s.crdb_internal.create_statements
+              WHERE database_name = %[1]s AND descriptor_name = %[2]s AND descriptor_type = 'view'
+              UNION ALL VALUES (NULL) ORDER BY 1 DESC) LIMIT 1
+  `
+	return p.showTableDetails(ctx, "SHOW CREATE VIEW", n.View, showCreateViewQuery)
 }
 
 // ShowTrace shows the current stored session trace.
@@ -495,8 +289,8 @@ SELECT timestamp,
        operation,
        span
   FROM (SELECT timestamp,
-               regexp_replace(message, e'^.*\\[[^]]*\\] ', '') AS message,
-               regexp_extract(message, e'^.*\\[[^]]*\\]') AS context,
+               regexp_replace(message, e'^\\[(?:[^][]|\\[[^]]*\\])*\\] ', '') AS message,
+               regexp_extract(message, e'^\\[(?:[^][]|\\[[^]]*\\])*\\]') AS context,
                first_value(operation) OVER (PARTITION BY txn_idx, span_idx ORDER BY message_idx) as operation,
                (txn_idx, span_idx) AS span
           FROM crdb_internal.session_trace)
@@ -512,6 +306,7 @@ WHERE message LIKE 'fetched: %'
    OR message LIKE 'DelRange %'
    OR message LIKE 'Del %'
    OR message LIKE 'Get %'
+   OR message LIKE 'Scan %'
    OR message = 'consuming rows'
    OR message = 'starting plan'
    OR message LIKE 'fast path - %'
@@ -529,7 +324,7 @@ WHERE message LIKE 'fetched: %'
 	}
 
 	if n.Statement == nil {
-		// SHOW SESSION TRACE ...
+		// SHOW TRACE FOR SESSION ...
 		return plan, nil
 	}
 
@@ -539,7 +334,7 @@ WHERE message LIKE 'fetched: %'
 		plan.Close(ctx)
 		return nil, err
 	}
-	tracePlan, err := p.makeTraceNode(stmtPlan)
+	tracePlan, err := p.makeTraceNode(stmtPlan, n.OnlyKVTrace /* kvTracingEnabled */)
 	if err != nil {
 		plan.Close(ctx)
 		stmtPlan.Close(ctx)
@@ -584,9 +379,9 @@ WHERE message LIKE 'fetched: %'
 
 	// We failed to substitute; this is an internal error.
 	err = pgerror.NewErrorf(pgerror.CodeInternalError,
-		"invalid logical plan structure:\n%s\nwhile inserting:\n%s",
-		planToString(ctx, plan),
-		planToString(ctx, tracePlan))
+		"invalid logical plan structure:\n%s", planToString(ctx, plan),
+	).SetDetailf(
+		"while inserting:\n%s", planToString(ctx, tracePlan))
 	plan.Close(ctx)
 	stmtPlan.Close(ctx)
 	tracePlan.Close(ctx)
@@ -734,9 +529,9 @@ func (p *planner) ShowConstraints(
 		return nil, err
 	}
 
-	desc, err := mustGetTableDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
+	desc, err := MustGetTableDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
 	if err != nil {
-		return nil, err
+		return nil, sqlbase.NewUndefinedRelationError(tn)
 	}
 	if err := p.anyPrivilege(desc); err != nil {
 		return nil, err
@@ -811,7 +606,11 @@ func (p *planner) ShowQueries(ctx context.Context, n *parser.ShowQueries) (planN
 // ShowJobs returns all the jobs.
 // Privileges: None.
 func (p *planner) ShowJobs(ctx context.Context, n *parser.ShowJobs) (planNode, error) {
-	return p.delegateQuery(ctx, "SHOW JOBS", "TABLE crdb_internal.jobs", nil, nil)
+	return p.delegateQuery(ctx, "SHOW JOBS",
+		`SELECT id, type, description, username, status, created, started, finished, modified,
+            fraction_completed, error, coordinator_id
+       FROM crdb_internal.jobs`,
+		nil, nil)
 }
 
 func (p *planner) ShowSessions(ctx context.Context, n *parser.ShowSessions) (planNode, error) {
@@ -853,7 +652,7 @@ func (p *planner) ShowTables(ctx context.Context, n *parser.ShowTables) (planNod
 // This statement is usually handled as a special case in Executor,
 // but for FROM [SHOW TRANSACTION STATUS] we will arrive here too.
 func (p *planner) ShowTransactionStatus(ctx context.Context) (planNode, error) {
-	return p.Show(ctx, &parser.Show{Name: "transaction status"})
+	return p.ShowVar(ctx, &parser.ShowVar{Name: "transaction status"})
 }
 
 // ShowUsers returns all the users.
@@ -861,12 +660,4 @@ func (p *planner) ShowTransactionStatus(ctx context.Context) (planNode, error) {
 func (p *planner) ShowUsers(ctx context.Context, n *parser.ShowUsers) (planNode, error) {
 	return p.delegateQuery(ctx, "SHOW USERS",
 		`SELECT username FROM system.users ORDER BY 1`, nil, nil)
-}
-
-// Help returns usage information for the given builtin function.
-// Privileges: None
-func (p *planner) Help(ctx context.Context, n *parser.Help) (planNode, error) {
-	return p.delegateQuery(ctx, "HELP", fmt.Sprintf(
-		`SELECT * FROM crdb_internal.builtin_functions WHERE function ILIKE %s`,
-		parser.EscapeSQLString(string(n.Name))), nil, nil)
 }

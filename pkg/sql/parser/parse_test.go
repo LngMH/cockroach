@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
@@ -21,9 +19,12 @@ import (
 	"fmt"
 	"go/constant"
 	"reflect"
+	"regexp"
+	"strings"
 	"testing"
 	"unicode/utf8"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	_ "github.com/cockroachdb/cockroach/pkg/util/log" // for flags
 )
@@ -77,10 +78,12 @@ func TestParse(t *testing.T) {
 		{`CREATE INDEX ON a (b)`},
 		{`CREATE INDEX ON a (b) STORING (c)`},
 		{`CREATE INDEX ON a (b) INTERLEAVE IN PARENT c (d)`},
+		{`CREATE INDEX ON a (b) INTERLEAVE IN PARENT c.d (e)`},
 		{`CREATE INDEX ON a (b ASC, c DESC)`},
 		{`CREATE UNIQUE INDEX a ON b (c)`},
 		{`CREATE UNIQUE INDEX a ON b (c) STORING (d)`},
 		{`CREATE UNIQUE INDEX a ON b (c) INTERLEAVE IN PARENT d (e, f)`},
+		{`CREATE UNIQUE INDEX a ON b (c) INTERLEAVE IN PARENT d.e (f, g)`},
 		{`CREATE UNIQUE INDEX a ON b.c (d)`},
 
 		{`CREATE TABLE a ()`},
@@ -97,6 +100,7 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b SMALLSERIAL)`},
 		{`CREATE TABLE a (b BIGSERIAL)`},
 		{`CREATE TABLE a (b UUID)`},
+		{`CREATE TABLE a (b INET)`},
 		{`CREATE TABLE a (b INT NULL)`},
 		{`CREATE TABLE a (b INT CONSTRAINT maybe NULL)`},
 		{`CREATE TABLE a (b INT NOT NULL)`},
@@ -117,6 +121,22 @@ func TestParse(t *testing.T) {
 		// "0" lost quotes previously.
 		{`CREATE TABLE a (b INT, c TEXT, PRIMARY KEY (b, c, "0"))`},
 		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON UPDATE RESTRICT)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON DELETE RESTRICT)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON DELETE RESTRICT ON UPDATE RESTRICT)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON UPDATE CASCADE)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON DELETE CASCADE)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON DELETE CASCADE ON UPDATE CASCADE)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON UPDATE SET NULL)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON DELETE SET NULL)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON DELETE SET NULL ON UPDATE SET NULL)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON UPDATE SET DEFAULT)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON DELETE SET DEFAULT)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON DELETE RESTRICT ON UPDATE SET DEFAULT)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON DELETE SET DEFAULT ON UPDATE CASCADE)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON DELETE CASCADE ON UPDATE SET NULL)`},
+		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b) REFERENCES other ON DELETE SET NULL ON UPDATE RESTRICT)`},
 		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b, c) REFERENCES other)`},
 		{`CREATE TABLE a (b INT, c TEXT, FOREIGN KEY (b, c) REFERENCES other (x, y))`},
 		{`CREATE TABLE a (b INT, c TEXT, CONSTRAINT s FOREIGN KEY (b, c) REFERENCES other (x, y))`},
@@ -128,6 +148,25 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b INT, UNIQUE (b) STORING (c))`},
 		{`CREATE TABLE a (b INT, INDEX (b))`},
 		{`CREATE TABLE a (b INT, c INT REFERENCES foo)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON UPDATE RESTRICT)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON DELETE RESTRICT)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON DELETE RESTRICT ON UPDATE RESTRICT)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON UPDATE CASCADE)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON DELETE CASCADE)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON DELETE CASCADE ON UPDATE CASCADE)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON UPDATE SET NULL)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON DELETE SET NULL)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON DELETE SET NULL ON UPDATE SET NULL)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON UPDATE SET DEFAULT)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON DELETE SET DEFAULT)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON DELETE RESTRICT ON UPDATE SET DEFAULT)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON DELETE SET DEFAULT ON UPDATE CASCADE)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON DELETE CASCADE ON UPDATE SET NULL)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON DELETE SET NULL ON UPDATE RESTRICT)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON UPDATE CASCADE)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON UPDATE SET NULL)`},
+		{`CREATE TABLE a (b INT, c INT REFERENCES foo ON UPDATE SET DEFAULT)`},
 		{`CREATE TABLE a (b INT, c INT CONSTRAINT ref REFERENCES foo)`},
 		{`CREATE TABLE a (b INT, c INT REFERENCES foo (bar))`},
 		{`CREATE TABLE a (b INT, INDEX (b) STORING (c))`},
@@ -139,6 +178,23 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b INT) INTERLEAVE IN PARENT foo (c) CASCADE`},
 		{`CREATE TABLE a.b (b INT)`},
 		{`CREATE TABLE IF NOT EXISTS a (b INT)`},
+
+		{`CREATE TABLE a (b INT) PARTITION BY LIST (b) (PARTITION p1 VALUES (1, DEFAULT), PARTITION p2 VALUES (2), (3))`},
+		{`CREATE TABLE a (b INT) PARTITION BY RANGE (b) (PARTITION p1 VALUES LESS THAN (1), PARTITION p2 VALUES LESS THAN (2, 3), PARTITION p3 VALUES LESS THAN (MAXVALUE))`},
+		// This montrosity was added on the assumption that it's more readable
+		// than all on one line. Feel free to rip it out if you come across it
+		// and disagree.
+		{regexp.MustCompile(`\n\s*`).ReplaceAllLiteralString(
+			`CREATE TABLE a (b INT, c INT, d INT) PARTITION BY LIST (b) (
+				PARTITION p1 VALUES (1) PARTITION BY LIST (c) (
+					PARTITION p1_1 VALUES (3), PARTITION p1_2 VALUES (4, 5)
+				), PARTITION p2 VALUES (6) PARTITION BY RANGE (c) (
+					PARTITION p2_1 VALUES LESS THAN (7) PARTITION BY LIST (d) (
+						PARTITION p2_1_1 VALUES (8)
+					)
+				)
+			)`, ``),
+		},
 
 		{`CREATE TABLE a AS SELECT * FROM b`},
 		{`CREATE TABLE IF NOT EXISTS a AS SELECT * FROM b`},
@@ -155,6 +211,7 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a AS SELECT * FROM b UNION VALUES ('one', 1) ORDER BY c LIMIT 5`},
 		{`CREATE TABLE IF NOT EXISTS a AS SELECT * FROM b UNION VALUES ('one', 1) ORDER BY c LIMIT 5`},
 		{`CREATE TABLE a (b STRING COLLATE "DE")`},
+		{`CREATE TABLE a (b STRING[] COLLATE "DE")`},
 
 		{`CREATE VIEW a AS SELECT * FROM b`},
 		{`CREATE VIEW a AS SELECT b.* FROM b LIMIT 5`},
@@ -167,6 +224,7 @@ func TestParse(t *testing.T) {
 		{`DELETE FROM a`},
 		{`DELETE FROM a.b`},
 		{`DELETE FROM a WHERE a = b`},
+		{`DELETE FROM a WHERE a = b LIMIT c`},
 		{`DELETE FROM a WHERE a = b RETURNING a, b`},
 		{`DELETE FROM a WHERE a = b RETURNING 1, 2`},
 		{`DELETE FROM a WHERE a = b RETURNING a + b`},
@@ -176,6 +234,8 @@ func TestParse(t *testing.T) {
 
 		{`DROP DATABASE a`},
 		{`DROP DATABASE IF EXISTS a`},
+		{`DROP DATABASE a CASCADE`},
+		{`DROP DATABASE a RESTRICT`},
 		{`DROP TABLE a`},
 		{`DROP TABLE a.b`},
 		{`DROP TABLE a, b`},
@@ -208,18 +268,20 @@ func TestParse(t *testing.T) {
 		{`DROP USER a`},
 		{`DROP USER a, b`},
 
+		{`CANCEL JOB a`},
+		{`CANCEL QUERY a`},
+		{`RESUME JOB a`},
+		{`PAUSE JOB a`},
+
 		{`EXPLAIN SELECT 1`},
 		{`EXPLAIN EXPLAIN SELECT 1`},
 		{`EXPLAIN (A, B, C) SELECT 1`},
 		{`SELECT * FROM [EXPLAIN SELECT 1]`},
 		{`SELECT * FROM [SHOW TRANSACTION STATUS]`},
 
-		{`HELP count`},
-		{`HELP "varchar"`},
-
 		{`SHOW barfoo`},
 		{`SHOW database`},
-		{`SHOW syntax`},
+		{`SHOW TIME ZONE`},
 
 		{`SHOW CLUSTER SETTING a`},
 		{`SHOW CLUSTER SETTING all`},
@@ -240,8 +302,8 @@ func TestParse(t *testing.T) {
 		{`SHOW LOCAL QUERIES`},
 		{`SHOW CLUSTER SESSIONS`},
 		{`SHOW LOCAL SESSIONS`},
-		{`SHOW SESSION TRACE`},
-		{`SHOW SESSION KV TRACE`},
+		{`SHOW TRACE FOR SESSION`},
+		{`SHOW KV TRACE FOR SESSION`},
 		{`SHOW TRACE FOR SELECT 42`},
 		{`SHOW TRACE FOR TABLE foo`},
 		{`SHOW KV TRACE FOR TABLE foo`},
@@ -252,7 +314,11 @@ func TestParse(t *testing.T) {
 		{`SHOW TESTING_RANGES FROM INDEX d.i`},
 		{`SHOW TESTING_RANGES FROM INDEX i`},
 		{`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE d.t`},
-		{`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE d.t AS OF SYSTEM TIME 'foo'`},
+		{`EXPERIMENTAL SHOW ZONE CONFIGURATIONS`},
+		{`EXPERIMENTAL SHOW ZONE CONFIGURATION FOR RANGE meta`},
+		{`EXPERIMENTAL SHOW ZONE CONFIGURATION FOR DATABASE db`},
+		{`EXPERIMENTAL SHOW ZONE CONFIGURATION FOR TABLE db.t`},
+		{`EXPERIMENTAL SHOW ZONE CONFIGURATION FOR TABLE t`},
 
 		// Tables are the default, but can also be specified with
 		// GRANT x ON TABLE y. However, the stringer does not output TABLE.
@@ -267,11 +333,30 @@ func TestParse(t *testing.T) {
 		{`SHOW TRANSACTION PRIORITY`},
 
 		{`PREPARE a AS SELECT 1`},
+		{`PREPARE a (INT) AS SELECT $1`},
+		{`PREPARE a (STRING, STRING) AS SELECT $1, $2`},
 		{`PREPARE a AS INSERT INTO a VALUES (1)`},
-		{`PREPARE a AS UPDATE a SET b = 3`},
+		{`PREPARE a (INT) AS INSERT INTO a VALUES ($1)`},
+		{`PREPARE a AS UPDATE a SET b = 1`},
+		{`PREPARE a (INT) AS UPDATE a SET b = $1`},
+		{`PREPARE a AS UPSERT INTO a VALUES (1)`},
+		{`PREPARE a (INT) AS UPSERT INTO a VALUES ($1)`},
 		{`PREPARE a AS DELETE FROM a`},
-		{`PREPARE a (INT) AS SELECT 1`},
-		{`PREPARE a (STRING, STRING) AS SELECT 1`},
+		{`PREPARE a (INT) AS DELETE FROM a WHERE b = $1`},
+		{`PREPARE a AS BACKUP DATABASE a TO 'b'`},
+		{`PREPARE a (STRING) AS BACKUP DATABASE a TO $1`},
+		{`PREPARE a AS RESTORE DATABASE a FROM 'b'`},
+		{`PREPARE a (STRING) AS RESTORE DATABASE a FROM $1`},
+		{`PREPARE a AS CANCEL QUERY 1`},
+		{`PREPARE a (STRING) AS CANCEL QUERY $1`},
+		{`PREPARE a AS CANCEL JOB 1`},
+		{`PREPARE a (INT) AS CANCEL JOB $1`},
+		{`PREPARE a AS PAUSE JOB 1`},
+		{`PREPARE a (INT) AS PAUSE JOB $1`},
+		{`PREPARE a AS RESUME JOB 1`},
+		{`PREPARE a (INT) AS RESUME JOB $1`},
+		{`PREPARE a AS IMPORT TABLE a CREATE USING 'b' CSV DATA ('c') WITH temp = 'd'`},
+		{`PREPARE a (STRING, STRING, STRING) AS IMPORT TABLE a CREATE USING $1 CSV DATA ($2) WITH temp = $3`},
 
 		{`EXECUTE a`},
 		{`EXECUTE a (1)`},
@@ -370,6 +455,18 @@ func TestParse(t *testing.T) {
 		{`SELECT (TABLE a)`},
 		{`SELECT 0x1`},
 		{`SELECT 'Deutsch' COLLATE "DE"`},
+		{`SELECT a @> b`},
+		{`SELECT a <@ b`},
+		{`SELECT a ? b`},
+		{`SELECT a ?| b`},
+		{`SELECT a ?& b`},
+		{`SELECT a->'x'`},
+		{`SELECT a#>'{x}'`},
+		{`SELECT a#>>'{x}'`},
+		{`SELECT (a->'x')->'y'`},
+		{`SELECT (a->'x')->>'y'`},
+		{`SELECT ''::JSON`},
+		{`SELECT ''::JSONB`},
 
 		{`SELECT 1 FROM t`},
 		{`SELECT 1, 2 FROM t`},
@@ -408,6 +505,9 @@ func TestParse(t *testing.T) {
 		{`SELECT TIMESTAMP 'foo'`},
 		{`SELECT TIMESTAMP WITH TIME ZONE 'foo'`},
 		{`SELECT CHAR 'foo'`},
+
+		{`SELECT '192.168.0.1':::INET`},
+		{`SELECT '192.168.0.1'::INET`},
 
 		{`SELECT 'a' AS "12345"`},
 		{`SELECT 'a' AS clnm`},
@@ -462,9 +562,9 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t WHERE a IN (b, c)`},
 		{`SELECT a FROM t WHERE a IN (SELECT a FROM t)`},
 		{`SELECT a FROM t WHERE a NOT IN (b, c)`},
-		{`SELECT a FROM t WHERE a = ANY ARRAY[b, c]`},
-		{`SELECT a FROM t WHERE a != SOME ARRAY[b, c]`},
-		{`SELECT a FROM t WHERE a LIKE ALL ARRAY[b, c]`},
+		{`SELECT a FROM t WHERE a = ANY (ARRAY[b, c])`},
+		{`SELECT a FROM t WHERE a != SOME (ARRAY[b, c])`},
+		{`SELECT a FROM t WHERE a LIKE ALL (ARRAY[b, c])`},
 		{`SELECT a FROM t WHERE a LIKE b`},
 		{`SELECT a FROM t WHERE a NOT LIKE b`},
 		{`SELECT a FROM t WHERE a ILIKE b`},
@@ -510,6 +610,12 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t ORDER BY a`},
 		{`SELECT a FROM t ORDER BY a ASC`},
 		{`SELECT a FROM t ORDER BY a DESC`},
+		{`SELECT a FROM t ORDER BY PRIMARY KEY t`},
+		{`SELECT a FROM t ORDER BY PRIMARY KEY t ASC`},
+		{`SELECT a FROM t ORDER BY PRIMARY KEY t DESC`},
+		{`SELECT a FROM t ORDER BY INDEX t@foo`},
+		{`SELECT a FROM t ORDER BY INDEX t@foo ASC`},
+		{`SELECT a FROM t ORDER BY INDEX t@foo DESC`},
 
 		{`SELECT 1 FROM t GROUP BY a`},
 		{`SELECT 1 FROM t GROUP BY a, b`},
@@ -564,6 +670,7 @@ func TestParse(t *testing.T) {
 		{`SET a = '3'`},
 		{`SET a = 3.0`},
 		{`SET a = $1`},
+		{`SET a = off`},
 		{`SET TRANSACTION READ ONLY`},
 		{`SET TRANSACTION READ WRITE`},
 		{`SET TRANSACTION ISOLATION LEVEL SNAPSHOT`},
@@ -579,21 +686,21 @@ func TestParse(t *testing.T) {
 		{`SET CLUSTER SETTING a = '3'`},
 		{`SET CLUSTER SETTING a = 3.0`},
 		{`SET CLUSTER SETTING a = $1`},
-		{`RESET a`},
+		{`SET CLUSTER SETTING a = off`},
 
 		{`SELECT * FROM (VALUES (1, 2)) AS foo`},
 		{`SELECT * FROM (VALUES (1, 2)) AS foo (a, b)`},
 
-		{`SELECT * FROM [123] AS t`},
-		{`SELECT * FROM [123(1, 2, 3)] AS t`},
-		{`SELECT * FROM [123()] AS t`},
+		{`SELECT * FROM [123 AS t]`},
+		{`SELECT * FROM [123(1, 2, 3) AS t]`},
+		{`SELECT * FROM [123() AS t]`},
 		{`SELECT * FROM t@[123]`},
 		{`SELECT * FROM t@{FORCE_INDEX=[123],NO_INDEX_JOIN}`},
-		{`SELECT * FROM [123]@[456] AS t`},
-		{`SELECT * FROM [123]@{FORCE_INDEX=[456],NO_INDEX_JOIN} AS t`},
+		{`SELECT * FROM [123 AS t]@[456]`},
+		{`SELECT * FROM [123 AS t]@{FORCE_INDEX=[456],NO_INDEX_JOIN}`},
 
-		// TODO(pmattis): Is this a postgres extension?
-		{`TABLE a`}, // Shorthand for: SELECT * FROM a
+		{`TABLE a`}, // Shorthand for: SELECT * FROM a; used e.g. in CREATE VIEW v AS TABLE t
+		{`TABLE [123 AS a]`},
 
 		{`TRUNCATE TABLE a`},
 		{`TRUNCATE TABLE a, b.c`},
@@ -678,6 +785,13 @@ func TestParse(t *testing.T) {
 		{`ALTER TABLE d.a SCATTER`},
 		{`ALTER INDEX d.i SCATTER FROM (1) TO (2)`},
 
+		{`ALTER RANGE meta EXPERIMENTAL CONFIGURE ZONE 'foo'`},
+		{`ALTER DATABASE db EXPERIMENTAL CONFIGURE ZONE 'foo'`},
+		{`ALTER TABLE db.t EXPERIMENTAL CONFIGURE ZONE 'foo'`},
+		{`ALTER TABLE t EXPERIMENTAL CONFIGURE ZONE 'foo'`},
+		{`ALTER TABLE t EXPERIMENTAL CONFIGURE ZONE b'foo'`},
+		{`ALTER TABLE t EXPERIMENTAL CONFIGURE ZONE NULL`},
+
 		{`BACKUP foo TO 'bar'`},
 		{`BACKUP foo.foo, baz.baz TO 'bar'`},
 		{`SHOW BACKUP 'bar'`},
@@ -694,8 +808,11 @@ func TestParse(t *testing.T) {
 		{`RESTORE DATABASE foo FROM 'bar'`},
 		{`RESTORE DATABASE foo, baz FROM 'bar'`},
 		{`RESTORE DATABASE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`},
-		{`BACKUP foo TO 'bar' WITH OPTIONS ('key1', 'key2'='value')`},
-		{`RESTORE foo FROM 'bar' WITH OPTIONS ('key1', 'key2'='value')`},
+		{`BACKUP foo TO 'bar' WITH key1, key2 = 'value'`},
+		{`RESTORE foo FROM 'bar' WITH key1, key2 = 'value'`},
+		{`IMPORT TABLE foo CREATE USING 'nodelocal:///some/file' CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
+		{`IMPORT TABLE foo (id INT PRIMARY KEY, email STRING, age INT) CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
+		{`IMPORT TABLE foo (id INT, email STRING, age INT) CSV DATA ('path/to/some/file', $1) WITH comma = ',', "nullif" = 'n/a', temp = $2`},
 		{`SET ROW (1, true, NULL)`},
 
 		// Regression for #15926
@@ -708,7 +825,7 @@ func TestParse(t *testing.T) {
 		}
 		s := stmts.String()
 		if d.sql != s {
-			t.Errorf("expected %s, but found %s", d.sql, s)
+			t.Errorf("expected \n%s\n, but found \n%s", d.sql, s)
 		}
 	}
 }
@@ -735,13 +852,14 @@ func TestParse2(t *testing.T) {
 
 		{`SELECT TIMESTAMP WITHOUT TIME ZONE 'foo'`, `SELECT TIMESTAMP 'foo'`},
 		{`SELECT CAST('foo' AS TIMESTAMP WITHOUT TIME ZONE)`, `SELECT CAST('foo' AS TIMESTAMP)`},
+		{`SELECT CAST(1 AS "char")`, `SELECT CAST(1 AS CHAR)`},
 
 		{`SELECT 'a' FROM t@{FORCE_INDEX=bar}`, `SELECT 'a' FROM t@bar`},
 		{`SELECT 'a' FROM t@{NO_INDEX_JOIN,FORCE_INDEX=bar}`,
 			`SELECT 'a' FROM t@{FORCE_INDEX=bar,NO_INDEX_JOIN}`},
 
 		{`SELECT 'a' FROM t@{FORCE_INDEX=[123]}`, `SELECT 'a' FROM t@[123]`},
-		{`SELECT 'a' FROM [123]@{FORCE_INDEX=[456]} AS t`, `SELECT 'a' FROM [123]@[456] AS t`},
+		{`SELECT 'a' FROM [123 AS t]@{FORCE_INDEX=[456]}`, `SELECT 'a' FROM [123 AS t]@[456]`},
 
 		{`SELECT a FROM t WHERE a IS UNKNOWN`, `SELECT a FROM t WHERE a IS NULL`},
 		{`SELECT a FROM t WHERE a IS NOT UNKNOWN`, `SELECT a FROM t WHERE a IS NOT NULL`},
@@ -765,6 +883,12 @@ func TestParse2(t *testing.T) {
 		{`SELECT a FROM t WHERE a = + b`, `SELECT a FROM t WHERE a = (+b)`},
 		{`SELECT a FROM t WHERE a = - b`, `SELECT a FROM t WHERE a = (-b)`},
 		{`SELECT a FROM t WHERE a = ~ b`, `SELECT a FROM t WHERE a = (~b)`},
+
+		// Special keywords are supported for index names.
+		{`SELECT a FROM t@primary`,
+			`SELECT a FROM t@"primary"`},
+		{`SELECT a FROM t ORDER BY INDEX t@primary`,
+			`SELECT a FROM t ORDER BY INDEX t@"primary"`},
 
 		// Escaped string literals are not always escaped the same because
 		// '''' and e'\'' scan to the same token. It's more convenient to
@@ -821,6 +945,12 @@ func TestParse2(t *testing.T) {
 			`SELECT rtrim(b, a)`},
 		{`SELECT TRIM(a, b)`,
 			`SELECT btrim(a, b)`},
+		{`SELECT CURRENT_USER`,
+			`SELECT current_user()`},
+		{`SELECT SESSION_USER`,
+			`SELECT current_user()`},
+		{`SELECT USER`,
+			`SELECT current_user()`},
 		// Offset has an optional ROW/ROWS keyword.
 		{`SELECT a FROM t1 OFFSET a ROW`,
 			`SELECT a FROM t1 OFFSET a`},
@@ -863,6 +993,13 @@ func TestParse2(t *testing.T) {
 		{`SELECT a FROM t INTERSECT DISTINCT SELECT 1 FROM t`,
 			`SELECT a FROM t INTERSECT SELECT 1 FROM t`},
 
+		{`SELECT a #- '{x}'`, `SELECT json_remove_path(a, '{x}')`},
+
+		// Pretty printing the FAMILY INET function is not normal due to the grammar
+		// definition of FAMILY.
+		{`SELECT FAMILY(x)`,
+			`SELECT "family"(x)`},
+
 		{`SET TIME ZONE 'pst8pdt'`,
 			`SET "time zone" = 'pst8pdt'`},
 		{`SET TIME ZONE 'Europe/Rome'`,
@@ -872,7 +1009,7 @@ func TestParse2(t *testing.T) {
 		{`SET TIME ZONE -7.3`,
 			`SET "time zone" = -7.3`},
 		{`SET TIME ZONE DEFAULT`,
-			`SET "time zone" = 'default'`},
+			`SET "time zone" = DEFAULT`},
 		{`SET TIME ZONE LOCAL`,
 			`SET "time zone" = 'local'`},
 		{`SET TIME ZONE pst8pdt`,
@@ -883,6 +1020,12 @@ func TestParse2(t *testing.T) {
 			`SET "time zone" = '-7h'`},
 		{`SET TIME ZONE INTERVAL '-7h0m5s' HOUR TO MINUTE`,
 			`SET "time zone" = '-6h-59m'`},
+		{`SET CLUSTER SETTING a = on`,
+			`SET CLUSTER SETTING a = "on"`},
+		{`SET a = on`,
+			`SET a = "on"`},
+		{`SET a = default`,
+			`SET a = DEFAULT`},
 
 		// Special substring syntax
 		{`SELECT SUBSTRING('RoacH' from 2 for 3)`,
@@ -939,6 +1082,10 @@ func TestParse2(t *testing.T) {
 			`SHOW CONSTRAINTS FROM t`},
 		{`SHOW KEYS FROM t`,
 			`SHOW INDEXES FROM t`},
+		{`SHOW SESSION barfoo`, `SHOW barfoo`},
+		{`SHOW SESSION database`, `SHOW database`},
+		{`SHOW SESSION TIME ZONE`, `SHOW TIME ZONE`},
+		{`EXPERIMENTAL SHOW ALL ZONE CONFIGURATIONS`, `EXPERIMENTAL SHOW ZONE CONFIGURATIONS`},
 		{`BEGIN`,
 			`BEGIN TRANSACTION`},
 		{`START TRANSACTION`,
@@ -951,6 +1098,10 @@ func TestParse2(t *testing.T) {
 			`BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT, PRIORITY LOW`},
 		{`SET TRANSACTION PRIORITY NORMAL, ISOLATION LEVEL SERIALIZABLE`,
 			`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, PRIORITY NORMAL`},
+		{`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE`,
+			`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE`},
+		{`SET TRANSACTION ISOLATION LEVEL SNAPSHOT READ ONLY`,
+			`SET TRANSACTION ISOLATION LEVEL SNAPSHOT, READ ONLY`},
 		{"SET CLUSTER SETTING a TO 1", "SET CLUSTER SETTING a = 1"},
 		{"RELEASE foo", "RELEASE SAVEPOINT foo"},
 		{"RELEASE SAVEPOINT foo", "RELEASE SAVEPOINT foo"},
@@ -977,16 +1128,103 @@ func TestParse2(t *testing.T) {
 		{`SHOW SESSIONS`, `SHOW CLUSTER SESSIONS`},
 		{`SHOW QUERIES`, `SHOW CLUSTER QUERIES`},
 
-		{`USE foo`, `SET database = 'foo'`},
+		{`USE foo`, `SET database = foo`},
 
-		{`SET NAMES foo`, `SET client_encoding = 'foo'`},
+		{`EXPERIMENTAL SCRUB TABLE x`, `EXPERIMENTAL SCRUB TABLE 'x'`},
+
+		{`SET NAMES foo`, `SET client_encoding = foo`},
 		{`SET NAMES 'foo'`, `SET client_encoding = 'foo'`},
-		{`SET NAMES DEFAULT`, `RESET client_encoding`},
-		{`SET NAMES`, `RESET client_encoding`},
+		{`SET NAMES DEFAULT`, `SET client_encoding = DEFAULT`},
+		{`SET NAMES`, `SET client_encoding = DEFAULT`},
 
 		{`SHOW NAMES`, `SHOW client_encoding`},
 
-		{`RESET NAMES`, `RESET client_encoding`},
+		{`RESET a`, `SET a = DEFAULT`},
+		{`RESET CLUSTER SETTING a`, `SET CLUSTER SETTING a = DEFAULT`},
+
+		{`RESET NAMES`, `SET client_encoding = DEFAULT`},
+
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE NO ACTION ON DELETE NO ACTION)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE RESTRICT ON DELETE RESTRICT)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE RESTRICT ON UPDATE RESTRICT)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE RESTRICT ON DELETE NO ACTION)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE RESTRICT)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE NO ACTION ON DELETE RESTRICT)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE RESTRICT)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE CASCADE ON DELETE CASCADE)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE CASCADE ON UPDATE CASCADE)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE CASCADE ON DELETE NO ACTION)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE CASCADE)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE NO ACTION ON DELETE CASCADE)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE CASCADE)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE SET NULL ON DELETE SET NULL)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE SET NULL ON UPDATE SET NULL)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE SET NULL ON DELETE NO ACTION)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE SET NULL)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE NO ACTION ON DELETE SET NULL)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE SET NULL)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE SET DEFAULT ON DELETE SET DEFAULT)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE SET DEFAULT ON DELETE NO ACTION)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE SET DEFAULT)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE NO ACTION ON DELETE SET DEFAULT)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE SET DEFAULT)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE RESTRICT ON DELETE CASCADE)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE CASCADE ON UPDATE RESTRICT)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE CASCADE ON DELETE SET NULL)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE SET NULL ON UPDATE CASCADE)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE SET NULL ON DELETE SET DEFAULT)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE SET DEFAULT ON UPDATE SET NULL)`,
+		},
+		{
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE SET DEFAULT ON DELETE RESTRICT)`,
+			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE RESTRICT ON UPDATE SET DEFAULT)`,
+		},
+		// See #19555. This is actually invalid SQL, but we permit it anyway.
+		{
+			`SELECT a FROM t WHERE a = ANY ARRAY[b, c]`,
+			`SELECT a FROM t WHERE a = ANY (ARRAY[b, c])`,
+		},
+		{
+			`SELECT a FROM t WHERE a != SOME ARRAY[b, c]`,
+			`SELECT a FROM t WHERE a != SOME (ARRAY[b, c])`,
+		},
+		{
+			`SELECT a FROM t WHERE a LIKE ALL ARRAY[b, c]`,
+			`SELECT a FROM t WHERE a LIKE ALL (ARRAY[b, c])`,
+		},
 	}
 	for _, d := range testData {
 		stmts, err := Parse(d.sql)
@@ -1035,22 +1273,12 @@ SELECT2 1
 		{`SELECT 1 FROM (t)`, `syntax error at or near ")"
 SELECT 1 FROM (t)
                 ^
-`},
-		{`SET a = 1, b = 2`, `syntax error at or near "="
-SET a = 1, b = 2
-             ^
-`},
-		{`SET a = 1,
-b = 2`, `syntax error at or near "="
-SET a = 1,
-b = 2
-  ^
-`},
-		{`SET TIME ZONE INTERVAL 'foobar'`, `could not parse 'foobar' as type interval: interval: missing unit at position 0: "foobar" at or near "EOF"
+HINT: try \h <SOURCE>`},
+		{`SET TIME ZONE INTERVAL 'foobar'`, `could not parse "foobar" as type interval: interval: missing unit at position 0: "foobar" at or near "EOF"
 SET TIME ZONE INTERVAL 'foobar'
                                ^
 `},
-		{`SELECT INTERVAL 'foo'`, `could not parse 'foo' as type interval: interval: missing unit at position 0: "foo" at or near "EOF"
+		{`SELECT INTERVAL 'foo'`, `could not parse "foo" as type interval: interval: missing unit at position 0: "foo" at or near "EOF"
 SELECT INTERVAL 'foo'
                      ^
 `},
@@ -1061,12 +1289,12 @@ SELECT 1 /* hello
 		{`SELECT '1`, `unterminated string
 SELECT '1
        ^
-`},
+HINT: try \h SELECT`},
 		{`SELECT * FROM t WHERE k=`,
 			`syntax error at or near "EOF"
 SELECT * FROM t WHERE k=
                         ^
-`,
+HINT: try \h SELECT`,
 		},
 		{`CREATE TABLE test (
   CONSTRAINT foo INDEX (bar)
@@ -1074,7 +1302,7 @@ SELECT * FROM t WHERE k=
 CREATE TABLE test (
   CONSTRAINT foo INDEX (bar)
                  ^
-`},
+HINT: try \h CREATE TABLE`},
 		{`CREATE TABLE test (
   foo BIT(0)
 )`, `length for type bit must be at least 1 at or near ")"
@@ -1106,6 +1334,10 @@ CREATE TABLE test (
 )
 ^
 `},
+		{`SELECT family FROM test`, `syntax error at or near "from"
+SELECT family FROM test
+              ^
+HINT: try \h SELECT`},
 		{`CREATE TABLE test (
   foo INT NOT NULL NULL
 )`, `conflicting NULL/NOT NULL declarations for column "foo" at or near ")"
@@ -1136,28 +1368,28 @@ CREATE DATABASE a b c
 			`syntax error at or near ")"
 CREATE INDEX ON a (b) STORING ()
                                ^
-`},
+HINT: try \h CREATE INDEX`},
 		{`CREATE VIEW a`,
 			`syntax error at or near "EOF"
 CREATE VIEW a
              ^
-`},
+HINT: try \h CREATE VIEW`},
 		{`CREATE VIEW a () AS select * FROM b`,
 			`syntax error at or near ")"
 CREATE VIEW a () AS select * FROM b
                ^
-`},
+HINT: try \h CREATE VIEW`},
 		{`SELECT FROM t`,
 			`syntax error at or near "from"
 SELECT FROM t
        ^
-`},
+HINT: try \h SELECT`},
 
 		{"SELECT 1e-\n-1",
 			`invalid floating point literal
 SELECT 1e-
        ^
-`},
+HINT: try \h SELECT`},
 		{"SELECT foo''",
 			`syntax error at or near ""
 SELECT foo''
@@ -1168,42 +1400,42 @@ SELECT foo''
 			`invalid hexadecimal numeric literal
 SELECT 0x FROM t
        ^
-`,
+HINT: try \h SELECT`,
 		},
 		{
 			`SELECT x'fail' FROM t`,
 			`invalid hexadecimal bytes literal
 SELECT x'fail' FROM t
        ^
-`,
+HINT: try \h SELECT`,
 		},
 		{
 			`SELECT x'AAB' FROM t`,
 			`invalid hexadecimal bytes literal
 SELECT x'AAB' FROM t
        ^
-`,
+HINT: try \h SELECT`,
 		},
 		{
 			`SELECT POSITION('high', 'a')`,
 			`syntax error at or near ","
 SELECT POSITION('high', 'a')
                       ^
-`,
+HINT: try \h SELECT`,
 		},
 		{
 			`SELECT a FROM foo@{FORCE_INDEX}`,
 			`syntax error at or near "}"
 SELECT a FROM foo@{FORCE_INDEX}
                               ^
-`,
+HINT: try \h <SOURCE>`,
 		},
 		{
 			`SELECT a FROM foo@{FORCE_INDEX=}`,
 			`syntax error at or near "}"
 SELECT a FROM foo@{FORCE_INDEX=}
                                ^
-`,
+HINT: try \h <SOURCE>`,
 		},
 		{
 			`SELECT a FROM foo@{FORCE_INDEX=bar,FORCE_INDEX=baz}`,
@@ -1238,14 +1470,14 @@ SELECT a FROM foo@{NO_INDEX_JOIN,FORCE_INDEX=baz,NO_INDEX_JOIN}
 			`syntax error at or near "@"
 INSERT INTO a@b VALUES (1, 2)
              ^
-`,
+HINT: try \h INSERT`,
 		},
 		{
 			`ALTER TABLE t RENAME COLUMN x TO family`,
 			`syntax error at or near "family"
 ALTER TABLE t RENAME COLUMN x TO family
                                  ^
-`,
+HINT: try \h ALTER TABLE`,
 		},
 		{
 			`SELECT CAST(1.2+2.3 AS notatype)`,
@@ -1266,7 +1498,7 @@ SELECT ANNOTATE_TYPE(1.2+2.3, notatype)
 			`syntax error at or near "EOF"
 CREATE USER foo WITH PASSWORD
                              ^
-`,
+HINT: try \h CREATE USER`,
 		},
 		{
 			`ALTER TABLE t RENAME TO t[TRUE]`,
@@ -1294,7 +1526,7 @@ TABLE abc[TRUE]
 			`syntax error at or near "["
 UPDATE kv SET k[0] = 9
                ^
-`,
+HINT: try \h UPDATE`,
 		},
 		{
 			`SELECT (ARRAY['a', 'b', 'c']).name`,
@@ -1315,7 +1547,7 @@ SELECT (0) FROM y[array[]]
 			`syntax error at or near "["
 INSERT INTO kv (k[0]) VALUES ('hello')
                  ^
-`,
+HINT: try \h <SELECTCLAUSE>`,
 		},
 		{
 			`SELECT CASE 1 = 1 WHEN true THEN ARRAY[1, 2] ELSE ARRAY[2, 3] END[1]`,
@@ -1338,11 +1570,29 @@ SELECT 1 + ANY ARRAY[1, 2, 3]
                             ^
 `,
 		},
+		{
+			`SELECT 'f'::"blah"`,
+			`syntax error at or near "blah"
+SELECT 'f'::"blah"
+            ^
+`,
+		},
 	}
 	for _, d := range testData {
 		_, err := Parse(d.sql)
-		if err == nil || err.Error() != d.expected {
-			t.Errorf("%s: expected\n%s, but found\n%v", d.sql, d.expected, err)
+		if err == nil {
+			t.Errorf("expected error, got nil")
+			continue
+		}
+		msg := err.Error()
+		if pgerr, ok := pgerror.GetPGCause(err); ok {
+			msg += strings.TrimPrefix(pgerr.Detail, "source SQL:") + "\n"
+			if pgerr.Hint != "" {
+				msg += "HINT: " + pgerr.Hint
+			}
+		}
+		if msg != d.expected {
+			t.Errorf("%s: expected\n%s, but found\n%v", d.sql, d.expected, msg)
 		}
 	}
 }
@@ -1634,4 +1884,18 @@ func testEncodeString(t *testing.T, input []byte, encode func(*bytes.Buffer, str
 		t.Fatalf("expected %s, but found %s", sql, stmt)
 	}
 	return stmt
+}
+
+func BenchmarkEncodeSQLString(b *testing.B) {
+	str := strings.Repeat("foo", 10000)
+	b.Run("old version", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			encodeSQLStringWithFlags(bytes.NewBuffer(nil), str, FmtBareStrings)
+		}
+	})
+	b.Run("new version", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			encodeSQLStringInsideArray(bytes.NewBuffer(nil), str)
+		}
+	})
 }

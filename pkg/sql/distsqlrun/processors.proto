@@ -12,9 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 //
-// Author: Radu Berinde (radu@cockroachlabs.com)
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
-//
 // Processor definitions for distributed SQL APIs. See
 // docs/RFCS/distributed_sql.md.
 // All the concepts here are "physical plan" concepts.
@@ -23,11 +20,14 @@ syntax = "proto2";
 package cockroach.sql.distsqlrun;
 option go_package = "distsqlrun";
 
+import "cockroach/pkg/roachpb/api.proto";
+import "cockroach/pkg/roachpb/csv.proto";
 import "cockroach/pkg/roachpb/data.proto";
 import "cockroach/pkg/roachpb/errors.proto";
 import "cockroach/pkg/sql/sqlbase/structured.proto";
 import "cockroach/pkg/sql/sqlbase/encoded_datum.proto";
 import "cockroach/pkg/sql/distsqlrun/data.proto";
+import "cockroach/pkg/util/hlc/timestamp.proto";
 import "gogoproto/gogo.proto";
 
 
@@ -120,6 +120,8 @@ message ProcessorCoreUnion {
   optional ValuesCoreSpec values = 10;
   optional BackfillerSpec backfiller = 11;
   optional AlgebraicSetOpSpec setOp = 12;
+  optional ReadCSVSpec readCSV = 13;
+  optional SSTWriterSpec SSTWriter = 14;
 }
 
 // NoopCoreSpec indicates a "no-op" processor core. This is used when we just
@@ -272,9 +274,16 @@ message MergeJoinerSpec {
 // left row (i+1).
 //
 // The "internal columns" of a HashJoiner (see ProcessorSpec) are the
-// concatenation of left input columns and right input columns. If the left
-// input has N columns and the right input has M columns, the first N columns
-// contain values from the left side and the following M columns contain values
+// concatenation of merged columns (if present), left input columns and right
+// input columns. Each merged column corresponds to a left and a right equality
+// column; its value is the value on the left if it is not NULL, otherwise it is
+// the value on the right. There are either zero or
+// E=len(left_eq_columns)=len(right_eq_columns) merged columns.
+//
+// If the left input has N columns and the right input has M columns, the
+// first N columns contain values from the left side and the following M columns
+// contain values from the right side. If merged columns are present, they
+// occupy first E positions followed by N values from the left side and M values
 // from the right side.
 message HashJoinerSpec {
   // The join constraints certain columns from the left stream to equal
@@ -287,9 +296,16 @@ message HashJoinerSpec {
   // stream has M columns, in this expression variables @1 to @N refer to
   // columns of the left stream and variables @N to @(N+M) refer to columns in
   // the right stream.
+  // Having "ON" expression implies no merged columns.
   optional Expression on_expr = 5 [(gogoproto.nullable) = false];
 
   optional JoinType type = 6 [(gogoproto.nullable) = false];
+
+  // Extra merged columns that are added in case of OUTER JOINS. These
+  // columns occupy first positions in a row amd it's the left value if it's not
+  // NULL, otherwise it's the right value. In INNER JOIN case no merged columns are
+  // needed since left stream values are guaranteed to be not NULL.
+  optional bool merged_columns = 7 [(gogoproto.nullable) = false];
 }
 
 // AggregatorSpec is the specification for an "aggregator" (processor core
@@ -320,6 +336,9 @@ message AggregatorSpec {
     VARIANCE = 12;
     XOR_AGG = 13;
     COUNT_ROWS = 14;
+    SQRDIFF = 15;
+    FINAL_VARIANCE = 16;
+    FINAL_STDDEV = 17;
   }
 
   message Aggregation {
@@ -332,8 +351,10 @@ message AggregatorSpec {
 
     // The column index specifies the argument(s) to the aggregator function.
     //
-    // Currently no functions take more than one argument.
+    // Most aggregations take one argument
     // COUNT_ROWS takes no arguments.
+    // FINAL_STDDEV and FINAL_VARIANCE take three arguments (SQRDIFF, SUM,
+    // COUNT).
     repeated uint32 col_idx = 5;
 
     // If set, this column index specifies a boolean argument; rows for which
@@ -386,6 +407,9 @@ message BackfillerSpec {
   // backfiller to do its job, such as the descriptors for tables with fk
   // relationships to the table being modified.
   repeated sqlbase.TableDescriptor other_tables = 6 [(gogoproto.nullable) = false];
+
+  // The timestamp to perform index backfill historical scans at.
+  optional util.hlc.Timestamp readAsOf = 7 [(gogoproto.nullable) = false];
 }
 
 // FlowSpec describes a "flow" which is a subgraph of a distributed SQL
@@ -394,6 +418,9 @@ message FlowSpec {
   optional bytes flow_id = 1 [(gogoproto.nullable) = false,
                               (gogoproto.customname) = "FlowID",
                               (gogoproto.customtype) = "FlowID"];
+  // The NodeID of the gateway that planned this Flow. Used for debugging.
+  optional int32 gateway = 3 [(gogoproto.nullable) = false,
+                              (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
 
   repeated ProcessorSpec processors = 2 [(gogoproto.nullable) = false];
 }
@@ -412,4 +439,37 @@ message AlgebraicSetOpSpec {
   // that ordering can be used to optimize resource usage in the processor.
   optional Ordering ordering = 1 [(gogoproto.nullable) = false];
   optional SetOpType op_type = 2 [(gogoproto.nullable) = false];
+}
+
+// ReadCSVSpec is the specification for a processor that reads a CSV
+// file at uri with descriptor table_desc, specified delimiter (comma),
+// optional comment rune, and optional nullif string (which is nullable to
+// differentiate between not set (nil) and the empty string (which could be
+// used as the null marker). It outputs rows that are a sampling of the file
+// at a rate of (row size) / sample_size.
+// See ccs/sqlccl/csv.go for implementation.
+message ReadCSVSpec {
+  optional roachpb.CSVOptions options = 1 [(gogoproto.nullable) = false];
+  // sample_size is the rate at which to output rows, based on an input row's size.
+  optional int32 sample_size = 2 [(gogoproto.nullable) = false];
+  // table_desc is the table descriptor of the CSV file.
+  optional sqlbase.TableDescriptor table_desc = 3 [(gogoproto.nullable) = false];
+
+  // uri is a storageccl.ExportStorage URI pointing to the CSV file to be read.
+  optional string uri = 4 [(gogoproto.nullable) = false];
+}
+
+// SSTWriterSpec is the specification for a processor that consumes rows,
+// uses tempStorage to sort them, then writes them all to a single SST file
+// at uri/name. walltime is used as the MVCC timestamp. It outputs a single
+// row containing the file name, size, checksum, observed start and end keys.
+// See ccs/sqlccl/csv.go for implementation.
+message SSTWriterSpec {
+  // destination as a storageccl.ExportStorage URI pointing to an export store
+  // location (directory).
+  optional string destination = 1 [(gogoproto.nullable) = false];
+  // name is the file name that will be written by the export store.
+  optional string name = 2 [(gogoproto.nullable) = false];
+  // walltimeNanos is the MVCC time at which the created KVs will be written.
+  optional int64 walltimeNanos = 3 [(gogoproto.nullable) = false];
 }

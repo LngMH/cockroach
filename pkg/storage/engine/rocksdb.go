@@ -11,17 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Andrew Bonventre (andybons@gmail.com)
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
-// Author: Jiang-Ming Yang (jiangming.yang@gmail.com)
 
 package engine
 
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -34,40 +30,42 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/elastic/gosigar"
-	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // TODO(tamird): why does rocksdb not link jemalloc,snappy statically?
 
-// #cgo CPPFLAGS: -I../../../c-deps/rocksdb/include
-// #cgo CPPFLAGS: -I../../../c-deps/protobuf/src
+// #cgo CPPFLAGS: -I../../../c-deps/libroach/include
+// #cgo LDFLAGS: -lroach
 // #cgo LDFLAGS: -lprotobuf
 // #cgo LDFLAGS: -lrocksdb
 // #cgo LDFLAGS: -lsnappy
-// #cgo CXXFLAGS: -std=c++11 -Werror -Wall -Wno-sign-compare
 // #cgo linux LDFLAGS: -lrt -lpthread
 // #cgo windows LDFLAGS: -lrpcrt4
 //
 // #include <stdlib.h>
-// #include "db.h"
+// #include <libroach.h>
 import "C"
 
 var minWALSyncInterval = settings.RegisterDurationSetting(
 	"rocksdb.min_wal_sync_interval",
 	"minimum duration between syncs of the RocksDB WAL",
-	1*time.Millisecond)
+	0*time.Millisecond,
+)
 
 //export rocksDBLog
 func rocksDBLog(s *C.char, n C.int) {
@@ -94,14 +92,10 @@ const (
 	// RocksDB default is 4KB. This sets it to 32KB.
 	defaultBlockSize = 32 << 10
 
-	// DefaultMaxOpenFiles is the default value for rocksDB's max_open_files
-	// option.
-	DefaultMaxOpenFiles = -1
-	// RecommendedMaxOpenFiles is the recommended value for rocksDB's
-	// max_open_files option. If more file descriptors are available than the
-	// recommended number, than the default value is used.
+	// RecommendedMaxOpenFiles is the recommended value for RocksDB's
+	// max_open_files option.
 	RecommendedMaxOpenFiles = 10000
-	// MinimumMaxOpenFiles is the minimum value that rocksDB's max_open_files
+	// MinimumMaxOpenFiles is the minimum value that RocksDB's max_open_files
 	// option can be set to. While this should be set as high as possible, the
 	// minimum total for a single store node must be under 2048 for Windows
 	// compatibility. See:
@@ -305,11 +299,13 @@ type RocksDBConfig struct {
 	MaxSizeBytes int64
 	// MaxOpenFiles controls the maximum number of file descriptors RocksDB
 	// creates. If MaxOpenFiles is zero, this is set to DefaultMaxOpenFiles.
-	MaxOpenFiles int
+	MaxOpenFiles uint64
 	// WarnLargeBatchThreshold controls if a log message is printed when a
 	// WriteBatch takes longer than WarnLargeBatchThreshold. If it is set to
 	// zero, no log messages are ever printed.
 	WarnLargeBatchThreshold time.Duration
+	// Settings instance for cluster-wide knobs.
+	Settings *cluster.Settings
 }
 
 // RocksDB is a wrapper around a RocksDB database instance.
@@ -345,7 +341,7 @@ var _ Engine = &RocksDB{}
 // needed.
 func NewRocksDB(cfg RocksDBConfig, cache RocksDBCache) (*RocksDB, error) {
 	if cfg.Dir == "" {
-		panic("dir must be non-empty")
+		return nil, errors.New("dir must be non-empty")
 	}
 
 	r := &RocksDB{
@@ -353,8 +349,7 @@ func NewRocksDB(cfg RocksDBConfig, cache RocksDBCache) (*RocksDB, error) {
 		cache: cache.ref(),
 	}
 
-	auxDir := filepath.Join(cfg.Dir, "auxiliary")
-	if err := r.SetAuxiliaryDir(auxDir); err != nil {
+	if err := r.setAuxiliaryDir(filepath.Join(cfg.Dir, "auxiliary")); err != nil {
 		return nil, err
 	}
 
@@ -376,7 +371,11 @@ func newMemRocksDB(
 		cache: cache.ref(),
 	}
 
-	if err := r.SetAuxiliaryDir(os.TempDir()); err != nil {
+	auxDir, err := ioutil.TempDir(os.TempDir(), "cockroach-auxiliary")
+	if err != nil {
+		return nil, err
+	}
+	if err := r.setAuxiliaryDir(auxDir); err != nil {
 		return nil, err
 	}
 
@@ -389,7 +388,15 @@ func newMemRocksDB(
 
 // String formatter.
 func (r *RocksDB) String() string {
-	return fmt.Sprintf("%s=%s", r.Attrs(), r.cfg.Dir)
+	dir := r.cfg.Dir
+	if r.cfg.Dir == "" {
+		dir = "<in-mem>"
+	}
+	attrs := r.Attrs().String()
+	if attrs == "" {
+		attrs = "<no-attributes>"
+	}
+	return fmt.Sprintf("%s=%s", attrs, dir)
 }
 
 func (r *RocksDB) open() error {
@@ -419,7 +426,7 @@ func (r *RocksDB) open() error {
 
 	blockSize := envutil.EnvOrDefaultBytes("COCKROACH_ROCKSDB_BLOCK_SIZE", defaultBlockSize)
 	walTTL := envutil.EnvOrDefaultDuration("COCKROACH_ROCKSDB_WAL_TTL", 0).Seconds()
-	maxOpenFiles := DefaultMaxOpenFiles
+	maxOpenFiles := uint64(RecommendedMaxOpenFiles)
 	if r.cfg.MaxOpenFiles != 0 {
 		maxOpenFiles = r.cfg.MaxOpenFiles
 	}
@@ -454,14 +461,6 @@ func (r *RocksDB) open() error {
 }
 
 func (r *RocksDB) syncLoop() {
-	// Lock the OS thread to prevent other goroutines from running on it. We
-	// don't want other goroutines to run on this thread because of the
-	// relatively long (multiple millisecond) Cgo calls that are
-	// performed. Scheduling other goroutines on this thread would introduce
-	// latency to those goroutines whenever this goroutine needs to sync the WAL.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
 	s := &r.syncer
 	s.Lock()
 	defer s.Unlock()
@@ -476,7 +475,10 @@ func (r *RocksDB) syncLoop() {
 			return
 		}
 
-		min := minWALSyncInterval.Get()
+		var min time.Duration
+		if r.cfg.Settings != nil {
+			min = minWALSyncInterval.Get(&r.cfg.Settings.SV)
+		}
 		if delta := timeutil.Since(lastSync); delta < min {
 			s.Unlock()
 			time.Sleep(min - delta)
@@ -512,6 +514,10 @@ func (r *RocksDB) Close() {
 	if len(r.cfg.Dir) == 0 {
 		if log.V(1) {
 			log.Infof(context.TODO(), "closing in-memory rocksdb instance")
+		}
+		// Remove the temporary directory when the engine is in-memory.
+		if err := os.RemoveAll(r.auxDir); err != nil {
+			log.Warning(context.TODO(), err)
 		}
 	} else {
 		log.Infof(context.TODO(), "closing rocksdb instance at %q", r.cfg.Dir)
@@ -574,7 +580,7 @@ func (r *RocksDB) Get(key MVCCKey) ([]byte, error) {
 
 // GetProto fetches the value at the specified key and unmarshals it.
 func (r *RocksDB) GetProto(
-	key MVCCKey, msg proto.Message,
+	key MVCCKey, msg protoutil.Message,
 ) (ok bool, keyBytes, valBytes int64, err error) {
 	return dbGetProto(r.rdb, key, msg)
 }
@@ -631,16 +637,6 @@ func (r *RocksDB) Capacity() (roachpb.StoreCapacity, error) {
 	fsuTotal := int64(fileSystemUsage.Total)
 	fsuAvail := int64(fileSystemUsage.Avail)
 
-	// If no size limitation have been placed on the store size or if the
-	// limitation is greater than what's available, just return the actual
-	// totals.
-	if r.cfg.MaxSizeBytes == 0 || r.cfg.MaxSizeBytes >= fsuTotal || r.cfg.Dir == "" {
-		return roachpb.StoreCapacity{
-			Capacity:  fsuTotal,
-			Available: fsuAvail,
-		}, nil
-	}
-
 	// Find the total size of all the files in the r.dir and all its
 	// subdirectories.
 	var totalUsedBytes int64
@@ -656,6 +652,17 @@ func (r *RocksDB) Capacity() (roachpb.StoreCapacity, error) {
 		return roachpb.StoreCapacity{}, errOuter
 	}
 
+	// If no size limitation have been placed on the store size or if the
+	// limitation is greater than what's available, just return the actual
+	// totals.
+	if r.cfg.MaxSizeBytes == 0 || r.cfg.MaxSizeBytes >= fsuTotal || r.cfg.Dir == "" {
+		return roachpb.StoreCapacity{
+			Capacity:  fsuTotal,
+			Available: fsuAvail,
+			Used:      totalUsedBytes,
+		}, nil
+	}
+
 	available := r.cfg.MaxSizeBytes - totalUsedBytes
 	if available > fsuAvail {
 		available = fsuAvail
@@ -667,6 +674,7 @@ func (r *RocksDB) Capacity() (roachpb.StoreCapacity, error) {
 	return roachpb.StoreCapacity{
 		Capacity:  r.cfg.MaxSizeBytes,
 		Available: available,
+		Used:      totalUsedBytes,
 	}, nil
 }
 
@@ -750,7 +758,7 @@ func (r *rocksDBReadOnly) Get(key MVCCKey) ([]byte, error) {
 }
 
 func (r *rocksDBReadOnly) GetProto(
-	key MVCCKey, msg proto.Message,
+	key MVCCKey, msg protoutil.Message,
 ) (ok bool, keyBytes, valBytes int64, err error) {
 	if r.isClosed {
 		panic("using a closed rocksDBReadOnly")
@@ -875,7 +883,7 @@ func (r *RocksDB) GetSSTables() SSTableInfos {
 func (r *RocksDB) getUserProperties() (enginepb.SSTUserPropertiesCollection, error) {
 	buf := cStringToGoBytes(C.DBGetUserProperties(r.rdb))
 	var ssts enginepb.SSTUserPropertiesCollection
-	if err := ssts.Unmarshal(buf); err != nil {
+	if err := protoutil.Unmarshal(buf, &ssts); err != nil {
 		return enginepb.SSTUserPropertiesCollection{}, err
 	}
 	if ssts.Error != "" {
@@ -892,18 +900,17 @@ func (r *RocksDB) GetStats() (*Stats, error) {
 		return nil, err
 	}
 	return &Stats{
-		BlockCacheHits:           int64(s.block_cache_hits),
-		BlockCacheMisses:         int64(s.block_cache_misses),
-		BlockCacheUsage:          int64(s.block_cache_usage),
-		BlockCachePinnedUsage:    int64(s.block_cache_pinned_usage),
-		BloomFilterPrefixChecked: int64(s.bloom_filter_prefix_checked),
-		BloomFilterPrefixUseful:  int64(s.bloom_filter_prefix_useful),
-		MemtableHits:             int64(s.memtable_hits),
-		MemtableMisses:           int64(s.memtable_misses),
-		MemtableTotalSize:        int64(s.memtable_total_size),
-		Flushes:                  int64(s.flushes),
-		Compactions:              int64(s.compactions),
-		TableReadersMemEstimate:  int64(s.table_readers_mem_estimate),
+		BlockCacheHits:                 int64(s.block_cache_hits),
+		BlockCacheMisses:               int64(s.block_cache_misses),
+		BlockCacheUsage:                int64(s.block_cache_usage),
+		BlockCachePinnedUsage:          int64(s.block_cache_pinned_usage),
+		BloomFilterPrefixChecked:       int64(s.bloom_filter_prefix_checked),
+		BloomFilterPrefixUseful:        int64(s.bloom_filter_prefix_useful),
+		MemtableTotalSize:              int64(s.memtable_total_size),
+		Flushes:                        int64(s.flushes),
+		Compactions:                    int64(s.compactions),
+		TableReadersMemEstimate:        int64(s.table_readers_mem_estimate),
+		PendingCompactionBytesEstimate: int64(s.pending_compaction_bytes_estimate),
 	}, nil
 }
 
@@ -936,7 +943,7 @@ func (r *rocksDBSnapshot) Get(key MVCCKey) ([]byte, error) {
 }
 
 func (r *rocksDBSnapshot) GetProto(
-	key MVCCKey, msg proto.Message,
+	key MVCCKey, msg protoutil.Message,
 ) (ok bool, keyBytes, valBytes int64, err error) {
 	return dbGetProto(r.handle, key, msg)
 }
@@ -1022,7 +1029,7 @@ func (r *distinctBatch) Get(key MVCCKey) ([]byte, error) {
 }
 
 func (r *distinctBatch) GetProto(
-	key MVCCKey, msg proto.Message,
+	key MVCCKey, msg protoutil.Message,
 ) (ok bool, keyBytes, valBytes int64, err error) {
 	if r.writeOnly {
 		return dbGetProto(r.parent.rdb, key, msg)
@@ -1134,6 +1141,13 @@ func (r *rocksDBBatchIterator) ComputeStats(
 	return r.iter.ComputeStats(start, end, nowNanos)
 }
 
+func (r *rocksDBBatchIterator) FindSplitKey(
+	start, end, minSplitKey MVCCKey, targetSize int64, allowMeta2Splits bool,
+) (MVCCKey, error) {
+	r.batch.flushMutations()
+	return r.iter.FindSplitKey(start, end, minSplitKey, targetSize, allowMeta2Splits)
+}
+
 func (r *rocksDBBatchIterator) Key() MVCCKey {
 	return r.iter.Key()
 }
@@ -1142,7 +1156,7 @@ func (r *rocksDBBatchIterator) Value() []byte {
 	return r.iter.Value()
 }
 
-func (r *rocksDBBatchIterator) ValueProto(msg proto.Message) error {
+func (r *rocksDBBatchIterator) ValueProto(msg protoutil.Message) error {
 	return r.iter.ValueProto(msg)
 }
 
@@ -1260,7 +1274,7 @@ func (r *rocksDBBatch) Get(key MVCCKey) ([]byte, error) {
 }
 
 func (r *rocksDBBatch) GetProto(
-	key MVCCKey, msg proto.Message,
+	key MVCCKey, msg protoutil.Message,
 ) (ok bool, keyBytes, valBytes int64, err error) {
 	if r.writeOnly {
 		panic("write-only batch")
@@ -1649,12 +1663,12 @@ func (r *rocksDBIterator) Valid() (bool, error) {
 
 func (r *rocksDBIterator) Next() {
 	r.checkEngineOpen()
-	r.setState(C.DBIterNext(r.iter, false /* !skip_current_key_versions */))
+	r.setState(C.DBIterNext(r.iter, false /* skip_current_key_versions */))
 }
 
 func (r *rocksDBIterator) Prev() {
 	r.checkEngineOpen()
-	r.setState(C.DBIterPrev(r.iter, false /* !skip_current_key_versions */))
+	r.setState(C.DBIterPrev(r.iter, false /* skip_current_key_versions */))
 }
 
 func (r *rocksDBIterator) NextKey() {
@@ -1678,11 +1692,11 @@ func (r *rocksDBIterator) Value() []byte {
 	return cSliceToGoBytes(r.value)
 }
 
-func (r *rocksDBIterator) ValueProto(msg proto.Message) error {
+func (r *rocksDBIterator) ValueProto(msg protoutil.Message) error {
 	if r.value.len <= 0 {
 		return nil
 	}
-	return proto.Unmarshal(r.UnsafeValue(), msg)
+	return protoutil.Unmarshal(r.UnsafeValue(), msg)
 }
 
 func (r *rocksDBIterator) UnsafeKey() MVCCKey {
@@ -1709,7 +1723,37 @@ func (r *rocksDBIterator) ComputeStats(
 	start, end MVCCKey, nowNanos int64,
 ) (enginepb.MVCCStats, error) {
 	result := C.MVCCComputeStats(r.iter, goToCKey(start), goToCKey(end), C.int64_t(nowNanos))
-	return cStatsToGoStats(result, nowNanos)
+	stats, err := cStatsToGoStats(result, nowNanos)
+	if util.RaceEnabled {
+		// If we've come here via rocksDBBatchIterator, then flushMutations
+		// (which forces reseek) was called just before C.MVCCComputeStats. Set
+		// it here as well to match.
+		r.reseek = true
+		// C.MVCCComputeStats and ComputeStatsGo must behave identically.
+		// There are unit tests to ensure that they return the same result, but
+		// as an additional check, use the race builds to check any edge cases
+		// that the tests may miss.
+		verifyStats, verifyErr := ComputeStatsGo(r, start, end, nowNanos)
+		if (err != nil) != (verifyErr != nil) {
+			panic(fmt.Sprintf("C.MVCCComputeStats differed from ComputeStatsGo: err %v vs %v", err, verifyErr))
+		}
+		if !stats.Equal(verifyStats) {
+			panic(fmt.Sprintf("C.MVCCComputeStats differed from ComputeStatsGo: stats %+v vs %+v", stats, verifyStats))
+		}
+	}
+	return stats, err
+}
+
+func (r *rocksDBIterator) FindSplitKey(
+	start, end, minSplitKey MVCCKey, targetSize int64, allowMeta2Splits bool,
+) (MVCCKey, error) {
+	var splitKey C.DBString
+	status := C.MVCCFindSplitKey(r.iter, goToCKey(start), goToCKey(end), goToCKey(minSplitKey),
+		C.int64_t(targetSize), C.bool(allowMeta2Splits), &splitKey)
+	if err := statusToError(status); err != nil {
+		return MVCCKey{}, err
+	}
+	return MVCCKey{Key: cStringToGoBytes(splitKey)}, nil
 }
 
 func cStatsToGoStats(stats C.MVCCStatsResult, nowNanos int64) (enginepb.MVCCStats, error) {
@@ -1893,7 +1937,7 @@ func dbGet(rdb *C.DBEngine, key MVCCKey) ([]byte, error) {
 }
 
 func dbGetProto(
-	rdb *C.DBEngine, key MVCCKey, msg proto.Message,
+	rdb *C.DBEngine, key MVCCKey, msg protoutil.Message,
 ) (ok bool, keyBytes, valBytes int64, err error) {
 	if len(key.Key) == 0 {
 		err = emptyKeyError()
@@ -1913,7 +1957,7 @@ func dbGetProto(
 		// cannot live past the lifetime of this method, but we're only
 		// using it to unmarshal the roachpb.
 		data := cSliceToUnsafeGoBytes(C.DBSlice(result))
-		err = proto.Unmarshal(data, msg)
+		err = protoutil.Unmarshal(data, msg)
 	}
 	C.free(unsafe.Pointer(result.data))
 	keyBytes = int64(key.EncodedSize())
@@ -2099,12 +2143,7 @@ func (r *RocksDB) GetAuxiliaryDir() string {
 	return r.auxDir
 }
 
-// SetAuxiliaryDir changes the auxiliary storage path for this engine.
-// Never call this.
-//
-// TODO(tschottdorf,danhhz): remove the only "real" use in backup_test.go
-// and this method.
-func (r *RocksDB) SetAuxiliaryDir(d string) error {
+func (r *RocksDB) setAuxiliaryDir(d string) error {
 	if err := os.MkdirAll(d, 0755); err != nil {
 		return err
 	}
@@ -2120,4 +2159,12 @@ func (r *RocksDB) IngestExternalFile(ctx context.Context, path string, move bool
 // WriteFile writes data to a file in this RocksDB's env.
 func (r *RocksDB) WriteFile(filename string, data []byte) error {
 	return statusToError(C.DBEnvWriteFile(r.rdb, goToCSlice([]byte(filename)), goToCSlice(data)))
+}
+
+// IsValidSplitKey returns whether the key is a valid split key. Certain key
+// ranges cannot be split (the meta1 span and the system DB span); split keys
+// chosen within any of these ranges are considered invalid. And a split key
+// equal to Meta2KeyMax (\x03\xff\xff) is considered invalid.
+func IsValidSplitKey(key roachpb.Key, allowMeta2Splits bool) bool {
+	return bool(C.MVCCIsValidSplitKey(goToCSlice(key), C._Bool(allowMeta2Splits)))
 }

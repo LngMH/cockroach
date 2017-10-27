@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // This code was derived from https://github.com/youtube/vitess.
 //
@@ -46,8 +44,9 @@ func (d DropBehavior) String() string {
 
 // DropDatabase represents a DROP DATABASE statement.
 type DropDatabase struct {
-	Name     Name
-	IfExists bool
+	Name         Name
+	IfExists     bool
+	DropBehavior DropBehavior
 }
 
 // Format implements the NodeFormatter interface.
@@ -57,6 +56,10 @@ func (node *DropDatabase) Format(buf *bytes.Buffer, f FmtFlags) {
 		buf.WriteString("IF EXISTS ")
 	}
 	FormatNode(buf, f, node.Name)
+	if node.DropBehavior != DropDefault {
+		buf.WriteByte(' ')
+		buf.WriteString(node.DropBehavior.String())
+	}
 }
 
 // DropIndex represents a DROP INDEX statement.

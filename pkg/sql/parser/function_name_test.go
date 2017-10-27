@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
@@ -36,7 +34,7 @@ func TestResolveFunction(t *testing.T) {
 		{`foo.*`, ``, `invalid function name: foo.*`},
 	}
 
-	searchPath := []string{"pg_catalog"}
+	searchPath := MakeSearchPath([]string{"pg_catalog"})
 	for _, tc := range testCases {
 		stmt, err := ParseOne("SELECT " + tc.in + "(1)")
 		if err != nil {

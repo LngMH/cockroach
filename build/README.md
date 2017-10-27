@@ -28,11 +28,26 @@ running CockroachDB. It is based on Debian Jessie and contains only the main
 CockroachDB binary. To fetch this image, run `docker pull
 cockroachdb/cockroach` in the usual fashion.
 
-To build the image yourself, use `./build-docker-deploy.sh`. The script will
-build and run a development container. The CockroachDB binary will be built
-inside of that container. That binary is built into our minimal container. The
+To build the image yourself, use the Dockerfile in the `deploy` directory after
+building a release version of the binary with the development image described in
+the previous section. The CockroachDB binary will be built inside of that
+development container, then placed into the minimal deployment container. The
 resulting image `cockroachdb/cockroach` can be run via `docker run` in the
-usual fashion.
+usual fashion. To be more specific, the steps to do this are:
+
+```
+go/src/github.com/cockroachdb/cockroach $ ./build/builder.sh make build TYPE=release-linux-gnu
+go/src/github.com/cockroachdb/cockroach $ cp ./cockroach build/deploy/cockroach
+go/src/github.com/cockroachdb/cockroach $ cd build/deploy && docker build -t cockroachdb/cockroach .
+```
+
+# Upgrading / extending the Docker image
+
+Process:
+
+- edit `build/Dockerfile` as desired
+- run `build/builder.sh init` to test -- this will build the image locally. Beware this can take a lot of time. The result of `init` is a docker image version which you can subsequently stick into the `version` variable inside the `builder.sh` script for testing locally.
+- Once you are happy with the result, run `build/builder.sh push` which pushes your image towards Docker hub, so that it becomes available to others. The result is again a version number, which you then *must* copy back into `builder.sh`. Then commit the change to both Dockerfile and `builder.sh` and submit a PR.
 
 #  Dependencies
 

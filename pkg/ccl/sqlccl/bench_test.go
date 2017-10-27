@@ -17,9 +17,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/sampledataccl"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -42,7 +40,7 @@ func BenchmarkClusterBackup(b *testing.B) {
 	// documentation's description. We're getting useful information out of it,
 	// but this is not a pattern to cargo-cult.
 
-	_, dir, _, sqlDB, cleanupFn := backupRestoreTestSetup(b, multiNode, 0)
+	_, dir, _, sqlDB, cleanupFn := backupRestoreTestSetup(b, multiNode, 0, initNone)
 	defer cleanupFn()
 	sqlDB.Exec(`DROP TABLE data.bank`)
 
@@ -71,22 +69,11 @@ func BenchmarkClusterBackup(b *testing.B) {
 }
 
 func BenchmarkClusterRestore(b *testing.B) {
-	b.Run("AddSSTable", func(b *testing.B) {
-		defer settings.TestingSetBool(&storageccl.AddSSTableEnabled, true)()
-		runBenchmarkClusterRestore(b)
-	})
-	b.Run("WriteBatch", func(b *testing.B) {
-		defer settings.TestingSetBool(&storageccl.AddSSTableEnabled, false)()
-		runBenchmarkClusterRestore(b)
-	})
-}
-
-func runBenchmarkClusterRestore(b *testing.B) {
 	// NB: This benchmark takes liberties in how b.N is used compared to the go
 	// documentation's description. We're getting useful information out of it,
 	// but this is not a pattern to cargo-cult.
 
-	_, dir, _, sqlDB, cleanup := backupRestoreTestSetup(b, multiNode, 0)
+	_, dir, _, sqlDB, cleanup := backupRestoreTestSetup(b, multiNode, 0, initNone)
 	defer cleanup()
 	sqlDB.Exec(`DROP TABLE data.bank`)
 
@@ -107,7 +94,7 @@ func BenchmarkLoadRestore(b *testing.B) {
 	// documentation's description. We're getting useful information out of it,
 	// but this is not a pattern to cargo-cult.
 
-	ctx, dir, _, sqlDB, cleanup := backupRestoreTestSetup(b, multiNode, 0)
+	ctx, dir, _, sqlDB, cleanup := backupRestoreTestSetup(b, multiNode, 0, initNone)
 	defer cleanup()
 	sqlDB.Exec(`DROP TABLE data.bank`)
 
@@ -126,7 +113,7 @@ func BenchmarkLoadSQL(b *testing.B) {
 	// NB: This benchmark takes liberties in how b.N is used compared to the go
 	// documentation's description. We're getting useful information out of it,
 	// but this is not a pattern to cargo-cult.
-	_, _, _, sqlDB, cleanup := backupRestoreTestSetup(b, multiNode, 0)
+	_, _, _, sqlDB, cleanup := backupRestoreTestSetup(b, multiNode, 0, initNone)
 	defer cleanup()
 	sqlDB.Exec(`DROP TABLE data.bank`)
 
@@ -153,7 +140,7 @@ func BenchmarkLoadSQL(b *testing.B) {
 func BenchmarkClusterEmptyIncrementalBackup(b *testing.B) {
 	const numStatements = 100000
 
-	_, dir, _, sqlDB, cleanupFn := backupRestoreTestSetup(b, multiNode, 0)
+	_, dir, _, sqlDB, cleanupFn := backupRestoreTestSetup(b, multiNode, 0, initNone)
 	defer cleanupFn()
 
 	restoreDir := filepath.Join(dir, "restore")

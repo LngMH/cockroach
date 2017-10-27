@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@cockroachlabs.com)
 
 package pgwire
 
@@ -230,5 +228,16 @@ func TestBinaryUuid(t *testing.T) {
 			t.Fatal(err)
 		}
 		return u
+	})
+}
+
+func TestBinaryInet(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testBinaryDatumType(t, "inet", func(val string) parser.Datum {
+		ipAddr, err := parser.ParseDIPAddrFromINetString(val)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ipAddr
 	})
 }

@@ -11,16 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package sql
 
 import (
-	"golang.org/x/net/context"
+	"sync/atomic"
 
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -75,7 +74,7 @@ func (req runnerRequest) run() {
 	req.resultChan <- res
 }
 
-func (dsp *distSQLPlanner) initRunners() {
+func (dsp *DistSQLPlanner) initRunners() {
 	// This channel has to be unbuffered because we want to only be able to send
 	// requests if a worker is actually there to receive them.
 	dsp.runnerChan = make(chan runnerRequest)
@@ -101,7 +100,11 @@ func (dsp *distSQLPlanner) initRunners() {
 //
 // Note that errors that happen while actually running the flow are reported to
 // recv, not returned by this function.
-func (dsp *distSQLPlanner) Run(
+// TODO(andrei): Some errors ocurring during the "starting" phase are also
+// reported to recv instead of being returned (see the flow.Start() call for the
+// local flow). Perhaps we should push all errors to recv and have this function
+// not return anything.
+func (dsp *DistSQLPlanner) Run(
 	planCtx *planningCtx,
 	txn *client.Txn,
 	plan *physicalPlan,
@@ -110,7 +113,11 @@ func (dsp *distSQLPlanner) Run(
 ) error {
 	ctx := planCtx.ctx
 
-	flows := plan.GenerateFlowSpecs()
+	if err := planCtx.sanityCheckAddresses(); err != nil {
+		return err
+	}
+
+	flows := plan.GenerateFlowSpecs(dsp.nodeDesc.NodeID /* gateway */)
 
 	if logPlanDiagram {
 		log.VEvent(ctx, 1, "creating plan diagram")
@@ -125,17 +132,16 @@ func (dsp *distSQLPlanner) Run(
 
 	log.VEvent(ctx, 1, "running DistSQL plan")
 
+	dsp.distSQLSrv.ServerConfig.Metrics.QueryStart()
+	defer dsp.distSQLSrv.ServerConfig.Metrics.QueryStop()
+
+	recv.outputTypes = plan.ResultTypes
 	recv.resultToStreamColMap = plan.planToStreamColMap
 	thisNodeID := dsp.nodeDesc.NodeID
 
-	// DistSQL needs to initialize the Transaction proto before we put it in the
-	// FlowRequest's below. This is because we might not have used the txn do to
-	// anything else (we might not have sent any requests through the client.Txn,
-	// which normally does this init).
-	txn.EnsureProto()
-
 	evalCtxProto := distsqlrun.MakeEvalContext(evalCtx)
-	for _, s := range evalCtx.SearchPath {
+	iter := evalCtx.SearchPath.Iter()
+	for s, ok := iter(); ok; s, ok = iter() {
 		evalCtxProto.SearchPath = append(evalCtxProto.SearchPath, s)
 	}
 
@@ -200,14 +206,17 @@ func (dsp *distSQLPlanner) Run(
 		return err
 	}
 	// TODO(radu): this should go through the flow scheduler.
-	flow.Start(ctx, func() {})
+	if err := flow.Start(ctx, func() {}); err != nil {
+		log.Fatalf(ctx, "unexpected error from syncFlow.Start(): %s "+
+			"The error should have gone to the consumer.", err)
+	}
 	flow.Wait()
 	flow.Cleanup(ctx)
 
 	return nil
 }
 
-// distSQLReceiver is a RowReceiver that stores incoming rows in a RowContainer.
+// distSQLReceiver is a RowReceiver that writes results to a rowResultWriter.
 // This is where the DistSQL execution meets the SQL Session - the RowContainer
 // comes from a client Session.
 //
@@ -216,14 +225,15 @@ func (dsp *distSQLPlanner) Run(
 type distSQLReceiver struct {
 	ctx context.Context
 
-	// rows is the container where we store the results; if we only need the count
-	// of the rows, it is nil.
-	rows *sqlbase.RowContainer
+	// resultWriter is the interface which we send results to.
+	resultWriter rowResultWriter
+
+	// outputTypes are the types of the result columns produced by the plan.
+	outputTypes []sqlbase.ColumnType
+
 	// resultToStreamColMap maps result columns to columns in the distsqlrun results
 	// stream.
 	resultToStreamColMap []int
-	// numRows counts the number of rows we received when rows is nil.
-	numRows int64
 
 	// err represents the error that we received either from a producer or
 	// internally in the operation of the distSQLReceiver. If set, this will
@@ -231,6 +241,11 @@ type distSQLReceiver struct {
 	//
 	// Once set, no more rows are accepted.
 	err error
+
+	// cancelled is atomically set to 1 when this distSQL receiver has been marked
+	// as cancelled. Upon the next Push(), err is set to a non-nil
+	// value, and ConsumerClosed is the ConsumerStatus.
+	cancelled int32
 
 	row    parser.Datums
 	status distsqlrun.ConsumerStatus
@@ -251,7 +266,21 @@ type distSQLReceiver struct {
 	updateClock func(observedTs hlc.Timestamp)
 }
 
+// rowResultWriter is a subset of StatementResult to be used with the
+// distSQLReceiver. It's implemented by RowResultWriter.
+type rowResultWriter interface {
+	// AddRow takes the passed in row and adds it to the current result.
+	AddRow(ctx context.Context, row parser.Datums) error
+	// IncrementRowsAffected increments a counter by n. This is used for all
+	// result types other than parser.Rows.
+	IncrementRowsAffected(n int)
+	// GetStatementType returns the StatementType that corresponds to the type of
+	// results that should be sent to this interface.
+	StatementType() parser.StatementType
+}
+
 var _ distsqlrun.RowReceiver = &distSQLReceiver{}
+var _ distsqlrun.CancellableRowReceiver = &distSQLReceiver{}
 
 // makeDistSQLReceiver creates a distSQLReceiver.
 //
@@ -263,19 +292,19 @@ var _ distsqlrun.RowReceiver = &distSQLReceiver{}
 // on errors. Nil if the flow overall doesn't run in a transaction.
 func makeDistSQLReceiver(
 	ctx context.Context,
-	sink *sqlbase.RowContainer,
+	resultWriter rowResultWriter,
 	rangeCache *kv.RangeDescriptorCache,
 	leaseCache *kv.LeaseHolderCache,
 	txn *client.Txn,
 	updateClock func(observedTs hlc.Timestamp),
 ) (distSQLReceiver, error) {
 	return distSQLReceiver{
-		ctx:         ctx,
-		rows:        sink,
-		rangeCache:  rangeCache,
-		leaseCache:  leaseCache,
-		txn:         txn,
-		updateClock: updateClock,
+		ctx:          ctx,
+		resultWriter: resultWriter,
+		rangeCache:   rangeCache,
+		leaseCache:   leaseCache,
+		txn:          txn,
+		updateClock:  updateClock,
 	}, nil
 }
 
@@ -320,6 +349,10 @@ func (r *distSQLReceiver) Push(
 		}
 		return r.status
 	}
+	if r.err == nil && atomic.LoadInt32(&r.cancelled) == 1 {
+		// Set the error to reflect query cancellation.
+		r.err = sqlbase.NewQueryCanceledError()
+	}
 	if r.err != nil {
 		// TODO(andrei): We should drain here.
 		return distsqlrun.ConsumerClosed
@@ -328,16 +361,16 @@ func (r *distSQLReceiver) Push(
 		return r.status
 	}
 
-	if r.rows == nil {
+	if r.resultWriter.StatementType() != parser.Rows {
 		// We only need the row count.
-		r.numRows++
+		r.resultWriter.IncrementRowsAffected(1)
 		return r.status
 	}
 	if r.row == nil {
 		r.row = make(parser.Datums, len(r.resultToStreamColMap))
 	}
 	for i, resIdx := range r.resultToStreamColMap {
-		err := row[resIdx].EnsureDecoded(&r.alloc)
+		err := row[resIdx].EnsureDecoded(&r.outputTypes[resIdx], &r.alloc)
 		if err != nil {
 			r.err = err
 			r.status = distsqlrun.ConsumerClosed
@@ -346,7 +379,7 @@ func (r *distSQLReceiver) Push(
 		r.row[i] = row[resIdx].Datum
 	}
 	// Note that AddRow accounts for the memory used by the Datums.
-	if _, err := r.rows.AddRow(r.ctx, r.row); err != nil {
+	if err := r.resultWriter.AddRow(r.ctx, r.row); err != nil {
 		r.err = err
 		// TODO(andrei): We should drain here. Metadata from this query would be
 		// useful, particularly as it was likely a large query (since AddRow()
@@ -363,6 +396,11 @@ func (r *distSQLReceiver) ProducerDone() {
 		panic("double close")
 	}
 	r.closed = true
+}
+
+// SetCancelled is part of the CancellableRowReceiver interface.
+func (r *distSQLReceiver) SetCancelled() {
+	atomic.StoreInt32(&r.cancelled, 1)
 }
 
 // updateCaches takes information about some ranges that were mis-planned and
@@ -384,7 +422,7 @@ func (r *distSQLReceiver) updateCaches(ctx context.Context, ranges []roachpb.Ran
 
 	// Update the LeaseHolderCache.
 	for _, ri := range ranges {
-		r.leaseCache.Update(ctx, ri.Desc.RangeID, ri.Lease.Replica)
+		r.leaseCache.Update(ctx, ri.Desc.RangeID, ri.Lease.Replica.StoreID)
 	}
 	return nil
 }
@@ -394,14 +432,14 @@ func (r *distSQLReceiver) updateCaches(ctx context.Context, ranges []roachpb.Ran
 //
 // Note that errors that happen while actually running the flow are reported to
 // recv, not returned by this function.
-func (dsp *distSQLPlanner) PlanAndRun(
+func (dsp *DistSQLPlanner) PlanAndRun(
 	ctx context.Context,
 	txn *client.Txn,
 	tree planNode,
 	recv *distSQLReceiver,
 	evalCtx parser.EvalContext,
 ) error {
-	planCtx := dsp.NewPlanningCtx(ctx, txn)
+	planCtx := dsp.newPlanningCtx(ctx, txn)
 
 	log.VEvent(ctx, 1, "creating DistSQL plan")
 

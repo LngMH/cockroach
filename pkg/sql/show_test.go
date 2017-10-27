@@ -11,25 +11,30 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@cockroachlabs.com)
 
 package sql_test
 
 import (
 	gosql "database/sql"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/kr/pretty"
 )
 
 func TestShowCreateTable(t *testing.T) {
@@ -48,6 +53,8 @@ func TestShowCreateTable(t *testing.T) {
 			c int unique,
 			primary key (a, b)
 		);
+		CREATE DATABASE o;
+		CREATE TABLE o.foo(x int primary key);
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -160,6 +167,8 @@ func TestShowCreateTable(t *testing.T) {
 	FAMILY "primary" (a, b, rowid)
 )`,
 		},
+		// Check that FK dependencies inside the current database
+		// have their db name omitted.
 		{
 			stmt: `CREATE TABLE %s (
 	i int,
@@ -177,6 +186,47 @@ func TestShowCreateTable(t *testing.T) {
 	INDEX t7_auto_index_fk_k_ref_items (k ASC),
 	FAMILY "primary" (i, j, k, rowid)
 )`,
+		},
+		// Check that FK dependencies outside of the current database
+		// have their db name prefixed.
+		{
+			stmt: `CREATE TABLE %s (
+	x INT,
+	CONSTRAINT fk_ref FOREIGN KEY (x) REFERENCES o.foo (x)
+)`,
+			expect: `CREATE TABLE %s (
+	x INT NULL,
+	CONSTRAINT fk_ref FOREIGN KEY (x) REFERENCES o.foo (x),
+	INDEX t8_auto_index_fk_ref (x ASC),
+	FAMILY "primary" (x, rowid)
+)`,
+		},
+		// Check that INTERLEAVE dependencies inside the current database
+		// have their db name omitted.
+		{
+			stmt: `CREATE TABLE %s (
+	a INT,
+	b INT,
+	PRIMARY KEY (a, b)
+) INTERLEAVE IN PARENT items (a, b)`,
+			expect: `CREATE TABLE %s (
+	a INT NOT NULL,
+	b INT NOT NULL,
+	CONSTRAINT "primary" PRIMARY KEY (a ASC, b ASC),
+	FAMILY "primary" (a, b)
+) INTERLEAVE IN PARENT items (a, b)`,
+		},
+		// Check that INTERLEAVE dependencies outside of the current
+		// database are prefixed by their db name.
+		{
+			stmt: `CREATE TABLE %s (
+	x INT PRIMARY KEY
+) INTERLEAVE IN PARENT o.foo (x)`,
+			expect: `CREATE TABLE %s (
+	x INT NOT NULL,
+	CONSTRAINT "primary" PRIMARY KEY (x ASC),
+	FAMILY "primary" (x)
+) INTERLEAVE IN PARENT o.foo (x)`,
 		},
 	}
 	for i, test := range tests {
@@ -239,55 +289,82 @@ func TestShowCreateView(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tests := []string{
-		`CREATE VIEW %s AS SELECT i, s, v, t FROM d.t`,
-		`CREATE VIEW %s AS SELECT i, s, t FROM d.t`,
-		`CREATE VIEW %s AS SELECT t.i, t.s, t.t FROM d.t`,
-		`CREATE VIEW %s AS SELECT foo.i, foo.s, foo.t FROM d.t AS foo WHERE foo.i > 3`,
-		`CREATE VIEW %s AS SELECT count(*) FROM d.t`,
-		`CREATE VIEW %s AS SELECT s, count(*) FROM d.t GROUP BY s HAVING count(*) > 3:::INT`,
-		`CREATE VIEW %s (a, b, c, d) AS SELECT i, s, v, t FROM d.t`,
-		`CREATE VIEW %s (a, b) AS SELECT i, v FROM d.t`,
+	tests := []struct {
+		create   string
+		expected string
+	}{
+		{
+			`CREATE VIEW %s AS SELECT i, s, v, t FROM t`,
+			`CREATE VIEW %s (i, s, v, t) AS SELECT i, s, v, t FROM d.t`,
+		},
+		{
+			`CREATE VIEW %s AS SELECT i, s, t FROM t`,
+			`CREATE VIEW %s (i, s, t) AS SELECT i, s, t FROM d.t`,
+		},
+		{
+			`CREATE VIEW %s AS SELECT t.i, t.s, t.t FROM t`,
+			`CREATE VIEW %s (i, s, t) AS SELECT t.i, t.s, t.t FROM d.t`,
+		},
+		{
+			`CREATE VIEW %s AS SELECT foo.i, foo.s, foo.t FROM t AS foo WHERE foo.i > 3`,
+			`CREATE VIEW %s (i, s, t) AS SELECT foo.i, foo.s, foo.t FROM d.t AS foo WHERE foo.i > 3`,
+		},
+		{
+			`CREATE VIEW %s AS SELECT count(*) FROM t`,
+			`CREATE VIEW %s ("count(*)") AS SELECT count(*) FROM d.t`,
+		},
+		{
+			`CREATE VIEW %s AS SELECT s, count(*) FROM t GROUP BY s HAVING count(*) > 3:::INT`,
+			`CREATE VIEW %s (s, "count(*)") AS SELECT s, count(*) FROM d.t GROUP BY s HAVING count(*) > 3:::INT`,
+		},
+		{
+			`CREATE VIEW %s (a, b, c, d) AS SELECT i, s, v, t FROM t`,
+			`CREATE VIEW %s (a, b, c, d) AS SELECT i, s, v, t FROM d.t`,
+		},
+		{
+			`CREATE VIEW %s (a, b) AS SELECT i, v FROM t`,
+			`CREATE VIEW %s (a, b) AS SELECT i, v FROM d.t`,
+		},
 	}
 	for i, test := range tests {
-		name := fmt.Sprintf("t%d", i)
-		stmt := fmt.Sprintf(test, name)
-		expect := stmt
-		if _, err := sqlDB.Exec(stmt); err != nil {
-			t.Fatal(err)
-		}
-		row := sqlDB.QueryRow(fmt.Sprintf("SHOW CREATE VIEW %s", name))
-		var scanName, create string
-		if err := row.Scan(&scanName, &create); err != nil {
-			t.Fatal(err)
-		}
-		if scanName != name {
-			t.Fatalf("expected view name %s, got %s", name, scanName)
-		}
-		if create != expect {
-			t.Fatalf("statement: %s\ngot: %s\nexpected: %s", stmt, create, expect)
-			continue
-		}
-		if _, err := sqlDB.Exec(fmt.Sprintf("DROP VIEW %s", name)); err != nil {
-			t.Fatal(err)
-		}
-		// Re-insert to make sure it's round-trippable.
-		name += "_2"
-		expect = fmt.Sprintf(test, name)
-		if _, err := sqlDB.Exec(expect); err != nil {
-			t.Fatalf("reinsert failure: %s: %s", expect, err)
-		}
-		row = sqlDB.QueryRow(fmt.Sprintf("SHOW CREATE VIEW %s", name))
-		if err := row.Scan(&scanName, &create); err != nil {
-			t.Fatal(err)
-		}
-		if create != expect {
-			t.Errorf("round trip statement: %s\ngot: %s", expect, create)
-			continue
-		}
-		if _, err := sqlDB.Exec(fmt.Sprintf("DROP VIEW %s", name)); err != nil {
-			t.Fatal(err)
-		}
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			name := fmt.Sprintf("t%d", i)
+			stmt := fmt.Sprintf(test.create, name)
+			expect := fmt.Sprintf(test.expected, name)
+			if _, err := sqlDB.Exec(stmt); err != nil {
+				t.Fatal(err)
+			}
+			row := sqlDB.QueryRow(fmt.Sprintf("SHOW CREATE VIEW %s", name))
+			var scanName, create string
+			if err := row.Scan(&scanName, &create); err != nil {
+				t.Fatal(err)
+			}
+			if scanName != name {
+				t.Fatalf("expected view name %s, got %s", name, scanName)
+			}
+			if create != expect {
+				t.Fatalf("statement: %s\ngot: %s\nexpected: %s", stmt, create, expect)
+			}
+			if _, err := sqlDB.Exec(fmt.Sprintf("DROP VIEW %s", name)); err != nil {
+				t.Fatal(err)
+			}
+			// Re-insert to make sure it's round-trippable.
+			name += "_2"
+			expect = fmt.Sprintf(test.expected, name)
+			if _, err := sqlDB.Exec(expect); err != nil {
+				t.Fatalf("reinsert failure: %s: %s", expect, err)
+			}
+			row = sqlDB.QueryRow(fmt.Sprintf("SHOW CREATE VIEW %s", name))
+			if err := row.Scan(&scanName, &create); err != nil {
+				t.Fatal(err)
+			}
+			if create != expect {
+				t.Fatalf("round trip statement: %s\ngot: %s", expect, create)
+			}
+			if _, err := sqlDB.Exec(fmt.Sprintf("DROP VIEW %s", name)); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -328,7 +405,7 @@ func TestShowQueries(t *testing.T) {
 				UseDatabase: "test",
 				Knobs: base.TestingKnobs{
 					SQLExecutor: &sql.ExecutorTestingKnobs{
-						StatementFilter: func(ctx context.Context, stmt string, res *sql.Result) {
+						StatementFilter: func(ctx context.Context, stmt string, resultWriter sql.ResultsWriter, err error) error {
 							if stmt == selectStmt {
 								const showQuery = "SELECT node_id, query FROM [SHOW CLUSTER QUERIES]"
 
@@ -368,6 +445,7 @@ func TestShowQueries(t *testing.T) {
 									t.Fatalf("unexpected number of running queries: %d, expected %d", count, expectedCount)
 								}
 							}
+							return nil
 						},
 					},
 				},
@@ -383,4 +461,88 @@ func TestShowQueries(t *testing.T) {
 		t.Fatal(err)
 	}
 
+}
+
+// TestShowJobs manually inserts a row into system.jobs and checks that the
+// encoded protobuf payload is properly decoded and visible in
+// crdb_internal.jobs.
+func TestShowJobs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	params, _ := createTestServerParams()
+	s, rawSQLDB, _ := serverutils.StartServer(t, params)
+	sqlDB := sqlutils.MakeSQLRunner(t, rawSQLDB)
+	defer s.Stopper().Stop(context.TODO())
+
+	// row represents a row returned from crdb_internal.jobs, but
+	// *not* a row in system.jobs.
+	type row struct {
+		id                int64
+		typ               string
+		status            string
+		description       string
+		username          string
+		err               string
+		created           time.Time
+		started           time.Time
+		finished          time.Time
+		modified          time.Time
+		fractionCompleted float32
+		coordinatorID     roachpb.NodeID
+	}
+
+	in := row{
+		id:          42,
+		typ:         "SCHEMA CHANGE",
+		status:      "superfailed",
+		description: "failjob",
+		username:    "failure",
+		err:         "boom",
+		// lib/pq returns time.Time objects with goofy locations, which breaks
+		// reflect.DeepEqual without this time.FixedZone song and dance.
+		// See: https://github.com/lib/pq/issues/329
+		created:           timeutil.Unix(1, 0).In(time.FixedZone("", 0)),
+		started:           timeutil.Unix(2, 0).In(time.FixedZone("", 0)),
+		finished:          timeutil.Unix(3, 0).In(time.FixedZone("", 0)),
+		modified:          timeutil.Unix(4, 0).In(time.FixedZone("", 0)),
+		fractionCompleted: 0.42,
+		coordinatorID:     7,
+	}
+
+	// system.jobs is part proper SQL columns, part protobuf, so we can't use the
+	// row struct directly.
+	inPayload, err := protoutil.Marshal(&jobs.Payload{
+		Description:       in.description,
+		StartedMicros:     in.started.UnixNano() / time.Microsecond.Nanoseconds(),
+		FinishedMicros:    in.finished.UnixNano() / time.Microsecond.Nanoseconds(),
+		ModifiedMicros:    in.modified.UnixNano() / time.Microsecond.Nanoseconds(),
+		FractionCompleted: in.fractionCompleted,
+		Username:          in.username,
+		Lease: &jobs.Lease{
+			NodeID: 7,
+		},
+		Error:   in.err,
+		Details: jobs.WrapPayloadDetails(jobs.SchemaChangeDetails{}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB.Exec(
+		`INSERT INTO system.jobs (id, status, created, payload) VALUES ($1, $2, $3, $4)`,
+		in.id, in.status, in.created, inPayload,
+	)
+
+	var out row
+	sqlDB.QueryRow(`
+      SELECT id, type, status, created, description, started, finished, modified,
+             fraction_completed, username, error, coordinator_id
+        FROM crdb_internal.jobs`).Scan(
+		&out.id, &out.typ, &out.status, &out.created, &out.description, &out.started,
+		&out.finished, &out.modified, &out.fractionCompleted, &out.username,
+		&out.err, &out.coordinatorID,
+	)
+	if !reflect.DeepEqual(in, out) {
+		diff := strings.Join(pretty.Diff(in, out), "\n")
+		t.Fatalf("in job did not match out job:\n%s", diff)
+	}
 }

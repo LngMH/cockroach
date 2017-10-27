@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
@@ -200,6 +198,18 @@ func (v *planVisitor) visit(plan planNode) {
 				buf.WriteByte(')')
 				v.observer.attr(name, "equality", buf.String())
 			}
+			if len(n.mergeJoinOrdering) > 0 {
+				// The ordering refers to equality columns
+				eqCols := make(sqlbase.ResultColumns, len(n.pred.leftEqualityIndices))
+				for i := range eqCols {
+					eqCols[i].Name = fmt.Sprintf("(%s=%s)", n.pred.leftColNames[i], n.pred.rightColNames[i])
+				}
+				var order physicalProps
+				for _, o := range n.mergeJoinOrdering {
+					order.addOrderColumn(o.ColIdx, o.Direction)
+				}
+				v.observer.attr(name, "mergeJoinOrder", order.AsString(eqCols))
+			}
 		}
 		subplans := v.expr(name, "pred", -1, n.pred.onCond, nil)
 		v.subqueries(name, subplans)
@@ -237,7 +247,10 @@ func (v *planVisitor) visit(plan planNode) {
 			// We use n.ordering and not plan.Ordering() because
 			// plan.Ordering() does not include the added sort columns not
 			// present in the output.
-			order := orderingInfo{ordering: n.ordering}
+			var order physicalProps
+			for _, o := range n.ordering {
+				order.addOrderColumn(o.ColIdx, o.Direction)
+			}
 			v.observer.attr(name, "order", order.AsString(columns))
 			switch ss := n.sortStrategy.(type) {
 			case *iterativeSortStrategy:
@@ -253,6 +266,10 @@ func (v *planVisitor) visit(plan planNode) {
 		for i, agg := range n.funcs {
 			subplans = v.expr(name, "aggregate", i, agg.expr, subplans)
 		}
+		if v.observer.attr != nil && n.numGroupCols > 0 {
+			v.observer.attr(name, "group by", fmt.Sprintf("@1-@%d", n.numGroupCols))
+		}
+
 		v.visit(n.plan)
 
 	case *windowNode:
@@ -352,9 +369,21 @@ func (v *planVisitor) visit(plan planNode) {
 
 	case *createViewNode:
 		if v.observer.attr != nil {
-			v.observer.attr(name, "query", n.sourceQuery)
+			v.observer.attr(name, "query", parser.AsStringWithFlags(n.n.AsSource, parser.FmtParsable))
 		}
-		v.visit(n.sourcePlan)
+
+	case *setNode:
+		var subplans []planNode
+		for i, texpr := range n.typedValues {
+			subplans = v.expr(name, "value", i, texpr, subplans)
+		}
+		v.subqueries(name, subplans)
+
+	case *setClusterSettingNode:
+		if n.value != nil {
+			subplans := v.expr(name, "value", -1, n.value, nil)
+			v.subqueries(name, subplans)
+		}
 
 	case *delayedNode:
 		if v.observer.attr != nil {
@@ -378,6 +407,14 @@ func (v *planVisitor) visit(plan planNode) {
 			v.observer.attr(name, "expanded", strconv.FormatBool(n.expanded))
 		}
 		v.visit(n.plan)
+
+	case *cancelQueryNode:
+		subplans := v.expr(name, "queryID", -1, n.queryID, nil)
+		v.subqueries(name, subplans)
+
+	case *controlJobNode:
+		subplans := v.expr(name, "jobID", -1, n.jobID, nil)
+		v.subqueries(name, subplans)
 	}
 }
 
@@ -455,10 +492,6 @@ func (v *planVisitor) VisitPost(expr parser.Expr) parser.Expr { return expr }
 func nodeName(plan planNode) string {
 	// Some nodes have custom names depending on attributes.
 	switch n := plan.(type) {
-	case *emptyNode:
-		if n.results {
-			return "nullrow"
-		}
 	case *sortNode:
 		if !n.needSort {
 			return "nosort"
@@ -485,44 +518,52 @@ func nodeName(plan planNode) string {
 // strings are constant and not precomputed so that the type names can
 // be changed without changing the output of "EXPLAIN".
 var planNodeNames = map[reflect.Type]string{
-	reflect.TypeOf(&alterTableNode{}):       "alter table",
-	reflect.TypeOf(&copyNode{}):             "copy",
-	reflect.TypeOf(&createDatabaseNode{}):   "create database",
-	reflect.TypeOf(&createIndexNode{}):      "create index",
-	reflect.TypeOf(&createTableNode{}):      "create table",
-	reflect.TypeOf(&createUserNode{}):       "create user",
-	reflect.TypeOf(&createViewNode{}):       "create view",
-	reflect.TypeOf(&delayedNode{}):          "virtual table",
-	reflect.TypeOf(&deleteNode{}):           "delete",
-	reflect.TypeOf(&distinctNode{}):         "distinct",
-	reflect.TypeOf(&dropDatabaseNode{}):     "drop database",
-	reflect.TypeOf(&dropIndexNode{}):        "drop index",
-	reflect.TypeOf(&dropTableNode{}):        "drop table",
-	reflect.TypeOf(&dropViewNode{}):         "drop view",
-	reflect.TypeOf(&dropUserNode{}):         "drop user",
-	reflect.TypeOf(&emptyNode{}):            "empty",
-	reflect.TypeOf(&explainDistSQLNode{}):   "explain dist_sql",
-	reflect.TypeOf(&explainPlanNode{}):      "explain plan",
-	reflect.TypeOf(&traceNode{}):            "show trace for",
-	reflect.TypeOf(&filterNode{}):           "filter",
-	reflect.TypeOf(&groupNode{}):            "group",
-	reflect.TypeOf(&hookFnNode{}):           "plugin",
-	reflect.TypeOf(&indexJoinNode{}):        "index-join",
-	reflect.TypeOf(&insertNode{}):           "insert",
-	reflect.TypeOf(&joinNode{}):             "join",
-	reflect.TypeOf(&limitNode{}):            "limit",
-	reflect.TypeOf(&ordinalityNode{}):       "ordinality",
-	reflect.TypeOf(&testingRelocateNode{}):  "testingRelocate",
-	reflect.TypeOf(&renderNode{}):           "render",
-	reflect.TypeOf(&scanNode{}):             "scan",
-	reflect.TypeOf(&scatterNode{}):          "scatter",
-	reflect.TypeOf(&showRangesNode{}):       "showRanges",
-	reflect.TypeOf(&showFingerprintsNode{}): "showFingerprints",
-	reflect.TypeOf(&sortNode{}):             "sort",
-	reflect.TypeOf(&splitNode{}):            "split",
-	reflect.TypeOf(&unionNode{}):            "union",
-	reflect.TypeOf(&updateNode{}):           "update",
-	reflect.TypeOf(&valueGenerator{}):       "generator",
-	reflect.TypeOf(&valuesNode{}):           "values",
-	reflect.TypeOf(&windowNode{}):           "window",
+	reflect.TypeOf(&alterTableNode{}):        "alter table",
+	reflect.TypeOf(&cancelQueryNode{}):       "cancel query",
+	reflect.TypeOf(&controlJobNode{}):        "control job",
+	reflect.TypeOf(&copyNode{}):              "copy",
+	reflect.TypeOf(&createDatabaseNode{}):    "create database",
+	reflect.TypeOf(&createIndexNode{}):       "create index",
+	reflect.TypeOf(&createTableNode{}):       "create table",
+	reflect.TypeOf(&createUserNode{}):        "create user",
+	reflect.TypeOf(&createViewNode{}):        "create view",
+	reflect.TypeOf(&delayedNode{}):           "virtual table",
+	reflect.TypeOf(&deleteNode{}):            "delete",
+	reflect.TypeOf(&distinctNode{}):          "distinct",
+	reflect.TypeOf(&dropDatabaseNode{}):      "drop database",
+	reflect.TypeOf(&dropIndexNode{}):         "drop index",
+	reflect.TypeOf(&dropTableNode{}):         "drop table",
+	reflect.TypeOf(&dropViewNode{}):          "drop view",
+	reflect.TypeOf(&dropUserNode{}):          "drop user",
+	reflect.TypeOf(&explainDistSQLNode{}):    "explain dist_sql",
+	reflect.TypeOf(&explainPlanNode{}):       "explain plan",
+	reflect.TypeOf(&traceNode{}):             "show trace for",
+	reflect.TypeOf(&filterNode{}):            "filter",
+	reflect.TypeOf(&groupNode{}):             "group",
+	reflect.TypeOf(&unaryNode{}):             "emptyrow",
+	reflect.TypeOf(&hookFnNode{}):            "plugin",
+	reflect.TypeOf(&indexJoinNode{}):         "index-join",
+	reflect.TypeOf(&insertNode{}):            "insert",
+	reflect.TypeOf(&joinNode{}):              "join",
+	reflect.TypeOf(&limitNode{}):             "limit",
+	reflect.TypeOf(&ordinalityNode{}):        "ordinality",
+	reflect.TypeOf(&testingRelocateNode{}):   "testingRelocate",
+	reflect.TypeOf(&renderNode{}):            "render",
+	reflect.TypeOf(&scanNode{}):              "scan",
+	reflect.TypeOf(&scatterNode{}):           "scatter",
+	reflect.TypeOf(&scrubNode{}):             "scrub",
+	reflect.TypeOf(&setNode{}):               "set",
+	reflect.TypeOf(&setClusterSettingNode{}): "set cluster setting",
+	reflect.TypeOf(&setZoneConfigNode{}):     "configure zone",
+	reflect.TypeOf(&showZoneConfigNode{}):    "show zone configuration",
+	reflect.TypeOf(&showRangesNode{}):        "showRanges",
+	reflect.TypeOf(&showFingerprintsNode{}):  "showFingerprints",
+	reflect.TypeOf(&sortNode{}):              "sort",
+	reflect.TypeOf(&splitNode{}):             "split",
+	reflect.TypeOf(&unionNode{}):             "union",
+	reflect.TypeOf(&updateNode{}):            "update",
+	reflect.TypeOf(&valueGenerator{}):        "generator",
+	reflect.TypeOf(&valuesNode{}):            "values",
+	reflect.TypeOf(&windowNode{}):            "window",
+	reflect.TypeOf(&zeroNode{}):              "norows",
 }

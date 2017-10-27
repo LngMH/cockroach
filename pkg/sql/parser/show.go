@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // This code was derived from https://github.com/youtube/vitess.
 //
@@ -27,18 +25,25 @@ import (
 	"fmt"
 )
 
-// Show represents a SHOW statement.
-type Show struct {
-	Name           string
-	ClusterSetting bool
+// ShowVar represents a SHOW statement.
+type ShowVar struct {
+	Name string
 }
 
 // Format implements the NodeFormatter interface.
-func (node *Show) Format(buf *bytes.Buffer, f FmtFlags) {
+func (node *ShowVar) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("SHOW ")
-	if node.ClusterSetting {
-		buf.WriteString("CLUSTER SETTING ")
-	}
+	buf.WriteString(node.Name)
+}
+
+// ShowClusterSetting represents a SHOW CLUSTER SETTING statement.
+type ShowClusterSetting struct {
+	Name string
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowClusterSetting) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteString("SHOW CLUSTER SETTING ")
 	buf.WriteString(node.Name)
 }
 
@@ -61,7 +66,7 @@ type ShowColumns struct {
 // Format implements the NodeFormatter interface.
 func (node *ShowColumns) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("SHOW COLUMNS FROM ")
-	FormatNode(buf, f, node.Table)
+	FormatNode(buf, f, &node.Table)
 }
 
 // ShowDatabases represents a SHOW DATABASES statement.
@@ -73,7 +78,7 @@ func (node *ShowDatabases) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("SHOW DATABASES")
 }
 
-// ShowTrace represents a SHOW SESSION TRACE statement.
+// ShowTrace represents a SHOW TRACE FOR SESSION statement.
 type ShowTrace struct {
 	Statement   Statement
 	OnlyKVTrace bool
@@ -85,10 +90,10 @@ func (node *ShowTrace) Format(buf *bytes.Buffer, f FmtFlags) {
 	if node.OnlyKVTrace {
 		onlyKV = " KV"
 	}
+	fmt.Fprintf(buf, "SHOW%s TRACE FOR ", onlyKV)
 	if node.Statement == nil {
-		fmt.Fprintf(buf, "SHOW SESSION%s TRACE", onlyKV)
+		buf.WriteString("SESSION")
 	} else {
-		fmt.Fprintf(buf, "SHOW%s TRACE FOR ", onlyKV)
 		FormatNode(buf, f, node.Statement)
 	}
 }
@@ -101,7 +106,7 @@ type ShowIndex struct {
 // Format implements the NodeFormatter interface.
 func (node *ShowIndex) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("SHOW INDEXES FROM ")
-	FormatNode(buf, f, node.Table)
+	FormatNode(buf, f, &node.Table)
 }
 
 // ShowQueries represents a SHOW QUERIES statement
@@ -158,7 +163,7 @@ func (node *ShowConstraints) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("SHOW CONSTRAINTS")
 	if node.Table.TableNameReference != nil {
 		buf.WriteString(" FROM ")
-		FormatNode(buf, f, node.Table)
+		FormatNode(buf, f, &node.Table)
 	}
 }
 
@@ -199,7 +204,7 @@ type ShowCreateTable struct {
 // Format implements the NodeFormatter interface.
 func (node *ShowCreateTable) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("SHOW CREATE TABLE ")
-	FormatNode(buf, f, node.Table)
+	FormatNode(buf, f, &node.Table)
 }
 
 // ShowCreateView represents a SHOW CREATE VIEW statement.
@@ -210,7 +215,7 @@ type ShowCreateView struct {
 // Format implements the NodeFormatter interface.
 func (node *ShowCreateView) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("SHOW CREATE VIEW ")
-	FormatNode(buf, f, node.View)
+	FormatNode(buf, f, &node.View)
 }
 
 // ShowTransactionStatus represents a SHOW TRANSACTION STATUS statement.
@@ -229,17 +234,6 @@ type ShowUsers struct {
 // Format implements the NodeFormatter interface.
 func (node *ShowUsers) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("SHOW USERS")
-}
-
-// Help represents a HELP statement.
-type Help struct {
-	Name Name
-}
-
-// Format implements the NodeFormatter interface.
-func (node *Help) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString("HELP ")
-	FormatNode(buf, f, node.Name)
 }
 
 // ShowRanges represents a SHOW TESTING_RANGES statement.
@@ -264,15 +258,10 @@ func (node *ShowRanges) Format(buf *bytes.Buffer, f FmtFlags) {
 // ShowFingerprints represents a SHOW EXPERIMENTAL_FINGERPRINTS statement.
 type ShowFingerprints struct {
 	Table *NormalizableTableName
-	AsOf  AsOfClause
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowFingerprints) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE ")
 	FormatNode(buf, f, node.Table)
-	if node.AsOf.Expr != nil {
-		buf.WriteString(" ")
-		FormatNode(buf, f, node.AsOf)
-	}
 }

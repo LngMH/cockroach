@@ -11,16 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package security
 
 import (
 	"crypto/tls"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
+
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 const (
@@ -56,16 +55,16 @@ type RequestWithUser interface {
 
 // ProtoAuthHook builds an authentication hook based on the security
 // mode and client certificate.
-// The proto.Message passed to the hook must implement RequestWithUser.
+// The protoutil.Message passed to the hook must implement RequestWithUser.
 func ProtoAuthHook(
 	insecureMode bool, tlsState *tls.ConnectionState,
-) (func(proto.Message, bool) error, error) {
+) (func(protoutil.Message, bool) error, error) {
 	userHook, err := UserAuthCertHook(insecureMode, tlsState)
 	if err != nil {
 		return nil, err
 	}
 
-	return func(request proto.Message, clientConnection bool) error {
+	return func(request protoutil.Message, clientConnection bool) error {
 		// RequestWithUser must be implemented.
 		requestWithUser, ok := request.(RequestWithUser)
 		if !ok {
@@ -139,7 +138,7 @@ func UserAuthPasswordHook(insecureMode bool, password string, hashedPassword []b
 		}
 
 		// If the requested user has an empty password, disallow authentication.
-		if len(password) == 0 || compareHashAndPassword(hashedPassword, password) != nil {
+		if len(password) == 0 || CompareHashAndPassword(hashedPassword, password) != nil {
 			return errors.New("invalid password")
 		}
 

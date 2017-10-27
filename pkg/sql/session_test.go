@@ -11,22 +11,27 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package sql_test
 
 import (
 	"database/sql/driver"
+	"fmt"
 	"net/url"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/lib/pq"
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -176,5 +181,122 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 			}
 
 		})
+	}
+}
+
+// Test two things about non-retriable errors happening when the Executor does
+// an "autoCommit" (i.e. commits the KV txn after running an implicit
+// transaction):
+// 1) The error is reported to the client.
+// 2) The error doesn't leave the session in the Aborted state. After running
+// implicit transactions, the state should always be NoTxn, regardless of any
+// errors.
+func TestNonRetriableErrorOnAutoCommit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	query := "SELECT 42"
+
+	params := base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				BeforeAutoCommit: func(ctx context.Context, stmt string) error {
+					if strings.Contains(stmt, query) {
+						return fmt.Errorf("injected autocommit error")
+					}
+					return nil
+				},
+			},
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	sqlDB.SetMaxOpenConns(1)
+
+	if _, err := sqlDB.Exec(query); !testutils.IsError(err, "injected") {
+		t.Fatalf("expected injected error, got: %v", err)
+	}
+
+	var state string
+	if err := sqlDB.QueryRow("SHOW TRANSACTION STATUS").Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "NoTxn" {
+		t.Fatalf("expected state %s, got: %s", "NoTxn", state)
+	}
+}
+
+// Test that, if a ROLLBACK statement encounters an error, the error is not
+// returned to the client and the session state is transitioned to NoTxn.
+func TestErrorOnRollback(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const targetKeyString string = "/Table/51/1/1/0"
+	var injectedErr int64
+
+	// We're going to inject an error into our EndTransaction.
+	params := base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Store: &storage.StoreTestingKnobs{
+				TestingProposalFilter: func(fArgs storagebase.ProposalFilterArgs) *roachpb.Error {
+					if !fArgs.Req.IsSingleRequest() {
+						return nil
+					}
+					req := fArgs.Req.Requests[0]
+					etReq, ok := req.GetInner().(*roachpb.EndTransactionRequest)
+					// We only inject the error once. Turns out that during the life of
+					// the test there's two EndTransactions being sent - one is the direct
+					// result of the test's call to tx.Rollback(), the second is sent by
+					// the TxnCoordSender - indirectly triggered by the fact that, on the
+					// server side, the transaction's context gets cancelled at the SQL
+					// layer.
+					if ok &&
+						etReq.Header().Key.String() == targetKeyString &&
+						atomic.LoadInt64(&injectedErr) == 0 {
+
+						atomic.StoreInt64(&injectedErr, 1)
+						return roachpb.NewErrorf("test injected error")
+					}
+					return nil
+				},
+			},
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := sqlDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Perform a write so that the EndTransaction we're going to send doesn't get
+	// elided.
+	if _, err := tx.Exec("INSERT INTO t.test(k, v) VALUES (1, 'abc')"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	var state string
+	if err := sqlDB.QueryRow("SHOW TRANSACTION STATUS").Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "NoTxn" {
+		t.Fatalf("expected state %s, got: %s", "NoTxn", state)
+	}
+
+	if atomic.LoadInt64(&injectedErr) == 0 {
+		t.Fatal("test didn't inject the error; it must have failed to find " +
+			"the EndTransaction with the expected key")
 	}
 }

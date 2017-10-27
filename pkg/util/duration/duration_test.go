@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Daniel Harrison (daniel.harrison@gmail.com)
 
 package duration
 
@@ -256,6 +254,27 @@ func TestAddMicros(t *testing.T) {
 		if res := AddMicros(test.t, test.d); !test.exp.Equal(res) {
 			t.Errorf("%d: expected AddMicros(%v, %d) = %v, found %v",
 				i, test.t, test.d, test.exp, res)
+		}
+	}
+}
+
+func TestTruncate(t *testing.T) {
+	zero := time.Duration(0).String()
+	testCases := []struct {
+		d, r time.Duration
+		s    string
+	}{
+		{0, 1, zero},
+		{0, 1, zero},
+		{time.Second, 1, "1s"},
+		{time.Second, 2 * time.Second, zero},
+		{time.Second + 1, time.Second, "1s"},
+		{11 * time.Nanosecond, 10 * time.Nanosecond, "10ns"},
+		{time.Hour + time.Nanosecond + 3*time.Millisecond + time.Second, time.Millisecond, "1h0m1.003s"},
+	}
+	for i, tc := range testCases {
+		if s := Truncate(tc.d, tc.r).String(); s != tc.s {
+			t.Errorf("%d: (%s,%s) should give %s, but got %s", i, tc.d, tc.r, tc.s, s)
 		}
 	}
 }

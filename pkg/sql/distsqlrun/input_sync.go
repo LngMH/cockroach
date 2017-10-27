@@ -12,9 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 //
-// Author: Radu Berinde (radu@cockroachlabs.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
-//
 // Input synchronizers are used by processors to merge incoming rows from
 // (potentially) multiple streams; see docs/RFCS/distributed_sql.md
 
@@ -70,6 +67,8 @@ type orderedSynchronizer struct {
 
 	sources []srcInfo
 
+	types []sqlbase.ColumnType
+
 	// state dictates the operation mode.
 	state orderedSynchronizerState
 
@@ -97,7 +96,7 @@ var _ RowSource = &orderedSynchronizer{}
 
 // Types is part of the RowSource interface.
 func (s *orderedSynchronizer) Types() []sqlbase.ColumnType {
-	return s.sources[0].src.Types()
+	return s.types
 }
 
 // Len is part of heap.Interface and is only meant to be used internally.
@@ -109,7 +108,7 @@ func (s *orderedSynchronizer) Len() int {
 func (s *orderedSynchronizer) Less(i, j int) bool {
 	si := &s.sources[s.heap[i]]
 	sj := &s.sources[s.heap[j]]
-	cmp, err := si.row.Compare(&s.alloc, s.ordering, s.evalCtx, sj.row)
+	cmp, err := si.row.Compare(s.types, &s.alloc, s.ordering, s.evalCtx, sj.row)
 	if err != nil {
 		s.err = err
 		return false
@@ -225,10 +224,12 @@ func (s *orderedSynchronizer) advanceRoot() error {
 	} else {
 		heap.Fix(s, 0)
 		// TODO(radu): this check may be costly, we could disable it in production
-		if cmp, err := oldRow.Compare(&s.alloc, s.ordering, s.evalCtx, src.row); err != nil {
+		if cmp, err := oldRow.Compare(s.types, &s.alloc, s.ordering, s.evalCtx, src.row); err != nil {
 			return err
 		} else if cmp > 0 {
-			return errors.Errorf("incorrectly ordered stream %s after %s", src.row, oldRow)
+			return errors.Errorf(
+				"incorrectly ordered stream %s after %s", src.row.String(s.types), oldRow.String(s.types),
+			)
 		}
 	}
 	// heap operations might set s.err (see Less)
@@ -331,6 +332,7 @@ func makeOrderedSync(
 	s := &orderedSynchronizer{
 		state:    notInitialized,
 		sources:  make([]srcInfo, len(sources)),
+		types:    sources[0].Types(),
 		heap:     make([]srcIdx, 0, len(sources)),
 		ordering: ordering,
 		evalCtx:  evalCtx,

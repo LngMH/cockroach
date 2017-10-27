@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 // Package hlc implements the Hybrid Logical Clock outlined in
 // "Logical Physical Clocks and Consistent Snapshots in Globally
@@ -21,6 +19,7 @@
 package hlc
 
 import (
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -143,7 +142,7 @@ func (c *Clock) getPhysicalClockLocked() int64 {
 		interval := c.mu.lastPhysicalTime - newTime
 		if interval > int64(c.maxOffset/10) {
 			c.mu.monotonicityErrorsCount++
-			log.Warningf(context.TODO(), "backward time jump detected (%f seconds)", float64(newTime-c.mu.lastPhysicalTime)/1e9)
+			log.Warningf(context.TODO(), "backward time jump detected (%f seconds)", float64(-interval)/1e9)
 		}
 	}
 
@@ -180,21 +179,29 @@ func (c *Clock) PhysicalNow() int64 {
 
 // PhysicalTime returns a time.Time struct using the local wall time.
 func (c *Clock) PhysicalTime() time.Time {
-	return time.Unix(0, c.PhysicalNow()).UTC()
+	return timeutil.Unix(0, c.PhysicalNow())
 }
 
-// Update takes a hybrid timestamp, usually originating from
-// an event received from another member of a distributed
-// system. The clock is updated and the hybrid timestamp
-// associated to the receipt of the event returned.
-// An error may only occur if offset checking is active and
-// the remote timestamp was rejected due to clock offset,
-// in which case the timestamp of the clock will not have been
-// altered.
-// To timestamp events of local origin, use Now instead.
+// Update takes a hybrid timestamp, usually originating from an event
+// received from another member of a distributed system. The clock is
+// updated and the clock's updated hybrid timestamp is returned. If
+// the remote timestamp exceeds the wall clock time by more than the
+// maximum clock offset, the update is still processed, but a warning
+// is logged. To receive an error response instead of forcing the
+// update in case the remote timestamp is too far into the future, use
+// UpdateAndCheckMaxOffset() instead.
 func (c *Clock) Update(rt Timestamp) Timestamp {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	updateT, err := c.updateLocked(rt, true)
+	if err != nil {
+		log.Warningf(context.TODO(), "%s - updating anyway", err)
+	}
+	return updateT
+}
+
+func (c *Clock) updateLocked(rt Timestamp, updateIfMaxOffsetExceeded bool) (Timestamp, error) {
+	var err error
 	physicalClock := c.getPhysicalClockLocked()
 
 	if physicalClock > c.mu.timestamp.WallTime && physicalClock > rt.WallTime {
@@ -202,17 +209,21 @@ func (c *Clock) Update(rt Timestamp) Timestamp {
 		// as the new wall time and the logical clock is reset.
 		c.mu.timestamp.WallTime = physicalClock
 		c.mu.timestamp.Logical = 0
-		return c.mu.timestamp
+		return c.mu.timestamp, nil
+	}
+
+	offset := time.Duration(rt.WallTime - physicalClock)
+	if c.maxOffset > 0 && c.maxOffset != timeutil.ClocklessMaxOffset && offset > c.maxOffset {
+		err = fmt.Errorf("remote wall time is too far ahead (%s) to be trustworthy", offset)
+		if !updateIfMaxOffsetExceeded {
+			return Timestamp{}, err
+		}
 	}
 
 	// In the remaining cases, our physical clock plays no role
-	// as it is behind the local and remote wall times. Instead,
+	// as it is behind the local or remote wall times. Instead,
 	// the logical clock comes into play.
 	if rt.WallTime > c.mu.timestamp.WallTime {
-		offset := time.Duration(rt.WallTime-physicalClock) * time.Nanosecond
-		if c.maxOffset > 0 && offset > c.maxOffset {
-			log.Warningf(context.TODO(), "remote wall time is too far ahead (%s) to be trustworthy - updating anyway", offset)
-		}
 		// The remote clock is ahead of ours, and we update
 		// our own logical clock with theirs.
 		c.mu.timestamp.WallTime = rt.WallTime
@@ -229,5 +240,15 @@ func (c *Clock) Update(rt Timestamp) Timestamp {
 		}
 		c.mu.timestamp.Logical++
 	}
-	return c.mu.timestamp
+	return c.mu.timestamp, err
+}
+
+// UpdateAndCheckMaxOffset is similar to Update, except it returns an
+// error instead of logging a warning and updating the clock's
+// timestamp, in the event that the supplied remote timestamp exceeds
+// the wall clock time by more than the maximum clock offset.
+func (c *Clock) UpdateAndCheckMaxOffset(rt Timestamp) (Timestamp, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.updateLocked(rt, false)
 }

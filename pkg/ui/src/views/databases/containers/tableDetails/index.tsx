@@ -20,7 +20,7 @@ import * as hljs from "highlight.js";
 // Specialization of generic SortedTable component:
 //   https://github.com/Microsoft/TypeScript/issues/3960
 //
-// The variable name must start with a capital letter or TSX will not recognize
+// The variable name must start with a capital letter or JSX will not recognize
 // it as a component.
 // tslint:disable-next-line:variable-name
 export const GrantsSortedTable = SortedTable as new () => SortedTable<protos.cockroach.server.serverpb.TableDetailsResponse.Grant$Properties>;
@@ -87,7 +87,7 @@ class TableMain extends React.Component<TableMainProps, {}> {
         </section>
         <section className="section">
           <div className="database-summary-title">
-            { this.props.params[tableNameAttr] }
+            <h2>{ this.props.params[tableNameAttr] }</h2>
           </div>
           <div className="content l-columns">
             <div className="l-columns__left">

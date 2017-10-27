@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package pgwire
 
@@ -25,22 +23,26 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/pkg/errors"
 )
 
 func makeTestV3Conn(c net.Conn) v3Conn {
 	metrics := makeServerMetrics(nil, metric.TestSampleInterval)
-	mon := mon.MakeUnlimitedMonitor(context.Background(), "test", nil, nil, 1000)
+	mon := mon.MakeUnlimitedMonitor(
+		context.Background(), "test", mon.MemoryResource, nil, nil, 1000,
+	)
+	st := cluster.MakeTestingClusterSettings()
 	exec := sql.NewExecutor(
 		sql.ExecutorConfig{
-			AmbientCtx:              log.AmbientContext{Tracer: tracing.NewTracer()},
+			AmbientCtx:              log.AmbientContext{Tracer: st.Tracer},
+			Settings:                st,
 			HistogramWindowInterval: metric.TestSampleInterval,
 			TestingKnobs:            &sql.ExecutorTestingKnobs{},
 			SessionRegistry:         sql.MakeSessionRegistry(),

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Ben Darnell
 
 package pgwire
 
@@ -26,12 +24,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/pkg/errors"
 )
@@ -39,7 +38,7 @@ import (
 const (
 	// ErrSSLRequired is returned when a client attempts to connect to a
 	// secure server in cleartext.
-	ErrSSLRequired = "cleartext connections are not permitted"
+	ErrSSLRequired = "node is running secure mode, SSL connection required"
 
 	// ErrDraining is returned when a client attempts to connect to a server
 	// which is not accepting client connections.
@@ -108,8 +107,8 @@ type Server struct {
 		draining      bool
 	}
 
-	sqlMemoryPool mon.MemoryMonitor
-	connMonitor   mon.MemoryMonitor
+	sqlMemoryPool mon.BytesMonitor
+	connMonitor   mon.BytesMonitor
 }
 
 // ServerMetrics is the set of metrics for the pgwire server.
@@ -152,7 +151,7 @@ func MakeServer(
 	cfg *base.Config,
 	executor *sql.Executor,
 	internalMemMetrics *sql.MemoryMetrics,
-	parentMemoryMonitor *mon.MemoryMonitor,
+	parentMemoryMonitor *mon.BytesMonitor,
 	histogramWindow time.Duration,
 ) *Server {
 	server := &Server{
@@ -162,12 +161,14 @@ func MakeServer(
 		metrics:    makeServerMetrics(internalMemMetrics, histogramWindow),
 	}
 	server.sqlMemoryPool = mon.MakeMonitor("sql",
+		mon.MemoryResource,
 		server.metrics.SQLMemMetrics.CurBytesCount,
 		server.metrics.SQLMemMetrics.MaxBytesHist,
 		0, noteworthySQLMemoryUsageBytes)
 	server.sqlMemoryPool.Start(context.Background(), parentMemoryMonitor, mon.BoundAccount{})
 
 	server.connMonitor = mon.MakeMonitor("conn",
+		mon.MemoryResource,
 		server.metrics.ConnMemMetrics.CurBytesCount,
 		server.metrics.ConnMemMetrics.MaxBytesHist,
 		int64(connReservationBatchSize)*baseSQLMemoryBudget, noteworthyConnMemoryUsageBytes)
@@ -218,7 +219,7 @@ func (s *Server) Metrics() *ServerMetrics {
 // which connections are accepted.
 // The RFC on drain modes has more information regarding the specifics of
 // what will happen to connections in different states:
-// https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/drain_modes.md
+// https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20160425_drain_modes.md
 func (s *Server) SetDraining(drain bool) error {
 	return s.setDrainingImpl(drain, drainMaxWait, cancelMaxWait)
 }
@@ -314,7 +315,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 	draining := s.mu.draining
 	if !draining {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithCancel(ctx)
+		ctx, cancel = contextutil.WithCancel(ctx)
 		done := make(chan struct{})
 		s.mu.connCancelMap[done] = cancel
 		defer func() {
@@ -388,11 +389,11 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 		defer v3conn.finish(ctx)
 
 		if v3conn.sessionArgs, err = parseOptions(ctx, buf.msg); err != nil {
-			return v3conn.sendInternalError(err.Error())
+			return v3conn.sendError(pgerror.NewError(pgerror.CodeProtocolViolationError, err.Error()))
 		}
 
 		if errSSLRequired {
-			return v3conn.sendInternalError(ErrSSLRequired)
+			return v3conn.sendError(pgerror.NewError(pgerror.CodeProtocolViolationError, ErrSSLRequired))
 		}
 		if draining {
 			return v3conn.sendError(newAdminShutdownErr(errors.New(ErrDraining)))
@@ -400,7 +401,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 
 		v3conn.sessionArgs.User = parser.Name(v3conn.sessionArgs.User).Normalize()
 		if err := v3conn.handleAuthentication(ctx, s.cfg.Insecure); err != nil {
-			return v3conn.sendInternalError(err.Error())
+			return v3conn.sendError(pgerror.NewError(pgerror.CodeInvalidPasswordError, err.Error()))
 		}
 
 		// Reserve some memory for this connection using the server's

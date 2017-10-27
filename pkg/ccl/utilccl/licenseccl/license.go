@@ -16,6 +16,8 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -24,7 +26,7 @@ const LicensePrefix = "crl-0-"
 
 // Encode serializes the License as a base64 string.
 func (l License) Encode() (string, error) {
-	bytes, err := l.Marshal()
+	bytes, err := protoutil.Marshal(&l)
 	if err != nil {
 		return "", err
 	}
@@ -45,7 +47,7 @@ func Decode(s string) (*License, error) {
 		return nil, errors.Wrap(err, "invalid license string")
 	}
 	var lic License
-	if err := lic.Unmarshal(data); err != nil {
+	if err := protoutil.Unmarshal(data, &lic); err != nil {
 		return nil, errors.Wrap(err, "invalid license string")
 	}
 	return &lic, nil
@@ -68,8 +70,8 @@ func (l *License) Check(at time.Time, cluster uuid.UUID, org, feature string) er
 
 	// We extend some grace period to enterprise license holders rather than
 	// suddenly throwing errors at them.
-	if l.Type != License_Enterprise {
-		if expiration := time.Unix(l.ValidUntilUnixSec, 0); at.After(expiration) {
+	if l.ValidUntilUnixSec > 0 && l.Type != License_Enterprise {
+		if expiration := timeutil.Unix(l.ValidUntilUnixSec, 0); at.After(expiration) {
 			return errors.Errorf("license expired at %s", expiration.String())
 		}
 	}

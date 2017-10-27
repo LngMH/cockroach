@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package sql
 
@@ -90,7 +88,7 @@ func makeDatabaseDesc(p *parser.CreateDatabase) sqlbase.DatabaseDescriptor {
 func getKeysForDatabaseDescriptor(
 	dbDesc *sqlbase.DatabaseDescriptor,
 ) (zoneKey roachpb.Key, nameKey roachpb.Key, descKey roachpb.Key) {
-	zoneKey = sqlbase.MakeZoneKey(dbDesc.ID)
+	zoneKey = config.MakeZoneKey(uint32(dbDesc.ID))
 	nameKey = sqlbase.MakeNameMetadataKey(keys.RootNamespaceID, dbDesc.GetName())
 	descKey = sqlbase.MakeDescMetadataKey(dbDesc.ID)
 	return
@@ -131,6 +129,20 @@ func getDatabaseDesc(
 	return desc, err
 }
 
+// getDatabaseDescByID looks up the database descriptor given its ID,
+// returning nil if the descriptor is not found. If you want the "not
+// found" condition to return an error, use mustGetDatabaseDescByID() instead.
+func getDatabaseDescByID(
+	ctx context.Context, txn *client.Txn, id sqlbase.ID,
+) (*sqlbase.DatabaseDescriptor, error) {
+	desc := &sqlbase.DatabaseDescriptor{}
+	found, err := getDescriptorByID(ctx, txn, id, desc)
+	if !found {
+		return nil, err
+	}
+	return desc, err
+}
+
 // MustGetDatabaseDesc looks up the database descriptor given its name,
 // returning an error if the descriptor is not found.
 func MustGetDatabaseDesc(
@@ -142,6 +154,21 @@ func MustGetDatabaseDesc(
 	}
 	if desc == nil {
 		return nil, sqlbase.NewUndefinedDatabaseError(name)
+	}
+	return desc, nil
+}
+
+// MustGetDatabaseDescByID looks up the database descriptor given its ID,
+// returning an error if the descriptor is not found.
+func MustGetDatabaseDescByID(
+	ctx context.Context, txn *client.Txn, id sqlbase.ID,
+) (*sqlbase.DatabaseDescriptor, error) {
+	desc, err := getDatabaseDescByID(ctx, txn, id)
+	if err != nil {
+		return nil, err
+	}
+	if desc == nil {
+		return nil, sqlbase.NewUndefinedDatabaseError(fmt.Sprintf("[%d]", id))
 	}
 	return desc, nil
 }
@@ -164,10 +191,22 @@ func (dc *databaseCache) getCachedDatabaseDesc(name string) (*sqlbase.DatabaseDe
 		return nil, err
 	}
 
-	descKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(id))
+	desc, err := dc.getCachedDatabaseDescByID(sqlbase.ID(id))
+	if err == nil && desc == nil {
+		return nil, fmt.Errorf("database %q has name entry, but no descriptor in system cache", name)
+	}
+	return desc, err
+}
+
+// getCachedDatabaseDescByID looks up the database descriptor from the descriptor cache,
+// given its ID.
+func (dc *databaseCache) getCachedDatabaseDescByID(
+	id sqlbase.ID,
+) (*sqlbase.DatabaseDescriptor, error) {
+	descKey := sqlbase.MakeDescMetadataKey(id)
 	descVal := dc.systemConfig.GetValue(descKey)
 	if descVal == nil {
-		return nil, fmt.Errorf("database %q has name entry, but no descriptor in system cache", name)
+		return nil, nil
 	}
 
 	desc := &sqlbase.Descriptor{}
@@ -177,7 +216,7 @@ func (dc *databaseCache) getCachedDatabaseDesc(name string) (*sqlbase.DatabaseDe
 
 	database := desc.GetDatabase()
 	if database == nil {
-		return nil, errors.Errorf("%q is not a database", name)
+		return nil, errors.Errorf("[%d] is not a database", id)
 	}
 
 	return database, database.Validate()
@@ -202,11 +241,51 @@ func getAllDatabaseDescs(
 	return dbDescs, nil
 }
 
-// getDatabaseID returns the ID of a database given its name. It
+// getDatabaseDesc returns the database descriptor given its name
+// if it exists in the cache, otherwise falls back to KV operations.
+func (dc *databaseCache) getDatabaseDesc(
+	ctx context.Context,
+	txnRunner func(context.Context, func(context.Context, *client.Txn) error) error,
+	vt VirtualTabler,
+	name string,
+) (*sqlbase.DatabaseDescriptor, error) {
+	// Lookup the database in the cache first, falling back to the KV store if it
+	// isn't present. The cache might cause the usage of a recently renamed
+	// database, but that's a race that could occur anyways.
+	desc, err := dc.getCachedDatabaseDesc(name)
+	if err != nil {
+		log.VEventf(ctx, 3, "error getting database descriptor from cache: %s", err)
+		if err := txnRunner(ctx, func(ctx context.Context, txn *client.Txn) error {
+			desc, err = MustGetDatabaseDesc(ctx, txn, vt, name)
+			return err
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return desc, err
+}
+
+// getDatabaseDescByID returns the database descriptor given its ID
+// if it exists in the cache, otherwise falls back to KV operations.
+func (dc *databaseCache) getDatabaseDescByID(
+	ctx context.Context, txn *client.Txn, id sqlbase.ID,
+) (*sqlbase.DatabaseDescriptor, error) {
+	desc, err := dc.getCachedDatabaseDescByID(id)
+	if err != nil {
+		log.VEventf(ctx, 3, "error getting database descriptor from cache: %s", err)
+		desc, err = MustGetDatabaseDescByID(ctx, txn, id)
+	}
+	return desc, err
+}
+
+//getDatabaseID returns the ID of a database given its name. It
 // uses the descriptor cache if possible, otherwise falls back to KV
 // operations.
 func (dc *databaseCache) getDatabaseID(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, name string,
+	ctx context.Context,
+	txnRunner func(context.Context, func(context.Context, *client.Txn) error) error,
+	vt VirtualTabler,
+	name string,
 ) (sqlbase.ID, error) {
 	if virtual := vt.getVirtualDatabaseDesc(name); virtual != nil {
 		return virtual.GetID(), nil
@@ -216,19 +295,9 @@ func (dc *databaseCache) getDatabaseID(
 		return id, nil
 	}
 
-	// Lookup the database in the cache first, falling back to the KV store if it
-	// isn't present. The cache might cause the usage of a recently renamed
-	// database, but that's a race that could occur anyways.
-	desc, err := dc.getCachedDatabaseDesc(name)
+	desc, err := dc.getDatabaseDesc(ctx, txnRunner, vt, name)
 	if err != nil {
-		if log.V(3) {
-			log.Infof(ctx, "error getting database descriptor: %s", err)
-		}
-		var err error
-		desc, err = MustGetDatabaseDesc(ctx, txn, vt, name)
-		if err != nil {
-			return 0, err
-		}
+		return 0, err
 	}
 
 	dc.setID(name, desc.ID)
@@ -282,6 +351,11 @@ func (p *planner) renameDatabase(
 	b.CPut(newKey, descID, nil)
 	b.Put(descKey, descDesc)
 	b.Del(oldKey)
+
+	p.session.tables.addUncommittedDatabase(
+		oldName, descID, true /* dropped */)
+	p.session.tables.addUncommittedDatabase(
+		newName, descID, false /* dropped */)
 
 	if err := p.txn.Run(ctx, b); err != nil {
 		if _, ok := err.(*roachpb.ConditionFailedError); ok {

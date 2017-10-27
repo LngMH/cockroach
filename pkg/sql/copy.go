@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson
 
 package sql
 
@@ -43,7 +41,7 @@ import (
 //
 // See: https://www.postgresql.org/docs/9.5/static/sql-copy.html
 type copyNode struct {
-	p             *planner
+	session       *Session
 	table         parser.TableExpr
 	columns       parser.UnresolvedNames
 	resultColumns sqlbase.ResultColumns
@@ -52,11 +50,11 @@ type copyNode struct {
 	rowsMemAcc    WrappableMemoryAccount
 }
 
-func (*copyNode) Values() parser.Datums              { return nil }
-func (*copyNode) Next(context.Context) (bool, error) { return false, nil }
+func (*copyNode) Values() parser.Datums        { return nil }
+func (*copyNode) Next(runParams) (bool, error) { return false, nil }
 
 func (n *copyNode) Close(ctx context.Context) {
-	n.rowsMemAcc.Wsession(n.p.session).Close(ctx)
+	n.rowsMemAcc.Wsession(n.session).Close(ctx)
 }
 
 // CopyFrom begins a COPY.
@@ -83,19 +81,19 @@ func (p *planner) CopyFrom(ctx context.Context, n *parser.CopyFrom) (planNode, e
 	for i, c := range cols {
 		cn.resultColumns[i] = sqlbase.ResultColumn{Typ: c.Type.ToDatumType()}
 	}
-	cn.p = p
+	cn.session = p.session
 	cn.rowsMemAcc = p.session.OpenAccount()
 	return cn, nil
 }
 
 // Start implements the planNode interface.
-func (n *copyNode) Start(context.Context) error {
+func (n *copyNode) Start(runParams) error {
 	// Should never happen because the executor prevents non-COPY messages during
 	// a COPY.
-	if n.p.session.copyFrom != nil {
+	if n.session.copyFrom != nil {
 		return fmt.Errorf("COPY already in progress")
 	}
-	n.p.session.copyFrom = n
+	n.session.copyFrom = n
 	return nil
 }
 
@@ -176,7 +174,7 @@ func (n *copyNode) addRow(ctx context.Context, line []byte) error {
 		return fmt.Errorf("expected %d values, got %d", len(n.resultColumns), len(parts))
 	}
 	exprs := make(parser.Exprs, len(parts))
-	acc := n.rowsMemAcc.Wsession(n.p.session)
+	acc := n.rowsMemAcc.Wsession(n.session)
 	for i, part := range parts {
 		s := string(part)
 		if s == nullString {
@@ -187,6 +185,7 @@ func (n *copyNode) addRow(ctx context.Context, line []byte) error {
 		case parser.TypeBytes,
 			parser.TypeDate,
 			parser.TypeInterval,
+			parser.TypeINet,
 			parser.TypeString,
 			parser.TypeTimestamp,
 			parser.TypeTimestampTZ,
@@ -196,7 +195,8 @@ func (n *copyNode) addRow(ctx context.Context, line []byte) error {
 				return err
 			}
 		}
-		d, err := parser.ParseStringAs(n.resultColumns[i].Typ, s, n.p.session.Location)
+		evalCtx := n.session.evalCtx()
+		d, err := parser.ParseStringAs(n.resultColumns[i].Typ, s, &evalCtx)
 		if err != nil {
 			return err
 		}
@@ -321,7 +321,7 @@ func (p *planner) CopyData(ctx context.Context, n CopyDataBlock) (planNode, erro
 
 	// Only do work if we have lots of rows or this is the end.
 	if ln := len(cf.rows); ln == 0 || (ln < copyRowSize && !n.Done) {
-		return &emptyNode{}, nil
+		return &zeroNode{}, nil
 	}
 
 	vc := &parser.ValuesClause{Tuples: cf.rows}
@@ -348,4 +348,4 @@ func (CopyDataBlock) StatementType() parser.StatementType { return parser.RowsAf
 
 // StatementTag returns a short string identifying the type of statement.
 func (CopyDataBlock) StatementTag() string { return "" }
-func (CopyDataBlock) String() string       { return "" }
+func (CopyDataBlock) String() string       { return "CopyDataBlock" }

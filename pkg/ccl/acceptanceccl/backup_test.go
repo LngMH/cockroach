@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"strconv"
 	"testing"
 	"time"
 
@@ -29,7 +28,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/acceptance/terrafarm"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
+	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -38,8 +39,8 @@ import (
 )
 
 const (
-	longWaitTime        = 2 * time.Minute
-	bulkArchiveStoreURL = "gs://cockroach-test/bulkops/10nodes-2t-50000ranges"
+	longWaitTime            = 2 * time.Minute
+	bulkArchiveStoreFixture = "store-dumps/10nodes-2t-50000ranges"
 )
 
 type benchmarkTest struct {
@@ -49,32 +50,42 @@ type benchmarkTest struct {
 	// prefix is the prefix that will be prepended to all resources created by
 	// Terraform.
 	prefix string
-	// cockroachDiskSizeGB is the size, in gigabytes, of the disks allocated
-	// for CockroachDB nodes. Leaving this as 0 accepts the default in the
-	// Terraform configs. This must be in GB, because Terraform only accepts
-	// disk size for GCE in GB.
-	cockroachDiskSizeGB int
-	// storeURL is the Google Cloud Storage URL from which the test will
-	// download stores. Nothing is downloaded if storeURL is empty.
-	storeURL string
-	// skipClusterInit controls the --join flags for the nodes. If false (the
-	// default), then the first node will be empty and thus init the cluster,
-	// and each node will have the previous node as its join flag. If true,
-	// then all nodes will have all nodes in their join flags.
+	// storeFixture is the name of the Azure Storage fixture to download and use
+	// as the store. Nothing is downloaded if storeFixture is empty.
+	storeFixture    string
 	skipClusterInit bool
 
 	f *terrafarm.Farmer
 }
 
 func (bt *benchmarkTest) Start(ctx context.Context) {
+	licenseKey, ok := envutil.EnvString("COCKROACH_DEV_LICENSE", 0)
+	if !ok {
+		bt.b.Fatal("testing enterprise features requires setting COCKROACH_DEV_LICENSE")
+	}
 	bt.f = acceptance.MakeFarmer(bt.b, bt.prefix, acceptance.GetStopper())
-
-	bt.f.AddFlag("--max-offset=1s")
-
-	bt.f.AddVars["join_all"] = fmt.Sprint(bt.skipClusterInit)
-
-	if bt.cockroachDiskSizeGB != 0 {
-		bt.f.AddVars["cockroach_disk_size"] = strconv.Itoa(bt.cockroachDiskSizeGB)
+	bt.f.SkipClusterInit = bt.skipClusterInit
+	bt.f.TerraformArgs = []string{
+		// Ls-series VMs are "storage optimized," which means they have large local
+		// SSDs (678GB on the L4s) and no disk throttling beyond the physical limit
+		// of the disk. All other VM series on Azure are subject to VM-level I/O
+		// throttling, where sync latencies jump to upwards of a 1s when the rate
+		// limit is exceeded. Since we expect syncs to take a few milliseconds at
+		// most, this causes cascading liveness failures which tank a restore.
+		//
+		// To determine the temporary SSD I/O rate limit for a particular VM size,
+		// look for the "max cached [and temp storage] throughput" column on the
+		// Azure VM size chart [0].
+		//
+		// TODO(benesch): build a rate-limiter that rate limits all write traffic
+		// (not just bulk I/O write traffic like kv.bulk_io_write.max_rate), and
+		// additionally run these tests on D-series VMs with a suitable rate limit.
+		//
+		// [0]: https://docs.microsoft.com/en-us/azure/virtual-machines/linux/sizes
+		"-var", "azure_vm_size=Standard_L4s",
+		"-var", "azure_location=westus",
+		// Keep this in sync with build/teamcity-reset-nightlies.sh.
+		"-var", "azure_vhd_storage_account=cockroachnightlywestvhd",
 	}
 
 	log.Infof(ctx, "creating cluster with %d node(s)", bt.nodes)
@@ -82,8 +93,10 @@ func (bt *benchmarkTest) Start(ctx context.Context) {
 		bt.b.Fatal(err)
 	}
 
-	if bt.storeURL != "" {
-		// We must stop the cluster because `nodectl` pokes at the data directory.
+	// TODO(benesch): avoid duplicating all this logic with allocator_test.
+	if bt.storeFixture != "" {
+		// We must stop the cluster because we're about to overwrite the data
+		// directory.
 		log.Info(ctx, "stopping cluster")
 		for i := 0; i < bt.f.NumNodes(); i++ {
 			if err := bt.f.Kill(ctx, i); err != nil {
@@ -91,13 +104,15 @@ func (bt *benchmarkTest) Start(ctx context.Context) {
 			}
 		}
 
-		log.Info(ctx, "downloading archived stores from Google Cloud Storage in parallel")
+		log.Infof(ctx, "downloading archived stores %s in parallel", bt.storeFixture)
 		errors := make(chan error, bt.f.NumNodes())
 		for i := 0; i < bt.f.NumNodes(); i++ {
 			go func(nodeNum int) {
-				cmd := fmt.Sprintf(`gsutil -m cp -r "%s/node%d/*" "%s"`, bt.storeURL, nodeNum, "/mnt/data0")
-				log.Infof(ctx, "exec on node %d: %s", nodeNum, cmd)
-				errors <- bt.f.Exec(nodeNum, cmd)
+				errors <- bt.f.Exec(nodeNum,
+					fmt.Sprintf("find %[1]s -type f -delete && curl -sfSL %s/store%d.tgz | tar -C %[1]s -zx",
+						"/mnt/data0", acceptance.FixtureURL(bt.storeFixture), nodeNum+1,
+					),
+				)
 			}(i)
 		}
 		for i := 0; i < bt.f.NumNodes(); i++ {
@@ -113,15 +128,32 @@ func (bt *benchmarkTest) Start(ctx context.Context) {
 			}
 		}
 	}
-	acceptance.CheckGossip(ctx, bt.b, bt.f, longWaitTime, acceptance.HasPeers(bt.nodes))
+	if err := acceptance.CheckGossip(ctx, bt.f, longWaitTime, acceptance.HasPeers(bt.nodes)); err != nil {
+		bt.b.Fatal(err)
+	}
 	bt.f.Assert(ctx, bt.b)
 
-	sqlDB, err := gosql.Open("postgres", bt.f.PGUrl(ctx, 0))
+	sqlDBRaw, err := gosql.Open("postgres", bt.f.PGUrl(ctx, 0))
 	if err != nil {
 		bt.b.Fatal(err)
 	}
-	defer sqlDB.Close()
-	sqlutils.MakeSQLRunner(bt.b, sqlDB).Exec("SET CLUSTER SETTING enterprise.enabled = true")
+	defer sqlDBRaw.Close()
+	sqlDB := sqlutils.MakeSQLRunner(bt.b, sqlDBRaw)
+	sqlDB.Exec(`SET CLUSTER SETTING cluster.organization = "Cockroach Labs - Production Testing"`)
+	sqlDB.Exec(fmt.Sprintf(`SET CLUSTER SETTING enterprise.license = "%s"`, licenseKey))
+	sqlDB.Exec(`SET CLUSTER SETTING trace.debug.enable = 'true'`)
+	sqlDB.Exec(`SET CLUSTER SETTING server.remote_debugging.mode = 'any'`)
+	// On Azure, if we don't limit our disk throughput, we'll quickly cause node
+	// liveness failures. This limit was determined experimentally on
+	// Standard_D3_v2 instances.
+	sqlDB.Exec(`SET CLUSTER SETTING kv.bulk_io_write.max_rate = '30MB'`)
+	// Stats-based replica and lease rebalancing interacts badly with restore's
+	// splits and scatters.
+	//
+	// TODO(benesch): Remove these settings when #17671 is fixed, or document the
+	// necessity of these settings as 1.1 known limitation.
+	sqlDB.Exec(`SET CLUSTER SETTING kv.allocator.stat_based_rebalancing.enabled = false`)
+	sqlDB.Exec(`SET CLUSTER SETTING kv.allocator.load_based_lease_rebalancing.enabled = false`)
 
 	log.Info(ctx, "initial cluster is up")
 }
@@ -150,38 +182,45 @@ const (
 	bankInsert = `INSERT INTO data.bank VALUES (%d, %d, '%s')`
 )
 
-func getAzureURI(t testing.TB) url.URL {
-	container := os.Getenv("AZURE_CONTAINER")
-	accountName := os.Getenv("AZURE_ACCOUNT_NAME")
-	accountKey := os.Getenv("AZURE_ACCOUNT_KEY")
-	if container == "" || accountName == "" || accountKey == "" {
-		t.Fatal("env variables AZURE_CONTAINER, AZURE_ACCOUNT_NAME, AZURE_ACCOUNT_KEY must be set")
+func getAzureURI(t testing.TB, accountName, accountKeyVar, container, object string) string {
+	accountKey := os.Getenv(accountKeyVar)
+	if accountKey == "" {
+		t.Fatalf("env var %s must be set", accountKeyVar)
 	}
-
-	return url.URL{
+	return (&url.URL{
 		Scheme: "azure",
 		Host:   container,
+		Path:   object,
 		RawQuery: url.Values{
 			storageccl.AzureAccountNameParam: []string{accountName},
 			storageccl.AzureAccountKeyParam:  []string{accountKey},
 		}.Encode(),
-	}
+	}).String()
+}
+
+func getAzureBackupFixtureURI(t testing.TB, name string) string {
+	return getAzureURI(
+		t, acceptance.FixtureStorageAccount(), "AZURE_FIXTURE_ACCOUNT_KEY", "backups", name,
+	)
+}
+
+func getAzureEphemeralURI(b *testing.B) string {
+	name := fmt.Sprintf("%s/%s-%d", b.Name(), timeutil.Now().Format(time.RFC3339Nano), b.N)
+	return getAzureURI(
+		b, acceptance.EphemeralStorageAccount(), "AZURE_EPHEMERAL_ACCOUNT_KEY", "backups", name,
+	)
 }
 
 // BenchmarkRestoreBig creates a backup via Load with b.N rows then benchmarks
-// the time to restore it. Run with:
-// make bench TESTTIMEOUT=1h PKG=./pkg/ccl/acceptanceccl BENCHES=BenchmarkRestoreBig TESTFLAGS='-v -benchtime 1m -remote -key-name azure -cwd ../../acceptance/terraform/azure'
+// the time to restore it.
 func BenchmarkRestoreBig(b *testing.B) {
 	ctx := context.Background()
 	rng, _ := randutil.NewPseudoRand()
 
-	restoreBaseURI := getAzureURI(b)
-
 	bt := benchmarkTest{
-		b:                   b,
-		nodes:               3,
-		cockroachDiskSizeGB: 250,
-		prefix:              "restore",
+		b:      b,
+		nodes:  3,
+		prefix: "restore",
 	}
 
 	defer bt.Close(ctx)
@@ -199,8 +238,6 @@ func BenchmarkRestoreBig(b *testing.B) {
 
 	// (mis-)Use a sub benchmark to avoid running the setup code more than once.
 	b.Run("", func(b *testing.B) {
-		restoreBaseURI.Path = fmt.Sprintf("BenchmarkRestoreBig/%s-%d", timeutil.Now().Format(time.RFC3339Nano), b.N)
-
 		var buf bytes.Buffer
 		buf.WriteString(bankCreateTable)
 		buf.WriteString(";\n")
@@ -211,13 +248,13 @@ func BenchmarkRestoreBig(b *testing.B) {
 		}
 
 		ts := hlc.Timestamp{WallTime: hlc.UnixNano()}
-		restoreURI := restoreBaseURI.String()
+		restoreURI := getAzureEphemeralURI(b)
 		desc, err := sqlccl.Load(ctx, sqlDB, &buf, "data", restoreURI, ts, 0, os.TempDir())
 		if err != nil {
 			b.Fatal(err)
 		}
 
-		dbName := fmt.Sprintf("bank%d", b.N)
+		dbName := fmt.Sprintf("bank %d", b.N)
 		r.Exec(fmt.Sprintf("CREATE DATABASE %s", dbName))
 
 		b.ResetTimer()
@@ -229,25 +266,62 @@ func BenchmarkRestoreBig(b *testing.B) {
 	})
 }
 
+func BenchmarkRestoreTPCH10(b *testing.B) {
+	for _, numNodes := range []int{1, 3, 10} {
+		b.Run(fmt.Sprintf("numNodes=%d", numNodes), func(b *testing.B) {
+			if b.N != 1 {
+				b.Fatal("b.N must be 1")
+			}
+
+			bt := benchmarkTest{
+				b:      b,
+				nodes:  numNodes,
+				prefix: "restore-tpch10",
+			}
+
+			ctx := context.Background()
+			bt.Start(ctx)
+			defer bt.Close(ctx)
+
+			db, err := gosql.Open("postgres", bt.f.PGUrl(ctx, 0))
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer db.Close()
+
+			if _, err := db.Exec("CREATE DATABASE tpch"); err != nil {
+				b.Fatal(err)
+			}
+
+			fn := func(ctx context.Context) error {
+				_, err := db.Exec(`RESTORE tpch.* FROM $1`, getAzureBackupFixtureURI(b, "tpch10"))
+				return err
+			}
+			b.ResetTimer()
+			jobID, status, err := jobs.RunAndWaitForTerminalState(ctx, db, fn)
+			b.StopTimer()
+			if err != nil {
+				b.Fatalf("%+v", err)
+			}
+			if status != jobs.StatusSucceeded {
+				b.Fatalf("job %d: expected %s got %s", jobID, jobs.StatusSucceeded, status)
+			}
+		})
+	}
+}
+
 func BenchmarkRestore2TB(b *testing.B) {
 	if b.N != 1 {
 		b.Fatal("b.N must be 1")
 	}
 
-	const backupBaseURI = "gs://cockroach-test/2t-backup"
-
 	bt := benchmarkTest{
 		b: b,
-		// TODO(dan): This is intended to be a 10 node test, but gce local ssds
-		// are only available as 375GB, which doesn't fit a 2TB restore (at
-		// least until #15210 is fixed). We could have more than one ssd per
-		// machine and raid them together but in the lead up to 1.0, I'm trying
-		// to change as little as possible while getting this working. Azure has
-		// large storage machines available, but has other issues we're working
-		// through (#15381).
-		nodes:               15,
-		cockroachDiskSizeGB: 250,
-		prefix:              "restore2tb",
+		// TODO(dan): Switch this back to 10 machines when this test goes back
+		// to Azure. Each GCE machine disk is 375GB, so with our current need
+		// for 2x the restore size in disk space, 2tb unless we up this a bit.
+		nodes:  15,
+		prefix: "restore2tb",
 	}
 
 	ctx := context.Background()
@@ -256,16 +330,33 @@ func BenchmarkRestore2TB(b *testing.B) {
 
 	db, err := gosql.Open("postgres", bt.f.PGUrl(ctx, 0))
 	if err != nil {
-		b.Fatal(err)
+		b.Fatalf("%+v", err)
 	}
 	defer db.Close()
 
-	if _, err := db.Exec("CREATE DATABASE datablocks"); err != nil {
-		b.Fatal(err)
+	// We're currently pinning this test to be run on GCE via
+	// teamcity-nightly-acceptance.sh. Effectively remove the setting for GCE,
+	// which doesn't seem to need it.
+	if _, err := db.Exec(`SET CLUSTER SETTING kv.bulk_io_write.max_rate = '1GB'`); err != nil {
+		b.Fatalf("%+v", err)
 	}
 
-	if _, err := db.Exec(`RESTORE datablocks.* FROM $1`, backupBaseURI); err != nil {
-		b.Fatal(err)
+	if _, err := db.Exec("CREATE DATABASE datablocks"); err != nil {
+		b.Fatalf("%+v", err)
+	}
+
+	fn := func(ctx context.Context) error {
+		_, err := db.Exec(`RESTORE datablocks.* FROM $1`, `gs://cockroach-test/2t-backup`)
+		return err
+	}
+	b.ResetTimer()
+	jobID, status, err := jobs.RunAndWaitForTerminalState(ctx, db, fn)
+	b.StopTimer()
+	if err != nil {
+		b.Fatalf("%+v", err)
+	}
+	if status != jobs.StatusSucceeded {
+		b.Fatalf("job %d: expected %s got %s", jobID, jobs.StatusSucceeded, status)
 	}
 }
 
@@ -274,20 +365,12 @@ func BenchmarkBackup2TB(b *testing.B) {
 		b.Fatal("b.N must be 1")
 	}
 
-	backupBaseURI := getAzureURI(b)
-
-	backupBaseURI = url.URL{
-		Scheme: "gs",
-		Host:   "cockroach-test",
-	}
-
 	bt := benchmarkTest{
-		b:                   b,
-		nodes:               10,
-		storeURL:            bulkArchiveStoreURL,
-		cockroachDiskSizeGB: 250,
-		prefix:              "backup2tb",
-		skipClusterInit:     true,
+		b:               b,
+		nodes:           10,
+		storeFixture:    acceptance.FixtureURL(bulkArchiveStoreFixture),
+		prefix:          "backup2tb",
+		skipClusterInit: true,
 	}
 
 	ctx := context.Background()
@@ -300,10 +383,8 @@ func BenchmarkBackup2TB(b *testing.B) {
 	}
 	defer db.Close()
 
-	backupBaseURI.Path = fmt.Sprintf("BenchmarkBackup2TB/%s-%d", timeutil.Now().Format(time.RFC3339Nano), b.N)
-
 	log.Infof(ctx, "starting backup")
-	row := db.QueryRow(`BACKUP DATABASE datablocks TO $1`, backupBaseURI.String())
+	row := db.QueryRow(`BACKUP DATABASE datablocks TO $1`, getAzureEphemeralURI(b))
 	var unused string
 	var dataSize int64
 	if err := row.Scan(&unused, &unused, &unused, &unused, &unused, &unused, &dataSize); err != nil {

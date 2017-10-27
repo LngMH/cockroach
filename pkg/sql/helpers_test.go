@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei(andreimatei1@gmail.com)
 
 package sql
 
@@ -22,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"golang.org/x/net/context"
 )
 
 // LeaseRemovalTracker can be used to wait for leases to be removed from the
@@ -57,7 +56,7 @@ func NewLeaseRemovalTracker() *LeaseRemovalTracker {
 // TrackRemoval starts monitoring lease removals for a particular lease.
 // This should be called before triggering the operation that (asynchronously)
 // removes the lease.
-func (w *LeaseRemovalTracker) TrackRemoval(table sqlbase.TableDescriptor) RemovalTracker {
+func (w *LeaseRemovalTracker) TrackRemoval(table *sqlbase.TableDescriptor) RemovalTracker {
 	id := tableVersionID{
 		id:      table.ID,
 		version: table.Version,
@@ -105,4 +104,24 @@ func (m *LeaseManager) ExpireLeases(clock *hlc.Clock) {
 		table.expiration = hlc.Timestamp{WallTime: past.UnixNano()}
 	}
 	m.tableNames.mu.Unlock()
+}
+
+// AcquireAndAssertMinVersion acquires a read lease for the specified table ID.
+// The lease is grabbed on the latest version if >= specified version.
+// It returns a table descriptor and an expiration time valid for the timestamp.
+func (m *LeaseManager) AcquireAndAssertMinVersion(
+	ctx context.Context,
+	timestamp hlc.Timestamp,
+	tableID sqlbase.ID,
+	minVersion sqlbase.DescriptorVersion,
+) (*sqlbase.TableDescriptor, hlc.Timestamp, error) {
+	t := m.findTableState(tableID, true)
+	if err := t.ensureVersion(ctx, minVersion, m); err != nil {
+		return nil, hlc.Timestamp{}, err
+	}
+	table, err := t.acquire(ctx, timestamp, m)
+	if err != nil {
+		return nil, hlc.Timestamp{}, err
+	}
+	return &table.TableDescriptor, table.expiration, nil
 }

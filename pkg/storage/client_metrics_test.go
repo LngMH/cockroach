@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package storage_test
 
@@ -150,8 +148,6 @@ func verifyRocksDBStats(t *testing.T, s *storage.Store) {
 		{m.RdbBlockCachePinnedUsage, 0},
 		{m.RdbBloomFilterPrefixChecked, 20},
 		{m.RdbBloomFilterPrefixUseful, 20},
-		{m.RdbMemtableHits, 0},
-		{m.RdbMemtableMisses, 0},
 		{m.RdbMemtableTotalSize, 5000},
 		{m.RdbFlushes, 1},
 		{m.RdbCompactions, 0},
@@ -188,7 +184,7 @@ func TestStoreMetrics(t *testing.T) {
 	}
 
 	// Perform a split, which has special metrics handling.
-	splitArgs := adminSplitArgs(roachpb.KeyMin, roachpb.Key("m"))
+	splitArgs := adminSplitArgs(roachpb.Key("m"))
 	if _, err := client.SendWrapped(context.Background(), rg1(mtc.stores[0]), splitArgs); err != nil {
 		t.Fatal(err)
 	}

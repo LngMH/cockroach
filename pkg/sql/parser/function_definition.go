@@ -11,15 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
 import (
 	"bytes"
-	"fmt"
 	"strings"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 )
 
 // FunctionDefinition implements a reference to the (possibly several)
@@ -62,10 +61,6 @@ func (fd *FunctionDefinition) Format(buf *bytes.Buffer, f FmtFlags) {
 
 func (fd *FunctionDefinition) String() string { return AsString(fd) }
 
-// SearchPath represents a list of namespaces to search builtins in.
-// The names must be normalized (as per Name.Normalize) already.
-type SearchPath []string
-
 // ResolveFunction transforms an UnresolvedName to a FunctionDefinition.
 func (n UnresolvedName) ResolveFunction(searchPath SearchPath) (*FunctionDefinition, error) {
 	fn, err := n.normalizeFunctionName()
@@ -75,7 +70,7 @@ func (n UnresolvedName) ResolveFunction(searchPath SearchPath) (*FunctionDefinit
 
 	if len(fn.selector) > 0 {
 		// We do not support selectors at this point.
-		return nil, fmt.Errorf("invalid function name: %s", n)
+		return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError, "invalid function name: %s", n)
 	}
 
 	if d, ok := funDefs[fn.function()]; ok && fn.prefix() == "" {
@@ -109,7 +104,8 @@ func (n UnresolvedName) ResolveFunction(searchPath SearchPath) (*FunctionDefinit
 		if prefix == "" {
 			// The function wasn't qualified, so we must search for it via
 			// the search path first.
-			for _, alt := range searchPath {
+			iter := searchPath.Iter()
+			for alt, ok := iter(); ok; alt, ok = iter() {
 				fullName = alt + "." + smallName
 				if def, ok = funDefs[fullName]; ok {
 					found = true
@@ -118,7 +114,8 @@ func (n UnresolvedName) ResolveFunction(searchPath SearchPath) (*FunctionDefinit
 			}
 		}
 		if !found {
-			return nil, fmt.Errorf("unknown function: %s()", n)
+			return nil, pgerror.NewErrorf(
+				pgerror.CodeUndefinedFunctionError, "unknown function: %s()", n)
 		}
 	}
 

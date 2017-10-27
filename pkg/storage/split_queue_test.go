@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -91,7 +89,7 @@ func TestSplitQueueShouldQueue(t *testing.T) {
 		}
 
 		repl.mu.Lock()
-		repl.mu.state.Stats = enginepb.MVCCStats{KeyBytes: test.bytes}
+		repl.mu.state.Stats = &enginepb.MVCCStats{KeyBytes: test.bytes}
 		repl.mu.maxBytes = test.maxBytes
 		repl.mu.Unlock()
 

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -26,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/kr/pretty"
 )
 
 // initialStats are the stats for a Replica which has been created through
@@ -33,7 +32,7 @@ import (
 // writeInitialState().
 func initialStats() enginepb.MVCCStats {
 	return enginepb.MVCCStats{
-		SysBytes: 208,
+		SysBytes: 188,
 		SysCount: 6,
 	}
 }
@@ -48,7 +47,7 @@ func TestRangeStatsEmpty(t *testing.T) {
 
 	ms := tc.repl.GetMVCCStats()
 	if exp := initialStats(); !reflect.DeepEqual(ms, exp) {
-		t.Errorf("expected stats %+v; got %+v", exp, ms)
+		t.Errorf("unexpected stats diff(exp, actual):\n%s", pretty.Diff(exp, ms))
 	}
 }
 

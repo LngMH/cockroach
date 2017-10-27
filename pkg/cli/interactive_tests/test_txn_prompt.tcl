@@ -11,6 +11,34 @@ eexpect ":/# "
 send "$argv sql\r"
 eexpect root@
 
+start_test "Check option to echo statements"
+send "\\set echo\r"
+send "select 1;\r"
+eexpect "\n> select 1;\r\n"
+eexpect root@
+end_test
+
+start_test "Check prompt update statements are disabled when smart_prompt is not set"
+send "\r"
+eexpect "> SHOW TRANSACTION STATUS"
+eexpect root@
+send "\\unset smart_prompt\r"
+send "set application_name=test;\r"
+eexpect "> set application_name=test;"
+eexpect "SET"
+expect {
+    "SHOW" {
+	report "unexpected SHOW"
+	exit 1
+    }
+    root@ {}
+}
+
+# reset settings for later tests
+send "\\unset echo\r"
+send "\\set smart_prompt\r"
+end_test
+
 start_test "Check database prompt."
 send "CREATE DATABASE IF NOT EXISTS testdb;\r"
 eexpect "\nCREATE DATABASE\r\n"
@@ -46,7 +74,7 @@ eexpect "\nROLLBACK\r\n"
 eexpect root@
 
 send "BEGIN; SAVEPOINT cockroach_restart;\r\r"
-eexpect OK
+eexpect SAVEPOINT
 eexpect root@
 send "SELECT 1;\r"
 eexpect "1 row"
@@ -62,7 +90,7 @@ send "COMMIT;\r"
 eexpect root@
 
 send "BEGIN; SAVEPOINT cockroach_restart;\r\r"
-eexpect OK
+eexpect SAVEPOINT
 eexpect root@
 send "SELECT CRDB_INTERNAL.FORCE_RETRY('1s':::INTERVAL);\r"
 eexpect "pq: restart transaction"
@@ -72,7 +100,7 @@ end_test
 
 start_test "Test that prompt reverts to OPEN at beginning of new attempt."
 send "ROLLBACK TO SAVEPOINT cockroach_restart;\r"
-eexpect OK
+eexpect ROLLBACK
 eexpect root@
 eexpect "OPEN>"
 end_test

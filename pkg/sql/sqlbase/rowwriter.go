@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
-// Author: Daniel Harrison (daniel.harrison@gmail.com)
 
 package sqlbase
 
@@ -151,6 +148,7 @@ type RowInserter struct {
 	marshalled []roachpb.Value
 	key        roachpb.Key
 	valueBuf   []byte
+	scratch    []byte
 	value      roachpb.Value
 }
 
@@ -163,6 +161,7 @@ func MakeRowInserter(
 	fkTables TableLookupsByID,
 	insertCols []ColumnDescriptor,
 	checkFKs bool,
+	alloc *DatumAlloc,
 ) (RowInserter, error) {
 	indexes := tableDesc.Indexes
 	// Also include the secondary indexes in mutation state
@@ -190,7 +189,8 @@ func MakeRowInserter(
 
 	if checkFKs {
 		var err error
-		if ri.Fks, err = makeFKInsertHelper(txn, *tableDesc, fkTables, ri.InsertColIDtoRowIndex); err != nil {
+		if ri.Fks, err = makeFKInsertHelper(txn, *tableDesc, fkTables,
+			ri.InsertColIDtoRowIndex, alloc); err != nil {
 			return ri, err
 		}
 	}
@@ -321,7 +321,7 @@ func (ri *RowInserter) InsertRow(
 			}
 			colIDDiff := col.ID - lastColID
 			lastColID = col.ID
-			ri.valueBuf, err = EncodeTableValue(ri.valueBuf, colIDDiff, values[idx])
+			ri.valueBuf, err = EncodeTableValue(ri.valueBuf, colIDDiff, values[idx], ri.scratch)
 			if err != nil {
 				return err
 			}
@@ -341,6 +341,15 @@ func (ri *RowInserter) InsertRow(
 	}
 
 	return nil
+}
+
+// EncodeIndexesForRow encodes the provided values into their primary and
+// secondary index keys. The secondaryIndexEntries are only valid until the next
+// call to EncodeIndexesForRow.
+func (ri *RowInserter) EncodeIndexesForRow(
+	values []parser.Datum,
+) (primaryIndexKey []byte, secondaryIndexEntries []IndexEntry, err error) {
+	return ri.Helper.encodeIndexes(ri.InsertColIDtoRowIndex, values)
 }
 
 // RowUpdater abstracts the key/value operations for updating table rows.
@@ -367,6 +376,7 @@ type RowUpdater struct {
 	key             roachpb.Key
 	indexEntriesBuf []IndexEntry
 	valueBuf        []byte
+	scratch         []byte
 	value           roachpb.Value
 }
 
@@ -396,6 +406,7 @@ func MakeRowUpdater(
 	updateCols []ColumnDescriptor,
 	requestedCols []ColumnDescriptor,
 	updateType rowUpdaterType,
+	alloc *DatumAlloc,
 ) (RowUpdater, error) {
 	updateColIDtoRowIndex := ColIDtoRowIndexFromCols(updateCols)
 
@@ -481,12 +492,14 @@ func MakeRowUpdater(
 		// When changing the primary key, we delete the old values and reinsert
 		// them, so request them all.
 		var err error
-		if ru.rd, err = MakeRowDeleter(txn, tableDesc, fkTables, tableCols, SkipFKs); err != nil {
+		if ru.rd, err = MakeRowDeleter(txn, tableDesc, fkTables,
+			tableCols, SkipFKs, alloc); err != nil {
 			return RowUpdater{}, err
 		}
 		ru.FetchCols = ru.rd.FetchCols
 		ru.FetchColIDtoRowIndex = ColIDtoRowIndexFromCols(ru.FetchCols)
-		if ru.ri, err = MakeRowInserter(txn, tableDesc, fkTables, tableCols, SkipFKs); err != nil {
+		if ru.ri, err = MakeRowInserter(txn, tableDesc, fkTables,
+			tableCols, SkipFKs, alloc); err != nil {
 			return RowUpdater{}, err
 		}
 	} else {
@@ -533,7 +546,8 @@ func MakeRowUpdater(
 	}
 
 	var err error
-	if ru.Fks, err = makeFKUpdateHelper(txn, *tableDesc, fkTables, ru.FetchColIDtoRowIndex); err != nil {
+	if ru.Fks, err = makeFKUpdateHelper(txn, *tableDesc, fkTables,
+		ru.FetchColIDtoRowIndex, alloc); err != nil {
 		return RowUpdater{}, err
 	}
 	return ru, nil
@@ -605,7 +619,9 @@ func (ru *RowUpdater) UpdateRow(
 	}
 
 	if rowPrimaryKeyChanged {
-		if err := ru.Fks.checkIdx(ctx, ru.Helper.TableDesc.PrimaryIndex.ID, oldValues, ru.newValues); err != nil {
+		if err := ru.Fks.checkIdx(
+			ctx, ru.Helper.TableDesc.PrimaryIndex.ID, oldValues, ru.newValues,
+		); err != nil {
 			return nil, err
 		}
 		for i := range newSecondaryIndexEntries {
@@ -615,11 +631,16 @@ func (ru *RowUpdater) UpdateRow(
 				}
 			}
 		}
+		if err := ru.Fks.checker.runCheck(ctx, oldValues, ru.newValues); err != nil {
+			return nil, err
+		}
 
 		if err := ru.rd.DeleteRow(ctx, b, oldValues, traceKV); err != nil {
 			return nil, err
 		}
-		if err := ru.ri.InsertRow(ctx, b, ru.newValues, false, traceKV); err != nil {
+		if err := ru.ri.InsertRow(
+			ctx, b, ru.newValues, false /* ignoreConflicts */, traceKV,
+		); err != nil {
 			return nil, err
 		}
 		return ru.newValues, nil
@@ -697,7 +718,7 @@ func (ru *RowUpdater) UpdateRow(
 			}
 			colIDDiff := col.ID - lastColID
 			lastColID = col.ID
-			ru.valueBuf, err = EncodeTableValue(ru.valueBuf, colIDDiff, ru.newValues[idx])
+			ru.valueBuf, err = EncodeTableValue(ru.valueBuf, colIDDiff, ru.newValues[idx], ru.scratch)
 			if err != nil {
 				return nil, err
 			}
@@ -748,6 +769,9 @@ func (ru *RowUpdater) UpdateRow(
 			b.CPut(newSecondaryIndexEntry.Key, &newSecondaryIndexEntry.Value, expValue)
 		}
 	}
+	if err := ru.Fks.checker.runCheck(ctx, oldValues, ru.newValues); err != nil {
+		return nil, err
+	}
 
 	return ru.newValues, nil
 }
@@ -786,6 +810,7 @@ func MakeRowDeleter(
 	fkTables TableLookupsByID,
 	requestedCols []ColumnDescriptor,
 	checkFKs bool,
+	alloc *DatumAlloc,
 ) (RowDeleter, error) {
 	indexes := tableDesc.Indexes
 	for _, m := range tableDesc.Mutations {
@@ -834,7 +859,8 @@ func MakeRowDeleter(
 	}
 	if checkFKs {
 		var err error
-		if rd.Fks, err = makeFKDeleteHelper(txn, *tableDesc, fkTables, fetchColIDtoRowIndex); err != nil {
+		if rd.Fks, err = makeFKDeleteHelper(txn, *tableDesc, fkTables,
+			fetchColIDtoRowIndex, alloc); err != nil {
 			return RowDeleter{}, err
 		}
 	}
@@ -869,7 +895,7 @@ func (rd *RowDeleter) DeleteRow(
 	if traceKV {
 		log.VEventf(ctx, 2, "DelRange %s - %s", rd.startKey, rd.endKey)
 	}
-	b.DelRange(&rd.startKey, &rd.endKey, false)
+	b.DelRange(&rd.startKey, &rd.endKey, false /* returnKeys */)
 	rd.startKey, rd.endKey = nil, nil
 
 	return nil

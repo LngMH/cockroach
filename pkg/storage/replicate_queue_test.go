@@ -11,12 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis
 
 package storage_test
 
 import (
+	gosql "database/sql"
+	"encoding/json"
 	"math"
 	"strings"
 	"testing"
@@ -57,10 +57,16 @@ func TestReplicateQueueRebalance(t *testing.T) {
 	)
 	defer tc.Stopper().Stop(context.TODO())
 
+	for _, server := range tc.Servers {
+		st := server.ClusterSettings()
+		st.Manual.Store(true)
+		storage.EnableStatsBasedRebalancing.Override(&st.SV, false)
+	}
+
 	const newRanges = 5
 	for i := 0; i < newRanges; i++ {
 		tableID := keys.MaxReservedDescID + i + 1
-		splitKey := keys.MakeRowSentinelKey(keys.MakeTablePrefix(uint32(tableID)))
+		splitKey := keys.MakeTablePrefix(uint32(tableID))
 		if _, _, err := tc.SplitRange(splitKey); err != nil {
 			t.Fatal(err)
 		}
@@ -125,9 +131,7 @@ func TestReplicateQueueUpReplicate(t *testing.T) {
 		t.Fatalf("replica count, want 1, current %d", len(desc.Replicas))
 	}
 
-	if err := tc.AddServer(t, base.TestServerArgs{}); err != nil {
-		t.Fatal(err)
-	}
+	tc.AddServer(t, base.TestServerArgs{})
 
 	testutils.SucceedsSoon(t, func() error {
 		// After the initial splits have been performed, all of the resulting ranges
@@ -150,9 +154,7 @@ func TestReplicateQueueUpReplicate(t *testing.T) {
 		return nil
 	})
 
-	if err := tc.AddServer(t, base.TestServerArgs{}); err != nil {
-		t.Fatal(err)
-	}
+	tc.AddServer(t, base.TestServerArgs{})
 
 	// Now wait until the replicas have been up-replicated to the
 	// desired number.
@@ -166,6 +168,12 @@ func TestReplicateQueueUpReplicate(t *testing.T) {
 		}
 		return nil
 	})
+
+	if err := verifyRangeLog(
+		tc.Conns[0], storage.RangeLogEventType_add, storage.ReasonRangeUnderReplicated,
+	); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestReplicateQueueDownReplicate verifies that the replication queue will
@@ -233,4 +241,46 @@ func TestReplicateQueueDownReplicate(t *testing.T) {
 		}
 		return nil
 	})
+
+	if err := verifyRangeLog(
+		tc.Conns[0], storage.RangeLogEventType_remove, storage.ReasonRangeOverReplicated,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func verifyRangeLog(
+	conn *gosql.DB, eventType storage.RangeLogEventType, reason storage.RangeLogEventReason,
+) error {
+	rows, err := conn.Query(
+		"SELECT info FROM system.rangelog WHERE \"eventType\" = $1;", eventType.String())
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var numEntries int
+	for rows.Next() {
+		numEntries++
+		var infoStr string
+		if err := rows.Scan(&infoStr); err != nil {
+			return err
+		}
+		var info storage.RangeLogEvent_Info
+		if err := json.Unmarshal([]byte(infoStr), &info); err != nil {
+			return errors.Errorf("error unmarshalling info string %q: %s", infoStr, err)
+		}
+		if a, e := info.Reason, reason; a != e {
+			return errors.Errorf("expected range log event reason %s, got %s from info %v", e, a, info)
+		}
+		if info.Details == "" {
+			return errors.Errorf("got empty range log event details: %v", info)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if numEntries == 0 {
+		return errors.New("no range log entries found for up-replication events")
+	}
+	return nil
 }

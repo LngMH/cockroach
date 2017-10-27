@@ -11,13 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
 import (
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 )
 
 type normalizableExpr interface {
@@ -128,7 +126,7 @@ func (expr *BinaryExpr) normalize(v *normalizeVisitor) TypedExpr {
 	right := expr.TypedRight()
 	expectedType := expr.ResolvedType()
 
-	if left == DNull || right == DNull {
+	if !expr.fn.nullableArgs && (left == DNull || right == DNull) {
 		return DNull
 	}
 
@@ -445,6 +443,34 @@ func (expr *ComparisonExpr) normalize(v *normalizeVisitor) TypedExpr {
 			expr = &exprCopy
 			expr.Right = &tupleCopy
 		}
+	case Is:
+		if expr.TypedRight() != DNull {
+			// IS exprs handle NULL and return a bool while EQ exprs propagate
+			// it (e.g. NULL IS b -> false, NULL = b -> NULL). To provide the
+			// same semantics, we catch NULL values with an AND expr. Now the
+			// three cases are:
+			//  a := b:    (a = b) AND (a IS NOT NULL) -> true  AND true  -> true
+			//  a := !b:   (a = b) AND (a IS NOT NULL) -> false AND true  -> false
+			//  a := NULL: (a = b) AND (a IS NOT NULL) -> NULL  AND false -> false
+			return NewTypedAndExpr(
+				NewTypedComparisonExpr(EQ, expr.TypedLeft(), expr.TypedRight()),
+				NewTypedComparisonExpr(IsNot, expr.TypedLeft(), DNull),
+			)
+		}
+	case IsNot:
+		// IS NOT exprs handle NULL and return a bool while NE exprs propagate
+		// it (e.g. NULL IS NOT b -> false, NULL != b -> NULL). To provide the
+		// same semantics, we catch NULL values with an OR expr. Now the three
+		// cases are:
+		//  a := b:    (a != b) OR (a IS NULL) -> false OR false -> false
+		//  a := !b:   (a != b) OR (a IS NULL) -> true  OR false -> true
+		//  a := NULL: (a != b) OR (a IS NULL) -> NULL  OR true  -> true
+		if expr.TypedRight() != DNull {
+			return NewTypedOrExpr(
+				NewTypedComparisonExpr(NE, expr.TypedLeft(), expr.TypedRight()),
+				NewTypedComparisonExpr(Is, expr.TypedLeft(), DNull),
+			)
+		}
 	case NE,
 		Like, NotLike,
 		ILike, NotILike,
@@ -511,15 +537,17 @@ func (expr *OrExpr) normalize(v *normalizeVisitor) TypedExpr {
 	return expr
 }
 
-func (expr *ParenExpr) normalize(v *normalizeVisitor) TypedExpr {
-	newExpr := expr.TypedInnerExpr()
-	if normalizable, ok := newExpr.(normalizableExpr); ok {
-		newExpr = normalizable.normalize(v)
-		if v.err != nil {
-			return expr
-		}
+func (expr *NotExpr) normalize(v *normalizeVisitor) TypedExpr {
+	inner := expr.TypedInnerExpr()
+	switch t := inner.(type) {
+	case *NotExpr:
+		return t.TypedInnerExpr()
 	}
-	return newExpr
+	return expr
+}
+
+func (expr *ParenExpr) normalize(v *normalizeVisitor) TypedExpr {
+	return expr.TypedInnerExpr()
 }
 
 func (expr *AnnotateTypeExpr) normalize(v *normalizeVisitor) TypedExpr {
@@ -654,7 +682,7 @@ func invertComparisonOp(op ComparisonOperator) (ComparisonOperator, error) {
 	case LT:
 		return GT, nil
 	default:
-		return op, errors.Errorf("internal error: unable to invert: %s", op)
+		return op, pgerror.NewErrorf(pgerror.CodeInternalError, "internal error: unable to invert: %s", op)
 	}
 }
 

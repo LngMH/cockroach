@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package kv
 
@@ -74,11 +72,11 @@ func (ri *RangeIterator) Desc() *roachpb.RangeDescriptor {
 	return ri.desc
 }
 
-// LeaseHolder returns the lease holder of the iterator's current range, if that
+// LeaseHolderStoreID returns the lease holder's StoreID of the iterator's current range, if that
 // information is present in the DistSender's LeaseHolderCache. The second
 // return val is true if the descriptor has been found.
 // The iterator must be valid.
-func (ri *RangeIterator) LeaseHolder(ctx context.Context) (roachpb.ReplicaDescriptor, bool) {
+func (ri *RangeIterator) LeaseHolderStoreID(ctx context.Context) (roachpb.StoreID, bool) {
 	if !ri.Valid() {
 		panic(ri.Error())
 	}
@@ -194,7 +192,7 @@ func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir Sca
 		// TODO: this code is subject to removal. See
 		// https://groups.google.com/d/msg/cockroach-db/DebjQEgU9r4/_OhMe7atFQAJ
 		reverse := ri.scanDir == Descending
-		if (reverse && !ri.desc.ContainsExclusiveEndKey(ri.key)) ||
+		if (reverse && !ri.desc.ContainsKeyInverted(ri.key)) ||
 			(!reverse && !ri.desc.ContainsKey(ri.key)) {
 			log.Eventf(ctx, "addressing error: %s does not include key %s", ri.desc, ri.key)
 			if err := ri.token.Evict(ctx); err != nil {

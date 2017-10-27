@@ -12,8 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 //
-// Author: Radu Berinde (radu@cockroachlabs.com)
-//
 // The parallel_test adds an orchestration layer on top of the logic_test code
 // with the capability of running multiple test data files in parallel.
 //
@@ -136,8 +134,7 @@ func (t *parallelTest) run(dir string) {
 		t.Fatalf("%s: %s", mainFile, err)
 	}
 	var spec parTestSpec
-	err = yaml.Unmarshal(yamlData, &spec)
-	if err != nil {
+	if err := yaml.UnmarshalStrict(yamlData, &spec); err != nil {
 		t.Fatalf("%s: %s", mainFile, err)
 	}
 
@@ -197,6 +194,15 @@ func (t *parallelTest) setup(spec *parTestSpec) {
 		},
 	}
 	t.cluster = serverutils.StartTestCluster(t, spec.ClusterSize, args)
+
+	for i := 0; i < t.cluster.NumServers(); i++ {
+		server := t.cluster.Server(i)
+		mode := sql.DistSQLOff
+		st := server.ClusterSettings()
+		st.Manual.Store(true)
+		sql.DistSQLClusterExecMode.Override(&st.SV, int64(mode))
+	}
+
 	t.clients = make([][]*gosql.DB, spec.ClusterSize)
 	for i := range t.clients {
 		t.clients[i] = append(t.clients[i], t.cluster.ServerConn(i))
@@ -235,7 +241,7 @@ func (t *parallelTest) setup(spec *parTestSpec) {
 func TestParallel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	glob := string(*paralleltestdata)
+	glob := *paralleltestdata
 	paths, err := filepath.Glob(glob)
 	if err != nil {
 		t.Fatal(err)

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -58,10 +56,21 @@ func fakePrevKey(k []byte) roachpb.Key {
 	}, nil)
 }
 
+func uuidFromString(input string) uuid.UUID {
+	u, err := uuid.FromString(input)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
 // createRangeData creates sample range data in all possible areas of
 // the key space. Returns a slice of the encoded keys of all created
 // data.
 func createRangeData(t *testing.T, r *Replica) []engine.MVCCKey {
+	testTxnID := uuidFromString("0ce61c17-5eb4-4587-8c36-dcf4062ada4c")
+	testTxnID2 := uuidFromString("9855a1ef-8eb9-4c06-a106-cab1dda78a2b")
+
 	ts0 := hlc.Timestamp{}
 	ts := hlc.Timestamp{WallTime: 1}
 	desc := r.Desc()
@@ -69,8 +78,8 @@ func createRangeData(t *testing.T, r *Replica) []engine.MVCCKey {
 		key roachpb.Key
 		ts  hlc.Timestamp
 	}{
-		{keys.AbortCacheKey(r.RangeID, testTxnID), ts0},
-		{keys.AbortCacheKey(r.RangeID, testTxnID2), ts0},
+		{keys.AbortSpanKey(r.RangeID, testTxnID), ts0},
+		{keys.AbortSpanKey(r.RangeID, testTxnID2), ts0},
 		{keys.RangeFrozenStatusKey(r.RangeID), ts0},
 		{keys.RangeLastGCKey(r.RangeID), ts0},
 		{keys.RaftAppliedIndexKey(r.RangeID), ts0},
@@ -126,7 +135,7 @@ func TestReplicaDataIteratorEmptyRange(t *testing.T) {
 	newDesc := *tc.repl.Desc()
 	newDesc.RangeID = 125125125
 
-	iter := NewReplicaDataIterator(&newDesc, tc.repl.store.Engine(), false /* !replicatedOnly */)
+	iter := NewReplicaDataIterator(&newDesc, tc.repl.store.Engine(), false /* replicatedOnly */)
 	defer iter.Close()
 	for ; ; iter.Next() {
 		if ok, err := iter.Valid(); err != nil {
@@ -180,7 +189,7 @@ func TestReplicaDataIterator(t *testing.T) {
 	postKeys := createRangeData(t, postRng)
 
 	// Verify the contents of the "b"-"c" range.
-	iter := NewReplicaDataIterator(tc.repl.Desc(), tc.repl.store.Engine(), false /* !replicatedOnly */)
+	iter := NewReplicaDataIterator(tc.repl.Desc(), tc.repl.store.Engine(), false /* replicatedOnly */)
 	defer iter.Close()
 	i := 0
 	for ; ; iter.Next() {
@@ -222,7 +231,7 @@ func TestReplicaDataIterator(t *testing.T) {
 	if err := tc.store.removeReplicaImpl(context.Background(), tc.repl, *tc.repl.Desc(), true); err != nil {
 		t.Fatal(err)
 	}
-	iter = NewReplicaDataIterator(tc.repl.Desc(), tc.repl.store.Engine(), false /* !replicatedOnly */)
+	iter = NewReplicaDataIterator(tc.repl.Desc(), tc.repl.store.Engine(), false /* replicatedOnly */)
 	defer iter.Close()
 	if ok, err := iter.Valid(); err != nil {
 		t.Fatal(err)
@@ -251,7 +260,7 @@ func TestReplicaDataIterator(t *testing.T) {
 		{preRng, preKeys},
 		{postRng, postKeys},
 	} {
-		iter = NewReplicaDataIterator(test.r.Desc(), test.r.store.Engine(), false /* !replicatedOnly */)
+		iter = NewReplicaDataIterator(test.r.Desc(), test.r.store.Engine(), false /* replicatedOnly */)
 		defer iter.Close()
 		i = 0
 		for ; ; iter.Next() {

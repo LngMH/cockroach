@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package cli
 
@@ -92,9 +90,13 @@ global
 
 defaults
     mode                tcp
+    # Timeout values should be configured for your specific use.
+    # See: https://cbonte.github.io/haproxy-dconv/1.8/configuration.html#4-timeout%20connect
     timeout connect     10s
     timeout client      1m
     timeout server      1m
+    # TCP keep-alive on client side. Server already enables them.
+    option              clitcpka
 
 listen psql
     bind :26257

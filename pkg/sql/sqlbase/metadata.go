@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package sqlbase
 
@@ -25,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/gogo/protobuf/proto"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 var _ DescriptorProto = &DatabaseDescriptor{}
@@ -43,7 +41,7 @@ type DescriptorKey interface {
 // and TableDescriptor.
 // TODO(marc): this is getting rather large.
 type DescriptorProto interface {
-	proto.Message
+	protoutil.Message
 	GetPrivileges() *PrivilegeDescriptor
 	GetID() ID
 	SetID(ID)
@@ -187,7 +185,7 @@ func (ms MetadataSchema) InitialRangeCount() int {
 	// The number of fixed ranges is determined by the pre-defined split points
 	// in SystemConfig.ComputeSplitKey. The early keyspace is split up in order
 	// to support separate zone configs for different parts of the system ranges.
-	// There are 4 pre-defined split points, so 5 fixed ranges.
-	const fixedRanges = 5
+	// When there are `n` StaticSplit points, there will be `n+1` ranges.
+	const fixedRanges = 7
 	return len(ms.descs) - ms.configs + fixedRanges
 }

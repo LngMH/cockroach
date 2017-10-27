@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package sql
 
@@ -26,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 type joinType int
@@ -134,6 +132,17 @@ type joinNode struct {
 	// pred represents the join predicate.
 	pred *joinPredicate
 
+	// mergeJoinOrdering is set during expandPlan if the left and right sides have
+	// similar ordering on the equality columns (or a subset of them). The column
+	// indices refer to equality columns: a ColIdx of i refers to left column
+	// pred.leftEqualityIndices[i] and right column pred.rightEqualityIndices[i].
+	// See computeMergeJoinOrdering. This information is used by distsql planning.
+	mergeJoinOrdering sqlbase.ColumnOrdering
+
+	// ordering is set during expandPlan based on mergeJoinOrdering, but later
+	// trimmed.
+	props physicalProps
+
 	// columns contains the metadata for the results of this node.
 	columns sqlbase.ResultColumns
 
@@ -174,7 +183,7 @@ func commonColumns(left, right *dataSourceInfo) parser.NameList {
 				continue
 			}
 
-			if parser.ReNormalizeName(cLeft.Name) == parser.ReNormalizeName(cRight.Name) {
+			if cLeft.Name == cRight.Name {
 				res = append(res, parser.Name(cLeft.Name))
 			}
 		}
@@ -279,15 +288,15 @@ func (p *planner) makeJoin(
 }
 
 // Start implements the planNode interface.
-func (n *joinNode) Start(ctx context.Context) error {
-	if err := n.left.plan.Start(ctx); err != nil {
+func (n *joinNode) Start(params runParams) error {
+	if err := n.left.plan.Start(params); err != nil {
 		return err
 	}
-	if err := n.right.plan.Start(ctx); err != nil {
+	if err := n.right.plan.Start(params); err != nil {
 		return err
 	}
 
-	if err := n.hashJoinStart(ctx); err != nil {
+	if err := n.hashJoinStart(params); err != nil {
 		return err
 	}
 
@@ -312,12 +321,13 @@ func (n *joinNode) Start(ctx context.Context) error {
 	return nil
 }
 
-func (n *joinNode) hashJoinStart(ctx context.Context) error {
+func (n *joinNode) hashJoinStart(params runParams) error {
 	var scratch []byte
 	// Load all the rows from the right side and build our hashmap.
 	acc := n.bucketsMemAcc.Wtxn(n.planner.session)
+	ctx := params.ctx
 	for {
-		hasRow, err := n.right.plan.Next(ctx)
+		hasRow, err := n.right.plan.Next(params)
 		if err != nil {
 			return err
 		}
@@ -343,7 +353,7 @@ func (n *joinNode) hashJoinStart(ctx context.Context) error {
 }
 
 // Next implements the planNode interface.
-func (n *joinNode) Next(ctx context.Context) (res bool, err error) {
+func (n *joinNode) Next(params runParams) (res bool, err error) {
 	// If results available from from previously computed results, we just
 	// return true.
 	if n.buffer.Next() {
@@ -368,7 +378,11 @@ func (n *joinNode) Next(ctx context.Context) (res bool, err error) {
 	// Compute next batch of matching rows.
 	var scratch []byte
 	for {
-		leftHasRow, err := n.left.plan.Next(ctx)
+		if err := params.p.cancelChecker.Check(); err != nil {
+			return false, err
+		}
+
+		leftHasRow, err := n.left.plan.Next(params)
 		if err != nil {
 			return false, nil
 		}
@@ -434,7 +448,7 @@ func (n *joinNode) Next(ctx context.Context) (res bool, err error) {
 			// We append an empty right row to the left row, adding the result
 			// to our buffer for the subsequent call to Next().
 			n.pred.prepareRow(n.output, lrow, n.emptyRight)
-			if _, err := n.buffer.AddRow(ctx, n.output); err != nil {
+			if _, err := n.buffer.AddRow(params.ctx, n.output); err != nil {
 				return false, err
 			}
 			return n.buffer.Next(), nil
@@ -451,7 +465,7 @@ func (n *joinNode) Next(ctx context.Context) (res bool, err error) {
 			// empty right row to the left row, adding the result to our buffer
 			// for the subsequent call to Next().
 			n.pred.prepareRow(n.output, lrow, n.emptyRight)
-			if _, err := n.buffer.AddRow(ctx, n.output); err != nil {
+			if _, err := n.buffer.AddRow(params.ctx, n.output); err != nil {
 				return false, err
 			}
 			return n.buffer.Next(), nil
@@ -477,7 +491,7 @@ func (n *joinNode) Next(ctx context.Context) (res bool, err error) {
 				// without matches for right or full joins later.
 				b.MarkSeen(idx)
 			}
-			if _, err := n.buffer.AddRow(ctx, n.output); err != nil {
+			if _, err := n.buffer.AddRow(params.ctx, n.output); err != nil {
 				return false, err
 			}
 		}
@@ -486,7 +500,7 @@ func (n *joinNode) Next(ctx context.Context) (res bool, err error) {
 			// left or full outer join, we need to add a row with an empty
 			// right side.
 			n.pred.prepareRow(n.output, lrow, n.emptyRight)
-			if _, err := n.buffer.AddRow(ctx, n.output); err != nil {
+			if _, err := n.buffer.AddRow(params.ctx, n.output); err != nil {
 				return false, err
 			}
 		}
@@ -503,9 +517,12 @@ func (n *joinNode) Next(ctx context.Context) (res bool, err error) {
 
 	for _, b := range n.buckets.Buckets() {
 		for idx, rrow := range b.Rows() {
+			if err := params.p.cancelChecker.Check(); err != nil {
+				return false, err
+			}
 			if !b.Seen(idx) {
 				n.pred.prepareRow(n.output, n.emptyLeft, rrow)
-				if _, err := n.buffer.AddRow(ctx, n.output); err != nil {
+				if _, err := n.buffer.AddRow(params.ctx, n.output); err != nil {
 					return false, err
 				}
 			}
@@ -530,4 +547,108 @@ func (n *joinNode) Close(ctx context.Context) {
 
 	n.right.plan.Close(ctx)
 	n.left.plan.Close(ctx)
+}
+
+func (n *joinNode) joinOrdering() physicalProps {
+	if len(n.mergeJoinOrdering) == 0 {
+		return physicalProps{}
+	}
+	info := physicalProps{}
+
+	// n.Columns has the following schema on equality JOINs:
+	//
+	// 0                     numMerged                 numMerged + numLeftCols
+	// |                     |                         |                          |
+	// --- Merged columns --- --- Columns from left --- --- Columns from right ---
+
+	leftCol := func(leftColIdx int) int {
+		return n.pred.numMergedEqualityColumns + leftColIdx
+	}
+	rightCol := func(rightColIdx int) int {
+		return n.pred.numMergedEqualityColumns + n.pred.numLeftCols + rightColIdx
+	}
+
+	leftOrd := planPhysicalProps(n.left.plan)
+	rightOrd := planPhysicalProps(n.right.plan)
+
+	// Propagate the equivalency groups for the left columns.
+	for i := 0; i < n.pred.numLeftCols; i++ {
+		if group := leftOrd.eqGroups.Find(i); group != i {
+			info.eqGroups.Union(leftCol(group), rightCol(group))
+		}
+	}
+	// Propagate the equivalency groups for the right columns.
+	for i := 0; i < n.pred.numRightCols; i++ {
+		if group := rightOrd.eqGroups.Find(i); group != i {
+			info.eqGroups.Union(rightCol(group), rightCol(i))
+		}
+	}
+	// Set equivalency between the equality column pairs (and merged column if
+	// appropriate).
+	for i, leftIdx := range n.pred.leftEqualityIndices {
+		rightIdx := n.pred.rightEqualityIndices[i]
+		info.eqGroups.Union(leftCol(leftIdx), rightCol(rightIdx))
+		if i < n.pred.numMergedEqualityColumns {
+			info.eqGroups.Union(i, leftCol(leftIdx))
+		}
+	}
+
+	// TODO(arjun): Support order propagation for other JOIN types.
+	if n.joinType != joinTypeInner {
+		return info
+	}
+
+	// Any constant columns stay constant after an inner join.
+	for l, ok := leftOrd.constantCols.Next(0); ok; l, ok = leftOrd.constantCols.Next(l + 1) {
+		info.addConstantColumn(leftCol(l))
+	}
+	for r, ok := rightOrd.constantCols.Next(0); ok; r, ok = rightOrd.constantCols.Next(r + 1) {
+		info.addConstantColumn(rightCol(r))
+	}
+
+	// If the equality columns form a key on both sides, then each row (from
+	// either side) is incorporated into at most one result row; so any key sets
+	// remain valid and can be propagated.
+
+	var leftEqSet, rightEqSet util.FastIntSet
+	for i, leftIdx := range n.pred.leftEqualityIndices {
+		leftEqSet.Add(leftIdx)
+		info.addNotNullColumn(leftCol(leftIdx))
+
+		rightIdx := n.pred.rightEqualityIndices[i]
+		rightEqSet.Add(rightIdx)
+		info.addNotNullColumn(rightCol(rightIdx))
+
+		if i < n.pred.numMergedEqualityColumns {
+			info.addNotNullColumn(i)
+		}
+	}
+
+	if leftOrd.isKey(leftEqSet) && rightOrd.isKey(rightEqSet) {
+		for _, k := range leftOrd.weakKeys {
+			// Translate column indices.
+			var s util.FastIntSet
+			for c, ok := k.Next(0); ok; c, ok = k.Next(c + 1) {
+				s.Add(leftCol(c))
+			}
+			info.addWeakKey(s)
+		}
+		for _, k := range rightOrd.weakKeys {
+			// Translate column indices.
+			var s util.FastIntSet
+			for c, ok := k.Next(0); ok; c, ok = k.Next(c + 1) {
+				s.Add(rightCol(c))
+			}
+			info.addWeakKey(s)
+		}
+	}
+
+	info.ordering = make(sqlbase.ColumnOrdering, len(n.mergeJoinOrdering))
+	for i, col := range n.mergeJoinOrdering {
+		leftGroup := leftOrd.eqGroups.Find(n.pred.leftEqualityIndices[col.ColIdx])
+		info.ordering[i].ColIdx = leftCol(leftGroup)
+		info.ordering[i].Direction = col.Direction
+	}
+	info.ordering = info.reduce(info.ordering)
+	return info
 }

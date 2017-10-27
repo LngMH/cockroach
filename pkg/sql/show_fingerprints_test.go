@@ -56,7 +56,7 @@ func TestShowFingerprintsAsOfSystemTime(t *testing.T) {
 		t.Errorf("expected different fingerprints: %v vs %v", fprint1, fprint2)
 	}
 
-	fprint3Query := fmt.Sprintf(`%s AS OF SYSTEM TIME '%s'`, fprintQuery, ts)
+	fprint3Query := fmt.Sprintf(`SELECT * FROM [%s] AS OF SYSTEM TIME '%s'`, fprintQuery, ts)
 	sqlDB.CheckQueryResults(fprint3Query, fprint1)
 }
 
@@ -69,13 +69,19 @@ func TestShowFingerprintsColumnNames(t *testing.T) {
 
 	sqlDB := sqlutils.MakeSQLRunner(t, tc.ServerConn(0))
 	sqlDB.Exec(`CREATE DATABASE d`)
-	sqlDB.Exec(`CREATE TABLE d.t (a INT PRIMARY KEY, b INT, INDEX b_idx (b))`)
+	sqlDB.Exec(`CREATE TABLE d.t (
+		lowercase INT PRIMARY KEY,
+		"cApiTaLInT" INT,
+		"cApiTaLByTEs" BYTES,
+		INDEX capital_int_idx ("cApiTaLInT"),
+		INDEX capital_bytes_idx ("cApiTaLByTEs")
+	)`)
 
-	sqlDB.Exec(`INSERT INTO d.t VALUES (1, 2)`)
+	sqlDB.Exec(`INSERT INTO d.t VALUES (1, 2, 'a')`)
 	fprint1 := sqlDB.QueryStr(`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE d.t`)
 
 	sqlDB.Exec(`TRUNCATE TABLE d.t`)
-	sqlDB.Exec(`INSERT INTO d.t VALUES (3, 4)`)
+	sqlDB.Exec(`INSERT INTO d.t VALUES (3, 4, 'b')`)
 	fprint2 := sqlDB.QueryStr(`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE d.t`)
 
 	if reflect.DeepEqual(fprint1, fprint2) {

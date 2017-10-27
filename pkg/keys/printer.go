@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Veteran Lu (23907238@qq.com)
 
 package keys
 
@@ -84,8 +82,8 @@ var (
 					if len(unq) == 0 {
 						return "", Meta1Prefix
 					}
-					return "", RangeMetaKey(MustAddr(RangeMetaKey(MustAddr(
-						roachpb.Key(unq)))))
+					return "", RangeMetaKey(RangeMetaKey(MustAddr(
+						roachpb.Key(unq)))).AsRawKey()
 				},
 			}},
 		},
@@ -100,7 +98,7 @@ var (
 					if len(unq) == 0 {
 						return "", Meta2Prefix
 					}
-					return "", RangeMetaKey(MustAddr(roachpb.Key(unq)))
+					return "", RangeMetaKey(MustAddr(roachpb.Key(unq))).AsRawKey()
 				},
 			}},
 		},
@@ -144,7 +142,7 @@ var (
 		ppFunc func(key roachpb.Key) string
 		psFunc func(rangeID roachpb.RangeID, input string) (string, roachpb.Key)
 	}{
-		{name: "AbortCache", suffix: LocalAbortCacheSuffix, ppFunc: abortCacheKeyPrint, psFunc: abortCacheKeyParse},
+		{name: "AbortSpan", suffix: LocalAbortSpanSuffix, ppFunc: abortSpanKeyPrint, psFunc: abortSpanKeyParse},
 		{name: "RaftTombstone", suffix: LocalRaftTombstoneSuffix},
 		{name: "RaftHardState", suffix: LocalRaftHardStateSuffix},
 		{name: "RaftAppliedIndex", suffix: LocalRaftAppliedIndexSuffix},
@@ -181,6 +179,7 @@ var constSubKeyDict = []struct {
 }{
 	{"/storeIdent", localStoreIdentSuffix},
 	{"/gossipBootstrap", localStoreGossipSuffix},
+	{"/clusterVersion", localStoreClusterVersionSuffix},
 }
 
 func localStoreKeyPrint(key roachpb.Key) string {
@@ -362,28 +361,45 @@ func localRangeKeyPrint(key roachpb.Key) string {
 		if s.atEnd {
 			if bytes.HasSuffix(key, s.suffix) {
 				key = key[:len(key)-len(s.suffix)]
-				fmt.Fprintf(&buf, "%s/%s", decodeKeyPrint(key), s.name)
+				_, decodedKey, err := encoding.DecodeBytesAscending([]byte(key), nil)
+				if err != nil {
+					fmt.Fprintf(&buf, "%s/%s", decodeKeyPrint(key), s.name)
+				} else {
+					fmt.Fprintf(&buf, "%s/%s", roachpb.Key(decodedKey), s.name)
+				}
 				return buf.String()
 			}
 		} else {
 			begin := bytes.Index(key, s.suffix)
 			if begin > 0 {
 				addrKey := key[:begin]
+				_, decodedAddrKey, err := encoding.DecodeBytesAscending([]byte(addrKey), nil)
+				if err != nil {
+					fmt.Fprintf(&buf, "%s/%s", decodeKeyPrint(addrKey), s.name)
+				} else {
+					fmt.Fprintf(&buf, "%s/%s", roachpb.Key(decodedAddrKey), s.name)
+				}
 				if bytes.Equal(s.suffix, LocalTransactionSuffix) {
 					txnID, err := uuid.FromBytes(key[(begin + len(s.suffix)):])
 					if err != nil {
 						return fmt.Sprintf("/%q/err:%v", key, err)
 					}
-					fmt.Fprintf(&buf, "%s/%s/addrKey:/id:%q", decodeKeyPrint(addrKey), s.name, txnID)
+					fmt.Fprintf(&buf, "/%q", txnID)
 				} else {
 					id := key[(begin + len(s.suffix)):]
-					fmt.Fprintf(&buf, "%s/%s/addrKey:/id:%q", decodeKeyPrint(addrKey), s.name, id)
+					fmt.Fprintf(&buf, "/%q", []byte(id))
 				}
 				return buf.String()
 			}
 		}
 	}
-	fmt.Fprintf(&buf, "%s", decodeKeyPrint(key))
+
+	_, decodedKey, err := encoding.DecodeBytesAscending([]byte(key), nil)
+	if err != nil {
+		fmt.Fprintf(&buf, "%s", decodeKeyPrint(key))
+	} else {
+		fmt.Fprintf(&buf, "%s", roachpb.Key(decodedKey))
+	}
 
 	return buf.String()
 }
@@ -396,7 +412,7 @@ func (euu *errUglifyUnsupported) Error() string {
 	return fmt.Sprintf("unsupported pretty key: %s", euu.wrapped)
 }
 
-func abortCacheKeyParse(rangeID roachpb.RangeID, input string) (string, roachpb.Key) {
+func abortSpanKeyParse(rangeID roachpb.RangeID, input string) (string, roachpb.Key) {
 	var err error
 	input = mustShiftSlash(input)
 	_, input = mustShift(input[:len(input)-1])
@@ -407,10 +423,10 @@ func abortCacheKeyParse(rangeID roachpb.RangeID, input string) (string, roachpb.
 	if err != nil {
 		panic(&errUglifyUnsupported{err})
 	}
-	return "", AbortCacheKey(rangeID, id)
+	return "", AbortSpanKey(rangeID, id)
 }
 
-func abortCacheKeyPrint(key roachpb.Key) string {
+func abortSpanKeyPrint(key roachpb.Key) string {
 	_, id, err := encoding.DecodeBytesAscending([]byte(key), nil)
 	if err != nil {
 		return fmt.Sprintf("/%q/err:%v", key, err)
@@ -507,7 +523,7 @@ func prettyPrintInternal(key roachpb.Key, quoteRawKeys bool) string {
 // /Local/...                                        "\x01"+...
 // 		/Store/...                                     "\x01s"+...
 //		/RangeID/...                                   "\x01s"+[rangeid]
-//			/[rangeid]/AbortCache/[id]                   "\x01s"+[rangeid]+"abc-"+[id]
+//			/[rangeid]/AbortSpan/[id]                   "\x01s"+[rangeid]+"abc-"+[id]
 //			/[rangeid]/Lease						                 "\x01s"+[rangeid]+"rfll"
 //			/[rangeid]/RaftTombstone                     "\x01s"+[rangeid]+"rftb"
 //			/[rangeid]/RaftHardState						         "\x01s"+[rangeid]+"rfth"
@@ -519,9 +535,9 @@ func prettyPrintInternal(key roachpb.Key, quoteRawKeys bool) string {
 //			/[rangeid]/RangeLastVerificationTimestamp    "\x01s"+[rangeid]+"rlvt"
 //			/[rangeid]/RangeStats                        "\x01s"+[rangeid]+"stat"
 //		/Range/...                                     "\x01k"+...
-//			/RangeDescriptor/[key]                       "\x01k"+[key]+"rdsc"
-//			/Transaction/addrKey:[key]/id:[id]	         "\x01k"+[key]+"txn-"+[txn-id]
-//			/QueueLastProcessed/addrKey:[key]/id:[queue] "\x01k"+[key]+"qlpt"+[queue]
+//			[key]/RangeDescriptor                        "\x01k"+[key]+"rdsc"
+//			[key]/Transaction/[id]	                     "\x01k"+[key]+"txn-"+[txn-id]
+//			[key]/QueueLastProcessed/[queue]             "\x01k"+[key]+"qlpt"+[queue]
 // /Local/Max                                        "\x02"
 //
 // /Meta1/[key]                                      "\x02"+[key]

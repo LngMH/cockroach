@@ -10,8 +10,8 @@ package storageccl
 
 import (
 	"bytes"
+	"fmt"
 	"io/ioutil"
-	"runtime"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -22,8 +22,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -31,103 +33,55 @@ import (
 
 // importRequestLimit is the number of Import requests that can run at once.
 // Each downloads a file from cloud storage to a temp file, iterates it, and
-// sends AddSSTable requests to batch insert it. Import and the resulting
-// AddSSTable calls are mostly cpu-bound at this point so allow NumCPU of them
-// to be running concurrently, which will hopefully hit the sweet spot between
-// maximizing throughput and minimizing thrashing.
-var importRequestLimit = runtime.NumCPU()
+// sends AddSSTable requests (usually just one) to batch insert it. The
+// AddSSTable requests are large enough to clog gRPC, so we only allow one per
+// node at a time.
+var importRequestLimit = 1
 
 var importRequestLimiter = makeConcurrentRequestLimiter(importRequestLimit)
 
+var importBatchSize = settings.RegisterByteSizeSetting(
+	"kv.import.batch_size",
+	"",
+	32<<20,
+)
+
+// commandMetadataEstimate is an estimate of how much metadata Raft will add to
+// an AddSSTable command. It is intentionally a vast overestimate to avoid
+// embedding intricate knowledge of the Raft encoding scheme here.
+const commandMetadataEstimate = 1 << 20 // 1 MB
+
 func init() {
+	importBatchSize.Hide()
 	storage.SetImportCmd(evalImport)
-}
 
-var importBatchSize = func() *settings.ByteSizeSetting {
-	s := settings.RegisterByteSizeSetting("kv.import.batch_size", "", 2<<20)
-	s.Hide()
-	return s
-}()
-
-// AddSSTableEnabled is exposed for testing.
-var AddSSTableEnabled = func() *settings.BoolSetting {
-	s := settings.RegisterBoolSetting(
-		"kv.import.experimental_addsstable.enabled",
-		"set to true to use the AddSSTable command in Import or false to use WriteBatch",
-		true,
-	)
-	s.Hide()
-	return s
-}()
-
-type importBatcher interface {
-	Add(engine.MVCCKey, []byte) error
-	Size() int64
-	Finish(context.Context, *client.DB) error
-	Close()
-}
-
-type writeBatcher struct {
-	batch         engine.RocksDBBatchBuilder
-	batchStartKey []byte
-	batchEndKey   []byte
-}
-
-var _ importBatcher = &writeBatcher{}
-
-func (b *writeBatcher) Add(key engine.MVCCKey, value []byte) error {
-	// Update the range currently represented in this batch, as
-	// necessary.
-	if len(b.batchStartKey) == 0 || bytes.Compare(key.Key, b.batchStartKey) < 0 {
-		b.batchStartKey = append(b.batchStartKey[:0], key.Key...)
-	}
-	if len(b.batchEndKey) == 0 || bytes.Compare(key.Key, b.batchEndKey) > 0 {
-		b.batchEndKey = append(b.batchEndKey[:0], key.Key...)
-	}
-
-	b.batch.Put(key, value)
-	return nil
-}
-
-func (b *writeBatcher) Size() int64 {
-	return int64(b.batch.Len())
-}
-
-func (b *writeBatcher) Finish(ctx context.Context, db *client.DB) error {
-	start := roachpb.Key(b.batchStartKey)
-	// The end key of the WriteBatch request is exclusive, but batchEndKey is
-	// currently the largest key in the batch. Increment it.
-	end := roachpb.Key(b.batchEndKey).Next()
-
-	repr := b.batch.Finish()
-	if log.V(1) {
-		log.Infof(ctx, "writebatch [%s,%s)", start, end)
-	}
-
-	const maxWriteBatchRetries = 10
-	for i := 0; ; i++ {
-		err := db.WriteBatch(ctx, start, end, repr)
-		if err == nil {
-			return nil
-		}
-		if _, ok := err.(*roachpb.AmbiguousResultError); i == maxWriteBatchRetries || !ok {
-			return errors.Wrapf(err, "writebatch [%s,%s)", start, end)
-		}
-		log.Warningf(ctx, "writebatch [%s,%s) attempt %d failed: %+v",
-			start, end, i, err)
-		continue
+	// Ensure that the user cannot set the maximum raft command size so low that
+	// more than half of an Import or AddSSTable command will be taken up by Raft
+	// metadata.
+	if commandMetadataEstimate > storage.MaxCommandSizeFloor/2 {
+		panic(fmt.Sprintf("raft command size floor (%s) is too small for import commands",
+			humanizeutil.IBytes(storage.MaxCommandSizeFloor)))
 	}
 }
 
-func (b *writeBatcher) Close() {}
+// maxImportBatchSize determines the maximum size of the payload in an
+// AddSSTable request. It uses the ImportBatchSize setting directly unless the
+// specified value would exceed the maximum Raft command size, in which case it
+// returns the maximum batch size that will fit within a Raft command.
+func maxImportBatchSize(st *cluster.Settings) int64 {
+	desiredSize := importBatchSize.Get(&st.SV)
+	maxCommandSize := storage.MaxCommandSize.Get(&st.SV)
+	if desiredSize+commandMetadataEstimate > maxCommandSize {
+		return maxCommandSize - commandMetadataEstimate
+	}
+	return desiredSize
+}
 
 type sstBatcher struct {
 	sstWriter     engine.RocksDBSstFileWriter
 	batchStartKey []byte
 	batchEndKey   []byte
 }
-
-var _ importBatcher = &sstBatcher{}
 
 func (b *sstBatcher) Add(key engine.MVCCKey, value []byte) error {
 	// Update the range currently represented in this batch, as
@@ -159,9 +113,9 @@ func (b *sstBatcher) Finish(ctx context.Context, db *client.DB) error {
 
 	const maxAddSSTableRetries = 10
 	for i := 0; ; i++ {
-		log.Event(ctx, "sending AddSSTable")
+		log.VEventf(ctx, 2, "sending AddSSTable [%s,%s)", start, end)
 		// TODO(dan): This will fail if the range has split.
-		err := db.ExperimentalAddSSTable(ctx, start, end, sstBytes)
+		err := db.AddSSTable(ctx, start, end, sstBytes)
 		if err == nil {
 			return nil
 		}
@@ -187,19 +141,6 @@ func evalImport(ctx context.Context, cArgs storage.CommandArgs) (*roachpb.Import
 		return nil, errors.Wrap(err, "make key rewriter")
 	}
 
-	var importStart, importEnd roachpb.Key
-	{
-		var ok bool
-		importStart, ok, _ = kr.RewriteKey(append([]byte(nil), args.DataSpan.Key...))
-		if !ok {
-			return nil, errors.Errorf("could not rewrite span start key: %s", importStart)
-		}
-		importEnd, ok, _ = kr.RewriteKey(append([]byte(nil), args.DataSpan.EndKey...))
-		if !ok {
-			return nil, errors.Errorf("could not rewrite span end key: %s", importEnd)
-		}
-	}
-
 	if err := importRequestLimiter.beginLimitedRequest(ctx); err != nil {
 		return nil, err
 	}
@@ -208,9 +149,9 @@ func evalImport(ctx context.Context, cArgs storage.CommandArgs) (*roachpb.Import
 	var rows rowCounter
 	var iters []engine.SimpleIterator
 	for _, file := range args.Files {
-		log.VEventf(ctx, 2, "import file %s", file.Path)
+		log.VEventf(ctx, 2, "import file %s %s", file.Path, args.Span.Key)
 
-		dir, err := MakeExportStorage(ctx, file.Dir)
+		dir, err := MakeExportStorage(ctx, file.Dir, cArgs.EvalCtx.ClusterSettings())
 		if err != nil {
 			return nil, err
 		}
@@ -248,7 +189,7 @@ func evalImport(ctx context.Context, cArgs storage.CommandArgs) (*roachpb.Import
 			}
 		}
 
-		iter, err := engineccl.NewMemSSTIterator(fileContents)
+		iter, err := engineccl.NewMemSSTIterator(fileContents, false)
 		if err != nil {
 			return nil, err
 		}
@@ -257,21 +198,16 @@ func evalImport(ctx context.Context, cArgs storage.CommandArgs) (*roachpb.Import
 		iters = append(iters, iter)
 	}
 
-	var batcher importBatcher
+	var batcher *sstBatcher
 	makeBatcher := func() error {
 		if batcher != nil {
 			return errors.New("cannot overwrite a batcher")
 		}
-
-		if AddSSTableEnabled.Get() {
-			sstWriter, err := engine.MakeRocksDBSstFileWriter()
-			if err != nil {
-				return errors.Wrapf(err, "making sstBatcher")
-			}
-			batcher = &sstBatcher{sstWriter: sstWriter}
-			return nil
+		sstWriter, err := engine.MakeRocksDBSstFileWriter()
+		if err != nil {
+			return errors.Wrapf(err, "making sstBatcher")
 		}
-		batcher = &writeBatcher{}
+		batcher = &sstBatcher{sstWriter: sstWriter}
 		return nil
 	}
 	if err := makeBatcher(); err != nil {
@@ -284,16 +220,31 @@ func evalImport(ctx context.Context, cArgs storage.CommandArgs) (*roachpb.Import
 	iter := engineccl.MakeMultiIterator(iters)
 	defer iter.Close()
 	var keyScratch, valueScratch []byte
-	for iter.Seek(startKeyMVCC); ; iter.NextKey() {
+
+	for iter.Seek(startKeyMVCC); ; {
 		ok, err := iter.Valid()
 		if err != nil {
 			return nil, err
 		}
+		if !ok {
+			break
+		}
+
+		if args.EndTime != (hlc.Timestamp{}) {
+			// TODO(dan): If we have to skip past a lot of versions to find the
+			// latest one before args.EndTime, then this could be slow.
+			if args.EndTime.Less(iter.UnsafeKey().Timestamp) {
+				iter.Next()
+				continue
+			}
+		}
+
 		if !ok || !iter.UnsafeKey().Less(endKeyMVCC) {
 			break
 		}
 		if len(iter.UnsafeValue()) == 0 {
 			// Value is deleted.
+			iter.NextKey()
 			continue
 		}
 
@@ -301,6 +252,7 @@ func evalImport(ctx context.Context, cArgs storage.CommandArgs) (*roachpb.Import
 		valueScratch = append(valueScratch[:0], iter.UnsafeValue()...)
 		key := engine.MVCCKey{Key: keyScratch, Timestamp: iter.UnsafeKey().Timestamp}
 		value := roachpb.Value{RawBytes: valueScratch}
+		iter.NextKey()
 
 		key.Key, ok, err = kr.RewriteKey(key.Key)
 		if err != nil {
@@ -331,14 +283,14 @@ func evalImport(ctx context.Context, cArgs storage.CommandArgs) (*roachpb.Import
 			return nil, errors.Wrapf(err, "adding to batch: %s -> %s", key, value.PrettyPrint())
 		}
 
-		if size := batcher.Size(); size > importBatchSize.Get() {
+		if size := batcher.Size(); size > maxImportBatchSize(cArgs.EvalCtx.ClusterSettings()) {
 			finishBatcher := batcher
 			batcher = nil
 			log.Eventf(gCtx, "triggering finish of batch of size %s", humanizeutil.IBytes(size))
 			g.Go(func() error {
 				defer log.Event(ctx, "finished batch")
 				defer finishBatcher.Close()
-				return finishBatcher.Finish(gCtx, db)
+				return errors.Wrapf(finishBatcher.Finish(gCtx, db), "import [%s, %s)", startKeyMVCC.Key, endKeyMVCC.Key)
 			})
 			if err := makeBatcher(); err != nil {
 				return nil, err

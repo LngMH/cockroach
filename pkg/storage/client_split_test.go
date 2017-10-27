@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage_test
 
@@ -36,12 +34,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
@@ -56,10 +56,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
-func adminSplitArgs(key, splitKey roachpb.Key) *roachpb.AdminSplitRequest {
+// adminSplitArgs creates an AdminSplitRequest for the provided split key.
+func adminSplitArgs(splitKey roachpb.Key) *roachpb.AdminSplitRequest {
 	return &roachpb.AdminSplitRequest{
 		Span: roachpb.Span{
-			Key: key,
+			Key: splitKey,
 		},
 		SplitKey: splitKey,
 	}
@@ -83,7 +84,7 @@ func TestStoreRangeSplitAtIllegalKeys(t *testing.T) {
 		keys.Meta2KeyMax,
 		keys.MakeTablePrefix(10 /* system descriptor ID */),
 	} {
-		args := adminSplitArgs(roachpb.KeyMin, key)
+		args := adminSplitArgs(key)
 		_, pErr := client.SendWrapped(context.Background(), rg1(store), args)
 		if !testutils.IsPError(pErr, "cannot split") {
 			t.Errorf("%q: unexpected split error %s", key, pErr)
@@ -101,8 +102,8 @@ func TestStoreRangeSplitAtTablePrefix(t *testing.T) {
 	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
-	key := keys.MakeRowSentinelKey(append([]byte(nil), keys.UserTableDataMin...))
-	args := adminSplitArgs(key, key)
+	key := keys.UserTableDataMin
+	args := adminSplitArgs(key)
 	if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
 		t.Fatalf("%q: split unexpected error: %s", key, pErr)
 	}
@@ -162,8 +163,14 @@ func TestStoreRangeSplitInsideRow(t *testing.T) {
 	tableKey := keys.MakeTablePrefix(keys.MaxReservedDescID + 1)
 	rowKey := roachpb.Key(encoding.EncodeVarintAscending(append([]byte(nil), tableKey...), 1))
 	rowKey = encoding.EncodeStringAscending(encoding.EncodeVarintAscending(rowKey, 1), "a")
-	col1Key := keys.MakeFamilyKey(append([]byte(nil), rowKey...), 1)
-	col2Key := keys.MakeFamilyKey(append([]byte(nil), rowKey...), 2)
+	col1Key, err := keys.EnsureSafeSplitKey(keys.MakeFamilyKey(append([]byte(nil), rowKey...), 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	col2Key, err := keys.EnsureSafeSplitKey(keys.MakeFamilyKey(append([]byte(nil), rowKey...), 2))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// We don't care about the value, so just store any old thing.
 	if err := store.DB().Put(context.TODO(), col1Key, "column 1"); err != nil {
@@ -174,29 +181,28 @@ func TestStoreRangeSplitInsideRow(t *testing.T) {
 	}
 
 	// Split between col1Key and col2Key by splitting before col2Key.
-	args := adminSplitArgs(col2Key, col2Key)
-	_, err := client.SendWrapped(context.Background(), rg1(store), args)
-	if err != nil {
-		t.Fatalf("%s: split unexpected error: %s", col1Key, err)
+	args := adminSplitArgs(col2Key)
+	_, pErr := client.SendWrapped(context.Background(), rg1(store), args)
+	if pErr != nil {
+		t.Fatalf("%s: split unexpected error: %s", col1Key, pErr)
 	}
 
-	repl1 := store.LookupReplica(col1Key, nil)
-	repl2 := store.LookupReplica(col2Key, nil)
+	repl1 := store.LookupReplica(roachpb.RKey(col1Key), nil)
+	repl2 := store.LookupReplica(roachpb.RKey(col2Key), nil)
+
 	// Verify the two columns are still on the same range.
 	if !reflect.DeepEqual(repl1, repl2) {
-		t.Fatalf("%s: ranges differ: %+v vs %+v", roachpb.Key(col1Key), repl1, repl2)
+		t.Fatalf("%s: ranges differ: %+v vs %+v", col1Key, repl1, repl2)
 	}
 	// Verify we split on a row key.
 	if startKey := repl1.Desc().StartKey; !startKey.Equal(rowKey) {
-		t.Fatalf("%s: expected split on %s, but found %s",
-			roachpb.Key(col1Key), roachpb.Key(rowKey), startKey)
+		t.Fatalf("%s: expected split on %s, but found %s", col1Key, rowKey, startKey)
 	}
 
 	// Verify the previous range was split on a row key.
 	repl3 := store.LookupReplica(tableKey, nil)
 	if endKey := repl3.Desc().EndKey; !endKey.Equal(rowKey) {
-		t.Fatalf("%s: expected split on %s, but found %s",
-			roachpb.Key(col1Key), roachpb.Key(rowKey), endKey)
+		t.Fatalf("%s: expected split on %s, but found %s", col1Key, rowKey, endKey)
 	}
 }
 
@@ -222,7 +228,7 @@ func TestStoreRangeSplitIntents(t *testing.T) {
 
 	// Split the range.
 	splitKey := roachpb.Key("m")
-	args := adminSplitArgs(roachpb.KeyMin, splitKey)
+	args := adminSplitArgs(splitKey)
 	if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -265,11 +271,12 @@ func TestStoreRangeSplitIntents(t *testing.T) {
 	}
 }
 
-// TestStoreRangeSplitAtRangeBounds verifies a range cannot be split
-// at its start or end keys (would create zero-length range!). This
-// sort of thing might happen in the wild if two split requests
-// arrived for same key. The first one succeeds and second would try
-// to split at the start of the newly split range.
+// TestStoreRangeSplitAtRangeBounds verifies that attempting to
+// split a range at its start key is a no-op and does not actually
+// perform a split (would create zero-length range!). This sort
+// of thing might happen in the wild if two split requests arrived for
+// same key. The first one succeeds and second would try to split
+// at the start of the newly split range.
 func TestStoreRangeSplitAtRangeBounds(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	storeCfg := storage.TestStoreConfig(nil)
@@ -278,71 +285,34 @@ func TestStoreRangeSplitAtRangeBounds(t *testing.T) {
 	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
-	args := adminSplitArgs(roachpb.KeyMin, []byte("a"))
-	if _, err := client.SendWrapped(context.Background(), rg1(store), args); err != nil {
-		t.Fatal(err)
-	}
-	// This second split will try to split at end of first split range.
-	if _, err := client.SendWrapped(context.Background(), rg1(store), args); err == nil {
-		t.Fatalf("split succeeded unexpectedly")
-	}
-	// Now try to split at start of new range.
-	args = adminSplitArgs(roachpb.KeyMin, []byte("a"))
-	if _, err := client.SendWrapped(context.Background(), rg1(store), args); err == nil {
-		t.Fatalf("split succeeded unexpectedly")
-	}
-}
-
-// TestEnsureSafeSplitKeyOutOfBounds is a regression test for an issue
-// fixed in #16291. A key that was initially within the bounds of a
-// range becomes out of bounds when passed through EnsureSafeSplitKey.
-// This was eventually detected, but it happened so late in the split
-// processes that we had no choice but to panic. Since #16291, this
-// condition is properly validated at the start of the split process
-// and returns an error cleanly.
-func TestEnsureSafeSplitKeyOutOfBounds(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	storeCfg := storage.TestStoreConfig(nil)
-	storeCfg.TestingKnobs.DisableSplitQueue = true
-	mtc := &multiTestContext{storeConfig: &storeCfg}
-	mtc.Start(t, 1)
-	defer mtc.Stop()
-
-	// Carefully construct keys with the desired properties: key2 is
-	// greater than key1, but the order reverses when EnsureSafeSplitKey
-	// is called.
-	var key1, key2 roachpb.Key
-	key1 = encoding.EncodeUvarintAscending(key1, keys.MaxReservedDescID+1)
-	key1 = encoding.EncodeUvarintAscending(key1, 1)
-	key1 = keys.MakeRowSentinelKey(key1)
-	key2 = encoding.EncodeUvarintAscending(key2, keys.MaxReservedDescID+1)
-	key2 = encoding.EncodeUvarintAscending(key2, 2)
-	key2 = encoding.EncodeUvarintAscending(key2, 1)
-
-	// Make sure the keys sort in the expected ways.
-	if key1.Compare(key2) >= 0 {
-		t.Fatalf("expected %s < %s", key1, key2)
-	}
-	var eKey1, eKey2 roachpb.Key
-	var err error
-	if eKey1, err = keys.EnsureSafeSplitKey(key1); err != nil {
-		t.Fatal(err)
-	}
-	if eKey2, err = keys.EnsureSafeSplitKey(key2); err != nil {
-		t.Fatal(err)
-	}
-	if eKey1.Compare(eKey2) <= 0 {
-		t.Fatalf("expected %s > %s", eKey1, eKey2)
-	}
-
-	args := adminSplitArgs(key1, key1)
-	if _, pErr := client.SendWrapped(context.Background(), mtc.distSenders[0], args); pErr != nil {
+	// Split range 1 at an arbitrary key.
+	key := roachpb.Key("a")
+	h := roachpb.Header{RangeID: 1}
+	args := adminSplitArgs(key)
+	if _, pErr := client.SendWrappedWith(context.Background(), store, h, args); pErr != nil {
 		t.Fatal(pErr)
 	}
-	args = adminSplitArgs(key2, key2)
-	_, pErr := client.SendWrapped(context.Background(), mtc.distSenders[0], args)
-	if !testutils.IsPError(pErr, "requested split key.*changed to.*by EnsureSafeSplitKey") {
-		t.Fatalf("unexpected error: %s", pErr)
+	replCount := store.ReplicaCount()
+
+	// An AdminSplit request sent to the end of the old range
+	// should fail with a RangeKeyMismatchError.
+	_, pErr := client.SendWrappedWith(context.Background(), store, h, args)
+	if _, ok := pErr.GetDetail().(*roachpb.RangeKeyMismatchError); !ok {
+		t.Fatalf("expected RangeKeyMismatchError, found: %v", pErr)
+	}
+
+	// An AdminSplit request sent to the start of the new range
+	// should succeed but no new ranges should be created.
+	newRng := store.LookupReplica(roachpb.RKey(key), nil)
+	h.RangeID = newRng.RangeID
+	if _, pErr := client.SendWrappedWith(context.Background(), store, h, args); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	newReplCount := store.ReplicaCount()
+	if replCount != newReplCount {
+		t.Fatalf("splitting at a range boundary should not create a new range; before second split "+
+			"found %d ranges, after second split found %d ranges", replCount, newReplCount)
 	}
 }
 
@@ -362,7 +332,7 @@ func TestStoreRangeSplitConcurrent(t *testing.T) {
 	errCh := make(chan *roachpb.Error, concurrentCount)
 	for i := 0; i < concurrentCount; i++ {
 		go func() {
-			args := adminSplitArgs(roachpb.KeyMin, splitKey)
+			args := adminSplitArgs(splitKey)
 			_, pErr := client.SendWrapped(context.Background(), rg1(store), args)
 			errCh <- pErr
 		}()
@@ -375,7 +345,7 @@ func TestStoreRangeSplitConcurrent(t *testing.T) {
 			// The only expected error from concurrent splits is the split key being
 			// outside the bounds for the range. Note that conflicting range
 			// descriptor errors are retried internally.
-			if !testutils.IsError(pErr.GoError(), "requested split key .* out of bounds of") {
+			if _, ok := pErr.GetDetail().(*roachpb.RangeKeyMismatchError); !ok {
 				t.Fatalf("unexpected error: %v", pErr)
 			}
 			failureCount++
@@ -427,10 +397,10 @@ func TestStoreRangeSplitIdempotency(t *testing.T) {
 	// Increments are a good way of testing idempotency. Up here, we
 	// address them to the original range, then later to the one that
 	// contains the key.
-	txn := roachpb.NewTransaction("test", []byte("c"), 10, enginepb.SERIALIZABLE,
+	txn := roachpb.MakeTransaction("test", []byte("c"), 10, enginepb.SERIALIZABLE,
 		store.Clock().Now(), 0)
 	lIncArgs := incrementArgs([]byte("apoptosis"), 100)
-	lTxn := *txn
+	lTxn := txn
 	lTxn.Sequence++
 	if _, pErr := client.SendWrappedWith(context.Background(), rg1(store), roachpb.Header{
 		Txn: &lTxn,
@@ -438,7 +408,7 @@ func TestStoreRangeSplitIdempotency(t *testing.T) {
 		t.Fatal(pErr)
 	}
 	rIncArgs := incrementArgs([]byte("wobble"), 10)
-	rTxn := *txn
+	rTxn := txn
 	rTxn.Sequence++
 	if _, pErr := client.SendWrappedWith(context.Background(), rg1(store), roachpb.Header{
 		Txn: &rTxn,
@@ -454,7 +424,7 @@ func TestStoreRangeSplitIdempotency(t *testing.T) {
 	keyBytes, valBytes := ms.KeyBytes, ms.ValBytes
 
 	// Split the range.
-	args := adminSplitArgs(roachpb.KeyMin, splitKey)
+	args := adminSplitArgs(splitKey)
 	if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -563,8 +533,7 @@ func TestStoreRangeSplitStats(t *testing.T) {
 
 	// Split the range after the last table data key.
 	keyPrefix := keys.MakeTablePrefix(keys.MaxReservedDescID + 1)
-	keyPrefix = keys.MakeRowSentinelKey(keyPrefix)
-	args := adminSplitArgs(roachpb.KeyMin, keyPrefix)
+	args := adminSplitArgs(keyPrefix)
 	if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -597,7 +566,7 @@ func TestStoreRangeSplitStats(t *testing.T) {
 	manual.Increment(100)
 
 	// Split the range at approximate halfway point.
-	args = adminSplitArgs(keyPrefix, midKey)
+	args = adminSplitArgs(midKey)
 	if _, pErr := client.SendWrappedWith(context.Background(), rg1(store), roachpb.Header{
 		RangeID: repl.RangeID,
 	}, args); pErr != nil {
@@ -696,8 +665,7 @@ func TestStoreEmptyRangeSnapshotSize(t *testing.T) {
 	// Split the range after the last table data key to get a range that contains
 	// no user data.
 	splitKey := keys.MakeTablePrefix(keys.MaxReservedDescID + 1)
-	splitKey = keys.MakeRowSentinelKey(splitKey)
-	splitArgs := adminSplitArgs(roachpb.KeyMin, splitKey)
+	splitArgs := adminSplitArgs(splitKey)
 	if _, err := client.SendWrapped(ctx, mtc.distSenders[0], splitArgs); err != nil {
 		t.Fatal(err)
 	}
@@ -763,8 +731,7 @@ func TestStoreRangeSplitStatsWithMerges(t *testing.T) {
 
 	// Split the range after the last table data key.
 	keyPrefix := keys.MakeTablePrefix(keys.MaxReservedDescID + 1)
-	keyPrefix = keys.MakeRowSentinelKey(keyPrefix)
-	args := adminSplitArgs(roachpb.KeyMin, keyPrefix)
+	args := adminSplitArgs(keyPrefix)
 	if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -782,7 +749,7 @@ func TestStoreRangeSplitStatsWithMerges(t *testing.T) {
 	manual.Increment(100)
 
 	// Split the range at approximate halfway point.
-	args = adminSplitArgs(keyPrefix, midKey)
+	args = adminSplitArgs(midKey)
 	if _, pErr := client.SendWrappedWith(context.Background(), rg1(store), roachpb.Header{
 		RangeID: repl.RangeID,
 	}, args); pErr != nil {
@@ -835,7 +802,7 @@ func fillRange(
 			return
 		}
 		key := append(append([]byte(nil), prefix...), randutil.RandBytes(src, 100)...)
-		key = keys.MakeRowSentinelKey(key)
+		key = keys.MakeFamilyKey(key, 0)
 		val := randutil.RandBytes(src, int(src.Int31n(1<<8)))
 		pArgs := putArgs(key, val)
 		_, pErr := client.SendWrappedWith(context.Background(), store, roachpb.Header{
@@ -999,12 +966,14 @@ func TestStoreRangeSystemSplits(t *testing.T) {
 		// range boundaries, but not at system table boundaries.
 		expKeys := []roachpb.Key{
 			testutils.MakeKey(keys.Meta2Prefix, keys.SystemPrefix),
+			testutils.MakeKey(keys.Meta2Prefix, keys.NodeLivenessPrefix),
+			testutils.MakeKey(keys.Meta2Prefix, keys.NodeLivenessKeyMax),
 			testutils.MakeKey(keys.Meta2Prefix, keys.TimeseriesPrefix),
 			testutils.MakeKey(keys.Meta2Prefix, keys.TimeseriesPrefix.PrefixEnd()),
 			testutils.MakeKey(keys.Meta2Prefix, keys.TableDataMin),
 		}
 		numReservedTables := schema.SystemDescriptorCount() - schema.SystemConfigDescriptorCount()
-		for i := 1; i <= int(numReservedTables); i++ {
+		for i := 1; i <= numReservedTables; i++ {
 			expKeys = append(expKeys,
 				testutils.MakeKey(keys.Meta2Prefix,
 					keys.MakeTablePrefix(keys.MaxSystemConfigDescID+uint32(i))),
@@ -1099,7 +1068,7 @@ func runSetupSplitSnapshotRace(
 	}
 
 	// Split the system range from the rest of the keyspace.
-	splitArgs := adminSplitArgs(roachpb.KeyMin, keys.SystemMax)
+	splitArgs := adminSplitArgs(keys.SystemMax)
 	if _, pErr := client.SendWrapped(context.Background(), rg1(mtc.stores[0]), splitArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -1125,7 +1094,7 @@ func runSetupSplitSnapshotRace(
 	mtc.advanceClock(context.TODO())
 
 	// Split the data range.
-	splitArgs = adminSplitArgs(keys.SystemMax, roachpb.Key("m"))
+	splitArgs = adminSplitArgs(roachpb.Key("m"))
 	if _, pErr := client.SendWrapped(context.Background(), mtc.distSenders[0], splitArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -1330,7 +1299,7 @@ func TestStoreSplitTimestampCacheDifferentLeaseHolder(t *testing.T) {
 	ctx = tc.Server(0).Stopper().WithCancel(ctx)
 
 	// This transaction will try to write "under" a served read.
-	txnOld := client.NewTxn(db)
+	txnOld := client.NewTxn(db, 0 /* gatewayNodeID */)
 
 	// Do something with txnOld so that its timestamp gets set.
 	if _, err := txnOld.Scan(ctx, "a", "b", 0); err != nil {
@@ -1451,8 +1420,8 @@ func TestStoreSplitGCThreshold(t *testing.T) {
 	}
 	gcArgs := &roachpb.GCRequest{
 		Span: roachpb.Span{
-			Key:    roachpb.Key(leftKey),
-			EndKey: roachpb.Key(rightKey),
+			Key:    leftKey,
+			EndKey: rightKey,
 		},
 		Threshold:          specifiedGCThreshold,
 		TxnSpanGCThreshold: specifiedTxnSpanGCThreshold,
@@ -1461,7 +1430,7 @@ func TestStoreSplitGCThreshold(t *testing.T) {
 		t.Fatal(pErr)
 	}
 
-	args := adminSplitArgs(splitKey, splitKey)
+	args := adminSplitArgs(splitKey)
 	if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -1558,7 +1527,7 @@ func TestStoreRangeSplitRaceUninitializedRHS(t *testing.T) {
 			// towards "a" (so that the range being split is always the first
 			// range).
 			splitKey := roachpb.Key(encoding.EncodeVarintDescending([]byte("a"), int64(i)))
-			splitArgs := adminSplitArgs(keys.SystemMax, splitKey)
+			splitArgs := adminSplitArgs(splitKey)
 			_, pErr := client.SendWrapped(context.Background(), mtc.distSenders[0], splitArgs)
 			errChan <- pErr
 		}()
@@ -1631,7 +1600,7 @@ func TestLeaderAfterSplit(t *testing.T) {
 	splitKey := roachpb.Key("m")
 	rightKey := roachpb.Key("z")
 
-	splitArgs := adminSplitArgs(roachpb.KeyMin, splitKey)
+	splitArgs := adminSplitArgs(splitKey)
 	if _, pErr := client.SendWrapped(context.Background(), mtc.distSenders[0], splitArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -1655,7 +1624,7 @@ func BenchmarkStoreRangeSplit(b *testing.B) {
 	store := createTestStoreWithConfig(b, stopper, storeCfg)
 
 	// Perform initial split of ranges.
-	sArgs := adminSplitArgs(roachpb.KeyMin, []byte("b"))
+	sArgs := adminSplitArgs(roachpb.Key("b"))
 	if _, err := client.SendWrapped(context.Background(), rg1(store), sArgs); err != nil {
 		b.Fatal(err)
 	}
@@ -1695,7 +1664,6 @@ func writeRandomDataToRange(
 	for i := 0; i < 100; i++ {
 		key := append([]byte(nil), keyPrefix...)
 		key = append(key, randutil.RandBytes(src, int(src.Int31n(1<<7)))...)
-		key = keys.MakeRowSentinelKey(key)
 		val := randutil.RandBytes(src, int(src.Int31n(1<<8)))
 		pArgs := putArgs(key, val)
 		if _, pErr := client.SendWrappedWith(context.Background(), rg1(store), roachpb.Header{
@@ -1707,7 +1675,7 @@ func writeRandomDataToRange(
 	// Return approximate midway point ("Z" in string "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz").
 	midKey := append([]byte(nil), keyPrefix...)
 	midKey = append(midKey, []byte("Z")...)
-	return keys.MakeRowSentinelKey(midKey)
+	return midKey
 }
 
 func writeRandomTimeSeriesDataToRange(
@@ -1757,7 +1725,7 @@ func writeRandomTimeSeriesDataToRange(
 	// Return approximate midway point (100 is midway between random timestamps in range [0,200)).
 	midKey := append([]byte(nil), keyPrefix...)
 	midKey = encoding.EncodeVarintAscending(midKey, 100*r.SlabDuration())
-	return keys.MakeRowSentinelKey(midKey)
+	return midKey
 }
 
 // TestStoreSplitBeginTxnPushMetaIntentRace prevents regression of
@@ -1807,7 +1775,7 @@ func TestStoreSplitBeginTxnPushMetaIntentRace(t *testing.T) {
 				log.Infof(context.TODO(), "allowing BeginTransaction to proceed after 20ms")
 			}
 		} else if filterArgs.Req.Method() == roachpb.Put &&
-			filterArgs.Req.Header().Key.Equal(keys.RangeMetaKey(splitKey)) {
+			filterArgs.Req.Header().Key.Equal(keys.RangeMetaKey(splitKey).AsRawKey()) {
 			select {
 			case wroteMeta2 <- struct{}{}:
 			default:
@@ -1823,7 +1791,7 @@ func TestStoreSplitBeginTxnPushMetaIntentRace(t *testing.T) {
 	manual.Increment(storage.GetGCQueueTxnCleanupThreshold().Nanoseconds() + 1)
 
 	// First, create a split after addressing records.
-	args := adminSplitArgs(roachpb.KeyMin, keys.SystemPrefix)
+	args := adminSplitArgs(keys.SystemPrefix)
 	if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -1839,7 +1807,7 @@ func TestStoreSplitBeginTxnPushMetaIntentRace(t *testing.T) {
 		if log.V(1) {
 			log.Infof(context.TODO(), "splitting at %s", splitKey)
 		}
-		args := adminSplitArgs(keys.SystemMax, splitKey.AsRawKey())
+		args := adminSplitArgs(splitKey.AsRawKey())
 		_, pErr := client.SendWrappedWith(context.Background(), store, roachpb.Header{
 			RangeID: store.LookupReplica(splitKey, nil).RangeID,
 		}, args)
@@ -1869,7 +1837,7 @@ func TestStoreSplitBeginTxnPushMetaIntentRace(t *testing.T) {
 	// within a SucceedSoon in order to give the intents time to resolve.
 	testutils.SucceedsSoon(t, func() error {
 		val, intents, err := engine.MVCCGet(context.Background(), store.Engine(),
-			keys.RangeMetaKey(splitKey), hlc.MaxTimestamp, true, nil)
+			keys.RangeMetaKey(splitKey).AsRawKey(), hlc.MaxTimestamp, true, nil)
 		if err != nil {
 			return err
 		}
@@ -1973,8 +1941,8 @@ func TestStorePushTxnQueueEnabledOnSplit(t *testing.T) {
 	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
-	key := keys.MakeRowSentinelKey(append([]byte(nil), keys.UserTableDataMin...))
-	args := adminSplitArgs(key, key)
+	key := keys.UserTableDataMin
+	args := adminSplitArgs(key)
 	if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
 		t.Fatalf("%q: split unexpected error: %s", key, pErr)
 	}
@@ -1997,7 +1965,7 @@ func TestDistributedTxnCleanup(t *testing.T) {
 
 	// Split at "a".
 	lhsKey := roachpb.Key("a")
-	args := adminSplitArgs(lhsKey, lhsKey)
+	args := adminSplitArgs(lhsKey)
 	if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
 		t.Fatalf("split at %q: %s", lhsKey, pErr)
 	}
@@ -2005,7 +1973,7 @@ func TestDistributedTxnCleanup(t *testing.T) {
 
 	// Split at "b".
 	rhsKey := roachpb.Key("b")
-	args = adminSplitArgs(rhsKey, rhsKey)
+	args = adminSplitArgs(rhsKey)
 	if _, pErr := client.SendWrappedWith(context.Background(), store, roachpb.Header{
 		RangeID: lhs.RangeID,
 	}, args); pErr != nil {
@@ -2024,7 +1992,7 @@ func TestDistributedTxnCleanup(t *testing.T) {
 				// Run a distributed transaction involving the lhsKey and rhsKey.
 				var txnKey roachpb.Key
 				ctx := context.Background()
-				txn := client.NewTxn(store.DB())
+				txn := client.NewTxn(store.DB(), 0 /* gatewayNodeID */)
 				opts := client.TxnExecOptions{
 					AutoCommit: true,
 					AutoRetry:  false,
@@ -2036,7 +2004,7 @@ func TestDistributedTxnCleanup(t *testing.T) {
 					if err := txn.Run(ctx, b); err != nil {
 						return err
 					}
-					txnKey = keys.TransactionKey(txn.Proto().Key, *txn.Proto().ID)
+					txnKey = keys.TransactionKey(txn.Proto().Key, txn.Proto().ID)
 					// If force=true, we're force-aborting the txn out from underneath.
 					// This simulates txn deadlock or a max priority txn aborting a
 					// normal or min priority txn.
@@ -2179,7 +2147,7 @@ func TestPushTxnQueueDependencyCycleWithRangeSplit(t *testing.T) {
 			rhsKey := roachpb.Key("b")
 
 			// Split at "a".
-			args := adminSplitArgs(lhsKey, lhsKey)
+			args := adminSplitArgs(lhsKey)
 			if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
 				t.Fatalf("split at %q: %s", lhsKey, pErr)
 			}
@@ -2243,7 +2211,7 @@ func TestPushTxnQueueDependencyCycleWithRangeSplit(t *testing.T) {
 			<-firstPush
 
 			// Split at "b".
-			args = adminSplitArgs(rhsKey, rhsKey)
+			args = adminSplitArgs(rhsKey)
 			if _, pErr := client.SendWrappedWith(context.Background(), store, roachpb.Header{
 				RangeID: lhs.RangeID,
 			}, args); pErr != nil {
@@ -2258,6 +2226,169 @@ func TestPushTxnQueueDependencyCycleWithRangeSplit(t *testing.T) {
 				if err := <-ch; err != nil {
 					t.Fatalf("%d: txn failure: %v", i, err)
 				}
+			}
+		})
+	}
+}
+
+func TestStoreCapacityAfterSplit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+	manualClock := hlc.NewManualClock(123)
+	cfg := storage.TestStoreConfig(hlc.NewClock(manualClock.UnixNano, time.Nanosecond))
+	cfg.TestingKnobs.DisableSplitQueue = true
+	s := createTestStoreWithConfig(t, stopper, cfg)
+
+	cap, err := s.Capacity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e, a := int32(1), cap.RangeCount; e != a {
+		t.Errorf("expected cap.RangeCount=%d, got %d", e, a)
+	}
+	bpr1 := cap.BytesPerReplica
+	if bpr1.P10 <= 0 {
+		t.Errorf("expected all bytes-per-replica to be positive, got %+v", bpr1)
+	}
+	if bpr1.P10 != bpr1.P25 || bpr1.P10 != bpr1.P50 || bpr1.P10 != bpr1.P75 || bpr1.P10 != bpr1.P90 {
+		t.Errorf("expected all bytes-per-replica percentiles to be identical, got %+v", bpr1)
+	}
+	wpr1 := cap.WritesPerReplica
+	if wpr1.P10 != wpr1.P25 || wpr1.P10 != wpr1.P50 || wpr1.P10 != wpr1.P75 || wpr1.P10 != wpr1.P90 {
+		t.Errorf("expected all writes-per-replica percentiles to be identical, got %+v", wpr1)
+	}
+
+	// Increment the manual clock and do a write to increase the qps above zero.
+	manualClock.Increment(int64(storage.MinStatsDuration))
+	key := roachpb.Key("a")
+	pArgs := putArgs(key, []byte("aaa"))
+	if _, pErr := client.SendWrapped(context.Background(), rg1(s), pArgs); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	cap, err = s.Capacity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e, a := int32(1), cap.RangeCount; e != a {
+		t.Errorf("expected cap.RangeCount=%d, got %d", e, a)
+	}
+	if e, a := int32(1), cap.LeaseCount; e != a {
+		t.Errorf("expected cap.LeaseCount=%d, got %d", e, a)
+	}
+	if minExpected, a := 1/float64(storage.MinStatsDuration/time.Second), cap.WritesPerSecond; minExpected > a {
+		t.Errorf("expected cap.WritesPerSecond >= %f, got %f", minExpected, a)
+	}
+	bpr2 := cap.BytesPerReplica
+	if bpr2.P10 <= bpr1.P10 {
+		t.Errorf("expected BytesPerReplica to have increased from %+v, but got %+v", bpr1, bpr2)
+	}
+	if bpr2.P10 != bpr2.P25 || bpr2.P10 != bpr2.P50 || bpr2.P10 != bpr2.P75 || bpr2.P10 != bpr2.P90 {
+		t.Errorf("expected all bytes-per-replica percentiles to be identical, got %+v", bpr2)
+	}
+	wpr2 := cap.WritesPerReplica
+	if wpr2.P10 <= wpr1.P10 {
+		t.Errorf("expected WritesPerReplica to have increased from %+v, but got %+v", wpr1, wpr2)
+	}
+	if wpr2.P10 != wpr2.P25 || wpr2.P10 != wpr2.P50 || wpr2.P10 != wpr2.P75 || wpr2.P10 != wpr2.P90 {
+		t.Errorf("expected all writes-per-replica percentiles to be identical, got %+v", wpr2)
+	}
+	if wpr2.P10 != cap.WritesPerSecond {
+		t.Errorf("expected WritesPerReplica.percentiles to equal cap.WritesPerSecond, but got %f and %f",
+			wpr2.P10, cap.WritesPerSecond)
+	}
+
+	// Split the range to verify stats work properly with more than one range.
+	sArgs := adminSplitArgs(key)
+	if _, pErr := client.SendWrapped(context.Background(), rg1(s), sArgs); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	cap, err = s.Capacity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e, a := int32(2), cap.RangeCount; e != a {
+		t.Errorf("expected cap.RangeCount=%d, got %d", e, a)
+	}
+	if e, a := int32(2), cap.LeaseCount; e != a {
+		t.Errorf("expected cap.LeaseCount=%d, got %d", e, a)
+	}
+	{
+		bpr := cap.BytesPerReplica
+		if bpr.P10 != bpr.P25 {
+			t.Errorf("expected BytesPerReplica p10 and p25 to be equal with 2 replicas, got %+v", bpr)
+		}
+		if bpr.P50 != bpr.P75 || bpr.P50 != bpr.P90 {
+			t.Errorf("expected BytesPerReplica p50, p75, and p90 to be equal with 2 replicas, got %+v", bpr)
+		}
+		if bpr.P10 == bpr.P90 {
+			t.Errorf("expected BytesPerReplica p10 and p90 to be different with 2 replicas, got %+v", bpr)
+		}
+	}
+}
+
+// TestRangeLookupAfterMeta2Split verifies that RangeLookup scans succeed even
+// when user ranges span the boundary of two split meta2 ranges. We test this
+// with forward and reverse ScanRequests so that we test both forward and
+// reverse RangeLookups. In the case of both the RangeLookup scan directions,
+// the forward part of the scan will need to continue onto a second range to
+// find the desired RangeDescriptor (remember that a reverse RangeLookup
+// includes an initial forward scan).
+func TestRangeLookupAfterMeta2Split(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	srv, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := srv.(*server.TestServer)
+	defer s.Stopper().Stop(ctx)
+
+	// Create a split at /Table/48 and /Meta2/Table/51. This creates:
+	//   meta ranges [/Min-/Meta2/Table/51) and [/Meta2/Table/51-/System)
+	//   user ranges [/Table/19-/Table/48)  and [/Table/48-/Max)
+	//
+	// Note that the two boundaries are offset such that a lookup for key /Table/49
+	// will first search for meta(/Table/49) which is on the left meta2 range. However,
+	// the user range [/Table/48-/Max) is stored on the right meta2 range, so the lookup
+	// will require a scan that continues into the next meta2 range.
+	const tableID = keys.MaxReservedDescID + 2 // 51
+	splitReq := adminSplitArgs(keys.MakeTablePrefix(tableID - 3 /* 48 */))
+	if _, pErr := client.SendWrapped(ctx, s.DistSender(), splitReq); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	metaKey := keys.RangeMetaKey(keys.MakeTablePrefix(tableID)).AsRawKey()
+	splitReq = adminSplitArgs(metaKey)
+	if _, pErr := client.SendWrapped(ctx, s.DistSender(), splitReq); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	for _, rev := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reverse=%t", rev), func(t *testing.T) {
+			// Clear the RangeDescriptorCache so that no cached descriptors are
+			// available from previous lookups.
+			s.DistSender().RangeDescriptorCache().Clear()
+
+			// Scan from [/Table/49-/Table/50) both forwards and backwards.
+			// Either way, the resulting RangeLookup scan will be forced to
+			// perform a continuation lookup.
+			scanStart := roachpb.Key(keys.MakeTablePrefix(tableID - 2)) // 49
+			scanEnd := scanStart.PrefixEnd()                            // 50
+			span := roachpb.Span{
+				Key:    scanStart,
+				EndKey: scanEnd,
+			}
+
+			var lookupReq roachpb.Request
+			if rev {
+				// A ReverseScanRequest will trigger a reverse RangeLookup scan.
+				lookupReq = &roachpb.ReverseScanRequest{Span: span}
+			} else {
+				lookupReq = &roachpb.ScanRequest{Span: span}
+			}
+			if _, err := client.SendWrapped(ctx, s.DistSender(), lookupReq); err != nil {
+				t.Fatalf("%T %v", err.GoError(), err)
 			}
 		})
 	}

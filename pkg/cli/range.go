@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package cli
 
@@ -66,7 +64,7 @@ func runLsRanges(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			panic(err)
 		}
-		startKey = keys.RangeMetaKey(rk)
+		startKey = keys.RangeMetaKey(rk).AsRawKey()
 	}
 	endKey := keys.Meta2Prefix.PrefixEnd()
 

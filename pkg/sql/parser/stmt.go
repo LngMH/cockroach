@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // This code was derived from https://github.com/youtube/vitess.
 //
@@ -80,6 +78,14 @@ type HiddenFromStats interface {
 	hiddenFromStats()
 }
 
+// HiddenFromShowQueries is a pseudo-interface to be implemented
+// by statements that should not show up in SHOW QUERIES (and are hence
+// not cancellable using CANCEL QUERY either). Usually implemented by
+// statements that spawn jobs.
+type HiddenFromShowQueries interface {
+	hiddenFromShowQueries()
+}
+
 // IndependentFromParallelizedPriors is a pseudo-interface to be implemented
 // by statements which do not force parallel statement execution synchronization
 // when they run.
@@ -93,11 +99,15 @@ func (*AlterTable) StatementType() StatementType { return DDL }
 // StatementTag returns a short string identifying the type of statement.
 func (*AlterTable) StatementTag() string { return "ALTER TABLE" }
 
+func (*AlterTable) hiddenFromShowQueries() {}
+
 // StatementType implements the Statement interface.
 func (*Backup) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*Backup) StatementTag() string { return "BACKUP" }
+
+func (*Backup) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
 func (*BeginTransaction) StatementType() StatementType { return Ack }
@@ -253,6 +263,12 @@ func (n *Insert) StatementType() StatementType { return n.Returning.statementTyp
 func (*Insert) StatementTag() string { return "INSERT" }
 
 // StatementType implements the Statement interface.
+func (n *Import) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*Import) StatementTag() string { return "IMPORT" }
+
+// StatementType implements the Statement interface.
 func (*ParenSelect) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -321,6 +337,8 @@ func (*Restore) StatementType() StatementType { return Rows }
 // StatementTag returns a short string identifying the type of statement.
 func (*Restore) StatementTag() string { return "RESTORE" }
 
+func (*Restore) hiddenFromShowQueries() {}
+
 // StatementType implements the Statement interface.
 func (*ResumeJob) StatementType() StatementType { return Ack }
 
@@ -364,6 +382,12 @@ func (*Scatter) StatementType() StatementType { return Rows }
 func (*Scatter) StatementTag() string { return "SCATTER" }
 
 // StatementType implements the Statement interface.
+func (*Scrub) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (n *Scrub) StatementTag() string { return "SCRUB" }
+
+// StatementType implements the Statement interface.
 func (*Select) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -376,12 +400,18 @@ func (*SelectClause) StatementType() StatementType { return Rows }
 func (*SelectClause) StatementTag() string { return "SELECT" }
 
 // StatementType implements the Statement interface.
-func (*Set) StatementType() StatementType { return Ack }
+func (*SetVar) StatementType() StatementType { return Ack }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*Set) StatementTag() string { return "SET" }
+func (*SetVar) StatementTag() string { return "SET" }
 
-func (*Set) hiddenFromStats() {}
+func (*SetVar) hiddenFromStats() {}
+
+// StatementType implements the Statement interface.
+func (*SetClusterSetting) StatementType() StatementType { return Ack }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*SetClusterSetting) StatementTag() string { return "SET CLUSTER SETTING" }
 
 // StatementType implements the Statement interface.
 func (*SetTransaction) StatementType() StatementType { return Ack }
@@ -392,6 +422,12 @@ func (*SetTransaction) StatementTag() string { return "SET TRANSACTION" }
 func (*SetTransaction) hiddenFromStats() {}
 
 // StatementType implements the Statement interface.
+func (*SetZoneConfig) StatementType() StatementType { return RowsAffected }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*SetZoneConfig) StatementTag() string { return "CONFIGURE ZONE" }
+
+// StatementType implements the Statement interface.
 func (*SetDefaultIsolation) StatementType() StatementType { return Ack }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -400,13 +436,22 @@ func (*SetDefaultIsolation) StatementTag() string { return "SET" }
 func (*SetDefaultIsolation) hiddenFromStats() {}
 
 // StatementType implements the Statement interface.
-func (*Show) StatementType() StatementType { return Rows }
+func (*ShowVar) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*Show) StatementTag() string { return "SHOW" }
+func (*ShowVar) StatementTag() string { return "SHOW" }
 
-func (*Show) hiddenFromStats()                   {}
-func (*Show) independentFromParallelizedPriors() {}
+func (*ShowVar) hiddenFromStats()                   {}
+func (*ShowVar) independentFromParallelizedPriors() {}
+
+// StatementType implements the Statement interface.
+func (*ShowClusterSetting) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowClusterSetting) StatementTag() string { return "SHOW" }
+
+func (*ShowClusterSetting) hiddenFromStats()                   {}
+func (*ShowClusterSetting) independentFromParallelizedPriors() {}
 
 // StatementType implements the Statement interface.
 func (*ShowColumns) StatementType() StatementType { return Rows }
@@ -525,6 +570,12 @@ func (*ShowUsers) hiddenFromStats()                   {}
 func (*ShowUsers) independentFromParallelizedPriors() {}
 
 // StatementType implements the Statement interface.
+func (*ShowZoneConfig) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowZoneConfig) StatementTag() string { return "SHOW ZONE CONFIGURATION" }
+
+// StatementType implements the Statement interface.
 func (*ShowRanges) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -539,15 +590,6 @@ func (*ShowFingerprints) StatementType() StatementType { return Rows }
 func (*ShowFingerprints) StatementTag() string { return "SHOW EXPERIMENTAL_FINGERPRINTS" }
 
 func (*ShowFingerprints) independentFromParallelizedPriors() {}
-
-// StatementType implements the Statement interface.
-func (*Help) StatementType() StatementType { return Rows }
-
-// StatementTag returns a short string identifying the type of statement.
-func (*Help) StatementTag() string { return "HELP" }
-
-func (*Help) hiddenFromStats()                   {}
-func (*Help) independentFromParallelizedPriors() {}
 
 // StatementType implements the Statement interface.
 func (*ShowConstraints) StatementType() StatementType { return Rows }
@@ -626,8 +668,8 @@ func (n *DropUser) String() string                 { return AsString(n) }
 func (n *Execute) String() string                  { return AsString(n) }
 func (n *Explain) String() string                  { return AsString(n) }
 func (n *Grant) String() string                    { return AsString(n) }
-func (n *Help) String() string                     { return AsString(n) }
 func (n *Insert) String() string                   { return AsString(n) }
+func (n *Import) String() string                   { return AsString(n) }
 func (n *ParenSelect) String() string              { return AsString(n) }
 func (n *PauseJob) String() string                 { return AsString(n) }
 func (n *Prepare) String() string                  { return AsString(n) }
@@ -644,28 +686,33 @@ func (n *RollbackToSavepoint) String() string      { return AsString(n) }
 func (n *RollbackTransaction) String() string      { return AsString(n) }
 func (n *Savepoint) String() string                { return AsString(n) }
 func (n *Scatter) String() string                  { return AsString(n) }
+func (n *Scrub) String() string                    { return AsString(n) }
 func (n *Select) String() string                   { return AsString(n) }
 func (n *SelectClause) String() string             { return AsString(n) }
-func (n *Set) String() string                      { return AsString(n) }
+func (n *SetClusterSetting) String() string        { return AsString(n) }
+func (n *SetZoneConfig) String() string            { return AsString(n) }
 func (n *SetDefaultIsolation) String() string      { return AsString(n) }
 func (n *SetTransaction) String() string           { return AsString(n) }
-func (n *Show) String() string                     { return AsString(n) }
+func (n *SetVar) String() string                   { return AsString(n) }
 func (n *ShowBackup) String() string               { return AsString(n) }
+func (n *ShowClusterSetting) String() string       { return AsString(n) }
 func (n *ShowColumns) String() string              { return AsString(n) }
+func (n *ShowConstraints) String() string          { return AsString(n) }
 func (n *ShowCreateTable) String() string          { return AsString(n) }
 func (n *ShowCreateView) String() string           { return AsString(n) }
 func (n *ShowDatabases) String() string            { return AsString(n) }
 func (n *ShowGrants) String() string               { return AsString(n) }
 func (n *ShowIndex) String() string                { return AsString(n) }
-func (n *ShowConstraints) String() string          { return AsString(n) }
-func (n *ShowQueries) String() string              { return AsString(n) }
 func (n *ShowJobs) String() string                 { return AsString(n) }
+func (n *ShowQueries) String() string              { return AsString(n) }
+func (n *ShowRanges) String() string               { return AsString(n) }
 func (n *ShowSessions) String() string             { return AsString(n) }
 func (n *ShowTables) String() string               { return AsString(n) }
 func (n *ShowTrace) String() string                { return AsString(n) }
 func (n *ShowTransactionStatus) String() string    { return AsString(n) }
 func (n *ShowUsers) String() string                { return AsString(n) }
-func (n *ShowRanges) String() string               { return AsString(n) }
+func (n *ShowVar) String() string                  { return AsString(n) }
+func (n *ShowZoneConfig) String() string           { return AsString(n) }
 func (n *ShowFingerprints) String() string         { return AsString(n) }
 func (n *Split) String() string                    { return AsString(n) }
 func (l StatementList) String() string             { return AsString(l) }

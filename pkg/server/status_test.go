@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package server
 
@@ -21,7 +18,6 @@ import (
 	"bytes"
 	"fmt"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"strconv"
 	"testing"
@@ -48,12 +44,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 func getStatusJSONProto(
-	ts serverutils.TestServerInterface, path string, response proto.Message,
+	ts serverutils.TestServerInterface, path string, response protoutil.Message,
 ) error {
 	return serverutils.GetJSONProto(ts, statusPrefix+path, response)
 }
@@ -353,7 +350,7 @@ func TestNodeStatusResponse(t *testing.T) {
 	if len(nodeStatuses) != 1 {
 		t.Errorf("too many node statuses returned - expected:1 actual:%d", len(nodeStatuses))
 	}
-	if !reflect.DeepEqual(s.node.Descriptor, nodeStatuses[0].Desc) {
+	if !proto.Equal(&s.node.Descriptor, &nodeStatuses[0].Desc) {
 		t.Errorf("node status descriptors are not equal\nexpected:%+v\nactual:%+v\n", s.node.Descriptor, nodeStatuses[0].Desc)
 	}
 
@@ -364,7 +361,7 @@ func TestNodeStatusResponse(t *testing.T) {
 		if err := getStatusJSONProto(s, "nodes/"+oldNodeStatus.Desc.NodeID.String(), &nodeStatus); err != nil {
 			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(s.node.Descriptor, nodeStatus.Desc) {
+		if !proto.Equal(&s.node.Descriptor, &nodeStatus.Desc) {
 			t.Errorf("node status descriptors are not equal\nexpected:%+v\nactual:%+v\n", s.node.Descriptor, nodeStatus.Desc)
 		}
 	}
@@ -374,25 +371,27 @@ func TestNodeStatusResponse(t *testing.T) {
 // as time series data.
 func TestMetricsRecording(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+
 	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{
 		MetricsSampleInterval: 5 * time.Millisecond})
-	defer s.Stopper().Stop(context.TODO())
-
-	checkTimeSeriesKey := func(now int64, keyName string) error {
-		key := ts.MakeDataKey(keyName, "", ts.Resolution10s, now)
-		data := roachpb.InternalTimeSeriesData{}
-		return kvDB.GetProto(context.TODO(), key, &data)
-	}
+	defer s.Stopper().Stop(ctx)
 
 	// Verify that metrics for the current timestamp are recorded. This should
 	// be true very quickly.
 	testutils.SucceedsSoon(t, func() error {
 		now := s.Clock().PhysicalNow()
-		if err := checkTimeSeriesKey(now, "cr.store.livebytes.1"); err != nil {
-			return err
-		}
-		if err := checkTimeSeriesKey(now, "cr.node.sys.go.allocbytes.1"); err != nil {
-			return err
+
+		var data roachpb.InternalTimeSeriesData
+		for _, keyName := range []string{
+			"cr.store.livebytes.1",
+			"cr.node.sys.go.allocbytes.1",
+		} {
+			key := ts.MakeDataKey(keyName, "", ts.Resolution10s, now)
+			if err := kvDB.GetProto(ctx, key, &data); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -432,7 +431,7 @@ func TestRangesResponse(t *testing.T) {
 	for _, ri := range response.Ranges {
 		// Do some simple validation based on the fact that this is a
 		// single-node cluster.
-		if ri.RaftState.State != "StateLeader" && ri.RaftState.State != "StateDormant" {
+		if ri.RaftState.State != "StateLeader" && ri.RaftState.State != raftStateDormant {
 			t.Errorf("expected to be Raft leader or dormant, but was '%s'", ri.RaftState.State)
 		}
 		expReplica := roachpb.ReplicaDescriptor{
@@ -449,8 +448,8 @@ func TestRangesResponse(t *testing.T) {
 		if ri.State.LastIndex == 0 {
 			t.Error("expected positive LastIndex")
 		}
-		if e, a := 1, len(ri.LeaseHistory); e != a {
-			t.Errorf("expected a lease history length of %d, actual %d\n%+v", e, a, ri)
+		if len(ri.LeaseHistory) == 0 {
+			t.Error("expected at least one lease history entry")
 		}
 	}
 }
@@ -523,7 +522,7 @@ func TestSpanStatsResponse(t *testing.T) {
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.TODO())
 
-	httpClient, err := ts.GetHTTPClient()
+	httpClient, err := ts.GetAuthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -555,7 +554,7 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 
 	rpcStopper := stop.NewStopper()
 	defer rpcStopper.Stop(context.TODO())
-	rpcContext := rpc.NewContext(log.AmbientContext{}, ts.RPCContext().Config, ts.Clock(), rpcStopper)
+	rpcContext := rpc.NewContext(log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, ts.RPCContext().Config, ts.Clock(), rpcStopper)
 	request := serverpb.SpanStatsRequest{
 		NodeID:   "1",
 		StartKey: []byte(roachpb.RKeyMin),
@@ -588,7 +587,7 @@ func TestNodesGRPCResponse(t *testing.T) {
 	defer ts.Stopper().Stop(context.TODO())
 
 	rootConfig := testutils.NewTestBaseContext(security.RootUser)
-	rpcContext := rpc.NewContext(log.AmbientContext{}, rootConfig, ts.Clock(), ts.Stopper())
+	rpcContext := rpc.NewContext(log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, rootConfig, ts.Clock(), ts.Stopper())
 	var request serverpb.NodesRequest
 
 	url := ts.ServingAddr()
@@ -605,18 +604,6 @@ func TestNodesGRPCResponse(t *testing.T) {
 
 	if a, e := len(response.Nodes), 1; a != e {
 		t.Errorf("expected %d node(s), found %d", e, a)
-	}
-}
-
-func TestHandleDebugRange(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s := startServer(t)
-	defer s.Stopper().Stop(context.TODO())
-
-	if body, err := getText(s, s.AdminURL()+rangeDebugEndpoint+"?id=1"); err != nil {
-		t.Fatal(err)
-	} else if !bytes.Contains(body, []byte("<TITLE>Range ID:1</TITLE>")) {
-		t.Errorf("expected \"<title>Range Id: 1</title>\" got: \n%s", body)
 	}
 }
 
@@ -667,5 +654,62 @@ func TestCertificatesResponse(t *testing.T) {
 	} else if a, e := cert.Data, nodeFile; !bytes.Equal(a, e) {
 		t.Errorf("mismatched contents: %s vs %s", a, e)
 	}
+}
 
+func TestRangeResponse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer storage.EnableLeaseHistory(100)()
+	ts := startServer(t)
+	defer ts.Stopper().Stop(context.TODO())
+
+	// Perform a scan to ensure that all the raft groups are initialized.
+	if _, err := ts.db.Scan(context.Background(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	var response serverpb.RangeResponse
+	if err := getStatusJSONProto(ts, "range/1", &response); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is a single node cluster, so only expect a single response.
+	if e, a := 1, len(response.ResponsesByNodeID); e != a {
+		t.Errorf("got the wrong number of responses, expected %d, actual %d", e, a)
+	}
+
+	node1Response := response.ResponsesByNodeID[response.NodeID]
+
+	// The response should come back as valid.
+	if !node1Response.Response {
+		t.Errorf("node1's response returned as false, expected true")
+	}
+
+	// The response should include just the one range.
+	if e, a := 1, len(node1Response.Infos); e != a {
+		t.Errorf("got the wrong number of ranges in the response, expected %d, actual %d", e, a)
+	}
+
+	info := node1Response.Infos[0]
+	expReplica := roachpb.ReplicaDescriptor{
+		NodeID:    1,
+		StoreID:   1,
+		ReplicaID: 1,
+	}
+
+	// Check some other values.
+	if len(info.State.Desc.Replicas) != 1 || info.State.Desc.Replicas[0] != expReplica {
+		t.Errorf("unexpected replica list %+v", info.State.Desc.Replicas)
+	}
+
+	if info.State.Lease == nil || *info.State.Lease == (roachpb.Lease{}) {
+		t.Error("expected a nontrivial Lease")
+	}
+
+	if info.State.LastIndex == 0 {
+		t.Error("expected positive LastIndex")
+	}
+
+	if len(info.LeaseHistory) == 0 {
+		t.Error("expected at least one lease history entry")
+	}
 }

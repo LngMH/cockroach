@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package distsqlrun
 
@@ -112,7 +109,7 @@ func (eh *exprHelper) IndexedVarResolvedType(idx int) parser.Type {
 
 // IndexedVarEval is part of the parser.IndexedVarContainer interface.
 func (eh *exprHelper) IndexedVarEval(idx int, ctx *parser.EvalContext) (parser.Datum, error) {
-	err := eh.row[idx].EnsureDecoded(&eh.datumAlloc)
+	err := eh.row[idx].EnsureDecoded(&eh.types[idx], &eh.datumAlloc)
 	if err != nil {
 		return nil, err
 	}

@@ -11,10 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package sqlbase
 
@@ -22,11 +18,12 @@ import (
 	"fmt"
 	"strings"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
 // Cockroach error extensions:
@@ -126,18 +123,14 @@ func IsUndefinedDatabaseError(err error) bool {
 	return errHasCode(err, pgerror.CodeInvalidCatalogNameError)
 }
 
-// NewUndefinedTableError creates an error that represents a missing database table.
-func NewUndefinedTableError(name string) error {
-	return pgerror.NewErrorf(pgerror.CodeUndefinedTableError, "table %q does not exist", name)
+// NewUndefinedRelationError creates an error that represents a missing database table or view.
+func NewUndefinedRelationError(name parser.NodeFormatter) error {
+	return pgerror.NewErrorf(pgerror.CodeUndefinedTableError,
+		"relation %q does not exist", parser.ErrString(name))
 }
 
-// NewUndefinedViewError creates an error that represents a missing database view.
-func NewUndefinedViewError(name string) error {
-	return pgerror.NewErrorf(pgerror.CodeUndefinedTableError, "view %q does not exist", name)
-}
-
-// IsUndefinedTableError returns true if the error is for an undefined table.
-func IsUndefinedTableError(err error) bool {
+// IsUndefinedRelationError returns true if the error is for an undefined table.
+func IsUndefinedRelationError(err error) bool {
 	return errHasCode(err, pgerror.CodeUndefinedTableError)
 }
 
@@ -152,8 +145,9 @@ func NewRelationAlreadyExistsError(name string) error {
 }
 
 // NewWrongObjectTypeError creates a wrong object type error.
-func NewWrongObjectTypeError(name, desiredObjType string) error {
-	return pgerror.NewErrorf(pgerror.CodeWrongObjectTypeError, "%q is not a %s", name, desiredObjType)
+func NewWrongObjectTypeError(name *parser.TableName, desiredObjType string) error {
+	return pgerror.NewErrorf(pgerror.CodeWrongObjectTypeError, "%q is not a %s",
+		parser.ErrString(name), desiredObjType)
 }
 
 // NewSyntaxError creates a syntax error.
@@ -203,6 +197,16 @@ func NewStatementCompletionUnknownError(err *roachpb.AmbiguousResultError) error
 	return pgerror.NewErrorf(pgerror.CodeStatementCompletionUnknownError, err.Error())
 }
 
+// NewQueryCanceledError creates a query cancellation error.
+func NewQueryCanceledError() error {
+	return pgerror.NewErrorf(pgerror.CodeQueryCanceledError, "query execution canceled")
+}
+
+// IsQueryCanceledError checks whether this is a query canceled error.
+func IsQueryCanceledError(err error) bool {
+	return errHasCode(err, pgerror.CodeQueryCanceledError) || strings.Contains(err.Error(), "query execution canceled")
+}
+
 func errHasCode(err error, code string) bool {
 	if pgErr, ok := pgerror.GetPGCause(err); ok {
 		return pgErr.Code == code
@@ -210,24 +214,43 @@ func errHasCode(err error, code string) bool {
 	return false
 }
 
+// singleKVFetcher is a kvFetcher that returns a single kv.
+type singleKVFetcher struct {
+	kv   roachpb.KeyValue
+	done bool
+}
+
+// nextKV implements the kvFetcher interface.
+func (f *singleKVFetcher) nextKV(ctx context.Context) (bool, roachpb.KeyValue, error) {
+	if f.done {
+		return false, roachpb.KeyValue{}, nil
+	}
+	f.done = true
+	return true, f.kv, nil
+}
+
+// getRangesInfo implements the kvFetcher interface.
+func (f *singleKVFetcher) getRangesInfo() []roachpb.RangeInfo {
+	panic("getRangesInfo() called on singleKVFetcher")
+}
+
 // ConvertBatchError returns a user friendly constraint violation error.
-func ConvertBatchError(tableDesc *TableDescriptor, b *client.Batch) error {
+func ConvertBatchError(ctx context.Context, tableDesc *TableDescriptor, b *client.Batch) error {
 	origPErr := b.MustPErr()
 	if origPErr.Index == nil {
 		return origPErr.GoError()
 	}
-	index := origPErr.Index.Index
-	if index >= int32(len(b.Results)) {
-		panic(fmt.Sprintf("index %d outside of results: %+v", index, b.Results))
+	j := origPErr.Index.Index
+	if j >= int32(len(b.Results)) {
+		panic(fmt.Sprintf("index %d outside of results: %+v", j, b.Results))
 	}
-	result := b.Results[index]
-	var alloc DatumAlloc
-	if _, ok := origPErr.GetDetail().(*roachpb.ConditionFailedError); ok && len(result.Rows) > 0 {
-		row := result.Rows[0]
+	result := b.Results[j]
+	if cErr, ok := origPErr.GetDetail().(*roachpb.ConditionFailedError); ok && len(result.Rows) > 0 {
+		key := result.Rows[0].Key
 		// TODO(dan): There's too much internal knowledge of the sql table
 		// encoding here (and this callsite is the only reason
 		// DecodeIndexKeyPrefix is exported). Refactor this bit out.
-		indexID, key, err := DecodeIndexKeyPrefix(&alloc, tableDesc, row.Key)
+		indexID, _, err := DecodeIndexKeyPrefix(tableDesc, key)
 		if err != nil {
 			return err
 		}
@@ -235,29 +258,36 @@ func ConvertBatchError(tableDesc *TableDescriptor, b *client.Batch) error {
 		if err != nil {
 			return err
 		}
-		vals, err := MakeEncodedKeyVals(tableDesc, index.ColumnIDs)
+		var rf RowFetcher
+		colIdxMap := make(map[ColumnID]int, len(index.ColumnIDs))
+		cols := make([]ColumnDescriptor, len(index.ColumnIDs))
+		valNeededForCol := make([]bool, len(index.ColumnIDs))
+		for i, colID := range index.ColumnIDs {
+			colIdxMap[colID] = i
+			col, err := tableDesc.FindColumnByID(colID)
+			if err != nil {
+				return err
+			}
+			cols[i] = *col
+			valNeededForCol[i] = true
+		}
+		if err := rf.Init(tableDesc, colIdxMap, index, false, /* reverse */
+			indexID != tableDesc.PrimaryIndex.ID /* isSecondaryIndex */, cols, valNeededForCol,
+			false /* returnRangeInfo */, &DatumAlloc{}); err != nil {
+			return err
+		}
+		f := singleKVFetcher{kv: roachpb.KeyValue{Key: key}}
+		if cErr.ActualValue != nil {
+			f.kv.Value = *cErr.ActualValue
+		}
+		// Use the RowFetcher to decode the single kv pair above by passing in
+		// this singleKVFetcher implementation, which doesn't actually hit KV.
+		if err := rf.StartScanFrom(ctx, &f); err != nil {
+			return err
+		}
+		decodedVals, err := rf.NextRowDecoded(ctx)
 		if err != nil {
 			return err
-		}
-		dirs := make([]encoding.Direction, 0, len(index.ColumnIDs))
-		for _, dir := range index.ColumnDirections {
-			convertedDir, err := dir.ToEncodingDirection()
-			if err != nil {
-				return err
-			}
-			dirs = append(dirs, convertedDir)
-		}
-		if _, err := DecodeKeyVals(vals, dirs, key); err != nil {
-			return err
-		}
-		decodedVals := make([]parser.Datum, len(vals))
-		var da DatumAlloc
-		for i, val := range vals {
-			err := val.EnsureDecoded(&da)
-			if err != nil {
-				return err
-			}
-			decodedVals[i] = val.Datum
 		}
 		return NewUniquenessConstraintViolationError(index, decodedVals)
 	}

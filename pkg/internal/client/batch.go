@@ -11,15 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package client
 
 import (
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 const (
@@ -134,7 +134,7 @@ func (b *Batch) initResult(calls, numRows int, raw bool, err error) {
 
 // fillResults walks through the results and updates them either with the
 // data or error which was the result of running the batch previously.
-func (b *Batch) fillResults() error {
+func (b *Batch) fillResults(ctx context.Context) error {
 	offset := 0
 	for i := range b.Results {
 		result := &b.Results[i]
@@ -266,6 +266,10 @@ func (b *Batch) fillResults() error {
 			// Fill up the resume span.
 			if result.Err == nil && reply != nil && reply.Header().ResumeSpan != nil {
 				result.ResumeSpan = *reply.Header().ResumeSpan
+				if reply.Header().ResumeReason == roachpb.RESUME_UNKNOWN {
+					log.Fatalf(ctx, "reply has ResumeSpan but no ResumeReason: %s", result)
+				}
+				result.ResumeReason = reply.Header().ResumeReason
 			}
 			// Fill up the RangeInfos, in case we got any.
 			if result.Err == nil && reply != nil {
@@ -370,7 +374,7 @@ func (b *Batch) put(key, value interface{}, inline bool) {
 // and Result.Err will indicate success or failure.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc).
+// protoutil.Message or any Go primitive type (bool, int, etc).
 func (b *Batch) Put(key, value interface{}) {
 	b.put(key, value, false)
 }
@@ -384,7 +388,7 @@ func (b *Batch) Put(key, value interface{}) {
 // and Result.Err will indicate success or failure.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc).
+// protoutil.Message or any Go primitive type (bool, int, etc).
 func (b *Batch) PutInline(key, value interface{}) {
 	b.put(key, value, true)
 }
@@ -398,7 +402,7 @@ func (b *Batch) PutInline(key, value interface{}) {
 // and Result.Err will indicate success or failure.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc).
+// protoutil.Message or any Go primitive type (bool, int, etc).
 func (b *Batch) CPut(key, value, expValue interface{}) {
 	k, err := marshalKey(key)
 	if err != nil {
@@ -419,13 +423,15 @@ func (b *Batch) CPut(key, value, expValue interface{}) {
 	b.initResult(1, 1, notRaw, nil)
 }
 
-// InitPut sets the first value for a key to value. An error is reported if a
-// value already exists for the key and it's not equal to the value passed in.
+// InitPut sets the first value for a key to value. An ConditionFailedError is
+// reported if a value already exists for the key and it's not equal to the
+// value passed in. If failOnTombstones is set to true, tombstones will return
+// a ConditionFailedError just like a mismatched value.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc). It is illegal to
-// set value to nil.
-func (b *Batch) InitPut(key, value interface{}) {
+// protoutil.Message or any Go primitive type (bool, int, etc). It is illegal
+// to set value to nil.
+func (b *Batch) InitPut(key, value interface{}, failOnTombstones bool) {
 	k, err := marshalKey(key)
 	if err != nil {
 		b.initResult(0, 1, notRaw, err)
@@ -436,7 +442,7 @@ func (b *Batch) InitPut(key, value interface{}) {
 		b.initResult(0, 1, notRaw, err)
 		return
 	}
-	b.appendReqs(roachpb.NewInitPut(k, v))
+	b.appendReqs(roachpb.NewInitPut(k, v, failOnTombstones))
 	b.initResult(1, 1, notRaw, nil)
 }
 

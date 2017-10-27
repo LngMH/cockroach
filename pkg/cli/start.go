@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrew Bonventre (andybons@gmail.com)
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package cli
 
@@ -23,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -30,32 +28,37 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
+	humanize "github.com/dustin/go-humanize"
+	"github.com/elastic/gosigar"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // jemallocHeapDump is an optional function to be called at heap dump time.
@@ -79,21 +82,6 @@ uninitialized, specify the --join flag to point to any healthy node
 `,
 	Example: `  cockroach start --insecure --store=attrs=ssd,path=/mnt/ssd1 [--join=host:port,[host:port]]`,
 	RunE:    MaybeShoutError(MaybeDecorateGRPCError(runStart)),
-}
-
-func setDefaultSizeParameters(ctx *server.Config) {
-	if size, err := server.GetTotalMemory(context.Background()); err == nil {
-		// Default the cache size to 1/4 of total memory. A larger cache size
-		// doesn't necessarily improve performance as this is memory that is
-		// dedicated to uncompressed blocks in RocksDB. A larger value here will
-		// compete with the OS buffer cache which holds compressed blocks.
-		ctx.CacheSize = size / 4
-
-		// Default the SQL memory pool size to 1/4 of total memory. Again
-		// we do not want to allow too much lest this will pressure
-		// against OS buffers and decrease overall client throughput.
-		ctx.SQLMemoryPoolSize = size / 4
-	}
 }
 
 // maxSizePerProfile is the maximum total size in bytes for profiles per
@@ -215,7 +203,7 @@ func initCPUProfile(ctx context.Context, dir string) {
 	}
 
 	go func() {
-		defer log.RecoverAndReportPanic(ctx)
+		defer log.RecoverAndReportPanic(ctx, &serverCfg.Settings.SV)
 
 		ctx := context.Background()
 
@@ -275,10 +263,224 @@ func initBlockProfile() {
 	runtime.SetBlockProfileRate(int(d))
 }
 
-// ErrorCode is the value to be used by main() as exit code in case of
-// error. For most errors 1 is appropriate, but a signal termination
-// can change this.
-var ErrorCode = 1
+type percentResolverFunc func(percent int) (int64, error)
+
+// bytesOrPercentageValue is a flag that accepts an integer value, an integer
+// plus a unit (e.g. 32GB or 32GiB) or a percentage (e.g. 32%). In all these
+// cases, it transforms the string flag input into an int64 value.
+//
+// Since it accepts a percentage, instances need to be configured with
+// instructions on how to resolve a percentage to a number (i.e. the answer to
+// the question "a percentage of what?"). This is done by taking in a
+// percentResolverFunc. There are predefined ones: memoryPercentResolver and
+// diskPercentResolverFactory.
+//
+// bytesOrPercentageValue can be used in two ways:
+// 1. Upon flag parsing, it can write an int64 value through a pointer specified
+// by the caller.
+// 2. It can store the flag value as a string and only convert it to an int64 on
+// a subsequent Resolve() call. Input validation still happens at flag parsing
+// time.
+//
+// Option 2 is useful when percentages cannot be resolved at flag parsing time.
+// For example, we have flags that can be expressed as percentages of the
+// capacity of storage device. Which storage device is in question might only be
+// known once other flags are parsed (e.g. --max-disk-temp-storage=10% depends
+// on --store).
+type bytesOrPercentageValue struct {
+	val  *int64
+	bval *humanizeutil.BytesValue
+
+	origVal string
+
+	// percentResolver is used to turn a percent string into a value. See
+	// memoryPercentResolver() and diskPercentResolverFactory().
+	percentResolver percentResolverFunc
+}
+
+// memoryPercentResolver turns a percent into the respective fraction of the
+// system's internal memory.
+func memoryPercentResolver(percent int) (int64, error) {
+	sizeBytes, err := server.GetTotalMemory(context.TODO())
+	if err != nil {
+		return 0, err
+	}
+	return (sizeBytes * int64(percent)) / 100, nil
+}
+
+// diskPercentResolverFactory takes in a path and produces a percentResolverFunc
+// bound to the respective storage device.
+//
+// An error is returned if dir does not exist.
+func diskPercentResolverFactory(dir string) (percentResolverFunc, error) {
+	fileSystemUsage := gosigar.FileSystemUsage{}
+	if err := fileSystemUsage.Get(dir); err != nil {
+		return nil, err
+	}
+	if fileSystemUsage.Total > math.MaxInt64 {
+		return nil, fmt.Errorf("unsupported disk size %s, max supported size is %s",
+			humanize.IBytes(fileSystemUsage.Total), humanizeutil.IBytes(math.MaxInt64))
+	}
+	deviceCapacity := int64(fileSystemUsage.Total)
+
+	return func(percent int) (int64, error) {
+		return (deviceCapacity * int64(percent)) / 100, nil
+	}, nil
+}
+
+// newBytesOrPercentageValue creates a bytesOrPercentageValue.
+//
+// v and percentResolver can be nil (either they're both specified or they're
+// both nil). If they're nil, then Resolve() has to be called later to get the
+// passed-in value.
+func newBytesOrPercentageValue(
+	v *int64, percentResolver func(percent int) (int64, error),
+) *bytesOrPercentageValue {
+	if v == nil {
+		v = new(int64)
+	}
+	return &bytesOrPercentageValue{
+		val:             v,
+		bval:            humanizeutil.NewBytesValue(v),
+		percentResolver: percentResolver,
+	}
+}
+
+func (b *bytesOrPercentageValue) Set(s string) error {
+	b.origVal = s
+	if strings.HasSuffix(s, "%") {
+		percent, err := strconv.Atoi(s[:len(s)-1])
+		if err != nil {
+			return err
+		}
+		if percent < 0 || percent > 99 {
+			return fmt.Errorf("percentage %s out of range 0%% - 99%%", s)
+		}
+
+		if b.percentResolver == nil {
+			// percentResolver not set means that this flag is not yet supposed to set
+			// any value.
+			return nil
+		}
+
+		absVal, err := b.percentResolver(percent)
+		if err != nil {
+			return err
+		}
+		s = fmt.Sprint(absVal)
+	}
+	return b.bval.Set(s)
+}
+
+// Resolve can be called to get the flag's value (if any). If the flag had been
+// previously set, *v will be written.
+func (b *bytesOrPercentageValue) Resolve(v *int64, percentResolver percentResolverFunc) error {
+	// The flag was not passed on the command line.
+	if b.origVal == "" {
+		return nil
+	}
+	b.percentResolver = percentResolver
+	b.val = v
+	b.bval = humanizeutil.NewBytesValue(v)
+	return b.Set(b.origVal)
+}
+
+func (b *bytesOrPercentageValue) Type() string {
+	return b.bval.Type()
+}
+
+func (b *bytesOrPercentageValue) String() string {
+	return b.bval.String()
+}
+
+func (b *bytesOrPercentageValue) IsSet() bool {
+	return b.bval.IsSet()
+}
+
+var cacheSizeValue = newBytesOrPercentageValue(&serverCfg.CacheSize, memoryPercentResolver)
+var sqlSizeValue = newBytesOrPercentageValue(&serverCfg.SQLMemoryPoolSize, memoryPercentResolver)
+var diskTempStorageSizeValue = newBytesOrPercentageValue(nil /* v */, nil /* percentResolver */)
+
+func initTempStorageConfig(
+	ctx context.Context, firstStore base.StoreSpec,
+) (base.TempStorageConfig, error) {
+	var recordPath string
+	if !firstStore.InMemory {
+		recordPath = filepath.Join(firstStore.Path, server.TempDirsRecordFilename)
+	}
+
+	var err error
+	// Need to first clean up any abandoned temporary directories from
+	// the temporary directory record file before creating any new
+	// temporary directories in case the disk is completely full.
+	if recordPath != "" {
+		if err = util.CleanupTempDirs(recordPath); err != nil {
+			return base.TempStorageConfig{}, errors.Wrap(err, "could not cleanup temporary directories from record file")
+		}
+	}
+
+	// The temp store size can depend on the location of the first regular store
+	// (if it's expressed as a percentage), so we resolve that flag here.
+	var tempStorePercentageResolver percentResolverFunc
+	if !firstStore.InMemory {
+		dir := firstStore.Path
+		// Create the store dir, if it doesn't exist. The dir is required to exist
+		// by diskPercentResolverFactory.
+		if err = os.MkdirAll(dir, 0755); err != nil {
+			return base.TempStorageConfig{}, errors.Wrapf(err, "failed to create dir for first store: %s", dir)
+		}
+		tempStorePercentageResolver, err = diskPercentResolverFactory(dir)
+		if err != nil {
+			return base.TempStorageConfig{}, errors.Wrapf(err, "failed to create resolver for: %s", dir)
+		}
+	} else {
+		tempStorePercentageResolver = memoryPercentResolver
+	}
+	var tempStorageMaxSizeBytes int64
+	if err = diskTempStorageSizeValue.Resolve(
+		&tempStorageMaxSizeBytes, tempStorePercentageResolver,
+	); err != nil {
+		return base.TempStorageConfig{}, err
+	}
+	if firstStore.InMemory && !diskTempStorageSizeValue.IsSet() {
+		// The default temp store size is different when the first
+		// store (and thus also the temp storage) is in memory.
+		tempStorageMaxSizeBytes = base.DefaultInMemTempStorageMaxSizeBytes
+	}
+
+	// Initialize a base.TempStorageConfig based on first store's spec and
+	// cli flags.
+	tempStorageConfig := base.TempStorageConfigFromEnv(
+		ctx,
+		firstStore,
+		tempDir,
+		tempStorageMaxSizeBytes,
+	)
+
+	// Set temp directory to first store's path if the temp storage is not
+	// in memory.
+	if tempDir == "" && !tempStorageConfig.InMemory {
+		tempDir = firstStore.Path
+	}
+	// Create the temporary subdirectory for the temp engine.
+	if tempStorageConfig.Path, err = util.CreateTempDir(tempDir, server.TempDirPrefix); err != nil {
+		return base.TempStorageConfig{}, errors.Wrap(err, "could not create temporary directory for temp storage")
+	}
+
+	// We record the new temporary directory in the record file (if it
+	// exists) for cleanup in case the node crashes.
+	if recordPath != "" {
+		if err = util.RecordTempDir(recordPath, tempStorageConfig.Path); err != nil {
+			return base.TempStorageConfig{}, errors.Wrapf(
+				err,
+				"could not record temporary directory path to record file: %s",
+				recordPath,
+			)
+		}
+	}
+
+	return tempStorageConfig, nil
+}
 
 // runStart starts the cockroach node using --store as the list of
 // storage devices ("stores") on this machine and --join as the list
@@ -288,38 +490,40 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if len(args) > 0 {
 		return usageAndError(cmd)
 	}
+	tBegin := timeutil.Now()
 
 	if ok, err := maybeRerunBackground(); ok {
 		return err
 	}
 
-	// Use the server-specific values for some flags and settings.
-	serverCfg.Insecure = serverInsecure
-	serverCfg.SSLCertsDir = serverSSLCertsDir
-	serverCfg.User = security.NodeUser
+	// Deal with flags that may depend on other flags.
+
+	tracer := serverCfg.Settings.Tracer
+	sp := tracer.StartSpan("server start")
+	ctx := opentracing.ContextWithSpan(context.Background(), sp)
 
 	var err error
-	serverCfg.TempStore, err = server.MakeTempStoreSpecFromStoreSpec(serverCfg.Stores.Specs[0])
-	if err != nil {
+	if serverCfg.TempStorageConfig, err = initTempStorageConfig(ctx, serverCfg.Stores.Specs[0]); err != nil {
 		return err
 	}
+
+	// Use the server-specific values for some flags and settings.
+	serverCfg.Insecure = startCtx.serverInsecure
+	serverCfg.SSLCertsDir = startCtx.serverSSLCertsDir
+	serverCfg.User = security.NodeUser
 
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
-	tracer := tracing.NewTracer()
-	sp := tracer.StartSpan("server start")
-	startCtx := opentracing.ContextWithSpan(context.Background(), sp)
-
 	// Set up the logging and profiling output.
 	// It is important that no logging occurs before this point or the log files
 	// will be created in $TMPDIR instead of their expected location.
-	stopper, err := setupAndInitializeLoggingAndProfiling(startCtx)
+	stopper, err := setupAndInitializeLoggingAndProfiling(ctx)
 	if err != nil {
 		return err
 	}
 
-	serverCfg.Report(startCtx)
+	serverCfg.Report(ctx)
 
 	// Run the rest of the startup process in the background to avoid preventing
 	// proper handling of signals if we get stuck on something during
@@ -337,16 +541,20 @@ func runStart(cmd *cobra.Command, args []string) error {
 	go func() {
 		// Ensure that the log files see the startup messages immediately.
 		defer log.Flush()
-		defer log.RecoverAndReportPanic(startCtx)
+		defer func() {
+			if s != nil {
+				log.RecoverAndReportPanic(ctx, &s.ClusterSettings().SV)
+			}
+		}()
 		defer sp.Finish()
 		if err := func() error {
 			if err := serverCfg.InitNode(); err != nil {
 				return errors.Wrap(err, "failed to initialize node")
 			}
 
-			log.Info(startCtx, "starting cockroach node")
+			log.Info(ctx, "starting cockroach node")
 			if envVarsUsed := envutil.GetEnvVarsUsed(); len(envVarsUsed) > 0 {
-				log.Infof(startCtx, "using local environment variables: %s", strings.Join(envVarsUsed, ", "))
+				log.Infof(ctx, "using local environment variables: %s", strings.Join(envVarsUsed, ", "))
 			}
 
 			var err error
@@ -363,7 +571,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 				return nil
 			}
 
-			if err := s.Start(startCtx); err != nil {
+			if err := s.Start(ctx); err != nil {
 				if le, ok := err.(server.ListenError); ok {
 					const errorPrefix = "consider changing the port via --"
 					if le.Addr == serverCfg.Addr {
@@ -386,11 +594,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
-
 			var buf bytes.Buffer
 			info := build.GetInfo()
 			tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
-			fmt.Fprintf(tw, "CockroachDB node starting at %s\n", timeutil.Now())
+			fmt.Fprintf(tw, "CockroachDB node starting at %s (took %0.1fs)\n", timeutil.Now(), timeutil.Since(tBegin).Seconds())
 			fmt.Fprintf(tw, "build:\t%s %s @ %s (%s)\n", info.Distribution, info.Tag, info.Time, info.GoVersion)
 			fmt.Fprintf(tw, "admin:\t%s\n", serverCfg.AdminURL())
 			fmt.Fprintf(tw, "sql:\t%s\n", pgURL)
@@ -403,6 +610,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 			}
 			if len(serverCfg.Locality.Tiers) > 0 {
 				fmt.Fprintf(tw, "locality:\t%s\n", serverCfg.Locality)
+			}
+			if s.TempDir() != "" {
+				fmt.Fprintf(tw, "temp dir:\t%s\n", s.TempDir())
 			}
 			for i, spec := range serverCfg.Stores.Specs {
 				fmt.Fprintf(tw, "store[%d]:\t%s\n", i, spec)
@@ -424,7 +634,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 				return err
 			}
 			msg := buf.String()
-			log.Infof(startCtx, "node startup completed:\n%s", msg)
+			log.Infof(ctx, "node startup completed:\n%s", msg)
 			if !log.LoggingToStderr(log.Severity_INFO) {
 				fmt.Print(msg)
 			}
@@ -437,6 +647,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	shutdownSpan := tracer.StartSpan("server shutdown")
 	defer shutdownSpan.Finish()
 	shutdownCtx := opentracing.ContextWithSpan(context.Background(), shutdownSpan)
+
 	var returnErr error
 
 	// Block until one of the signals above is received or the stopper
@@ -465,7 +676,12 @@ func runStart(cmd *cobra.Command, args []string) error {
 			// to terminate with a non-zero exit code; however SIGTERM is
 			// "legitimate" and should be acknowledged with a success exit
 			// code. So we keep the error state here for later.
-			returnErr = errors.New("interrupted")
+			returnErr = &cliError{
+				exitCode: 1,
+				// INFO because a single interrupt is rather innocuous.
+				severity: log.Severity_INFO,
+				cause:    errors.New("interrupted"),
+			}
 			msgDouble := "Note: a second interrupt will skip graceful shutdown and terminate forcefully"
 			fmt.Fprintln(os.Stdout, msgDouble)
 		}
@@ -502,19 +718,24 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	const hardShutdownHint = " - node may take longer to restart & clients may need to wait for leases to expire"
 	select {
 	case sig := <-signalCh:
-		returnErr = fmt.Errorf("received signal '%s' during shutdown, initiating hard shutdown", sig)
 		// This new signal is not welcome, as it interferes with the graceful
 		// shutdown process. On Unix, a signal that was not handled gracefully by
 		// the application should be visible to other processes as an exit code
 		// encoded as 128+signal number.
 		//
 		// Also, on Unix, os.Signal is syscall.Signal and it's convertible to int.
-		ErrorCode = 128 + int(sig.(syscall.Signal))
+		returnErr = &cliError{
+			exitCode: 128 + int(sig.(syscall.Signal)),
+			severity: log.Severity_ERROR,
+			cause: errors.Errorf(
+				"received signal '%s' during shutdown, initiating hard shutdown%s", sig, hardShutdownHint),
+		}
 		// NB: we do not return here to go through log.Flush below.
 	case <-time.After(time.Minute):
-		returnErr = errors.New("time limit reached, initiating hard shutdown")
+		returnErr = errors.Errorf("time limit reached, initiating hard shutdown%s", hardShutdownHint)
 		// NB: we do not return here to go through log.Flush below.
 	case <-stopper.IsStopped():
 		const msgDone = "server drained and shutdown completed"
@@ -525,12 +746,29 @@ func runStart(cmd *cobra.Command, args []string) error {
 	return returnErr
 }
 
+func maybeWarnCacheSize() {
+	if cacheSizeValue.IsSet() {
+		return
+	}
+
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "Using the default setting for --cache (%s).\n", cacheSizeValue)
+	fmt.Fprintf(&buf, "  A significantly larger value is usually needed for good performance.\n")
+	if size, err := server.GetTotalMemory(context.Background()); err == nil {
+		fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is --cache=25%% (%s).",
+			humanizeutil.IBytes(size/4))
+	} else {
+		fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is 25%% of physical memory.")
+	}
+	log.Warning(context.Background(), buf.String())
+}
+
 // setupAndInitializeLoggingAndProfiling does what it says on the label.
 // Prior to this however it determines suitable defaults for the
 // logging output directory and the verbosity level of stderr logging.
 // We only do this for the "start" command which is why this work
 // occurs here and not in an OnInitialize function.
-func setupAndInitializeLoggingAndProfiling(startCtx context.Context) (*stop.Stopper, error) {
+func setupAndInitializeLoggingAndProfiling(ctx context.Context) (*stop.Stopper, error) {
 	// Default the log directory to the "logs" subdirectory of the first
 	// non-memory store. If more than one non-memory stores is detected,
 	// print a warning.
@@ -575,7 +813,7 @@ func setupAndInitializeLoggingAndProfiling(startCtx context.Context) (*stop.Stop
 		if err := os.MkdirAll(logDir, 0755); err != nil {
 			return nil, err
 		}
-		log.Eventf(startCtx, "created log directory %s", logDir)
+		log.Eventf(ctx, "created log directory %s", logDir)
 
 		// Start the log file GC daemon to remove files that make the log
 		// directory too large.
@@ -585,11 +823,11 @@ func setupAndInitializeLoggingAndProfiling(startCtx context.Context) (*stop.Stop
 	if ambiguousLogDirs {
 		// Note that we can't report this message earlier, because the log directory
 		// may not have been ready before the call to MkdirAll() above.
-		log.Shout(startCtx, log.Severity_WARNING, "multiple stores configured"+
+		log.Shout(ctx, log.Severity_WARNING, "multiple stores configured"+
 			" and --log-dir not specified, you may want to specify --log-dir to disambiguate.")
 	}
 
-	if serverInsecure {
+	if startCtx.serverInsecure {
 		// Use a non-annotated context here since the annotation just looks funny,
 		// particularly to new users (made worse by it always printing as [n?]).
 		addr := serverConnHost
@@ -602,29 +840,31 @@ func setupAndInitializeLoggingAndProfiling(startCtx context.Context) (*stop.Stop
 				"- Any user, even root, can log in without providing a password.\n"+
 				"- Any user, connecting as root, can read or write any data in your cluster.\n"+
 				"- There is no network encryption nor authentication, and thus no confidentiality.\n\n"+
-				"Check out how to secure your cluster: https://www.cockroachlabs.com/docs/stable/secure-a-cluster.html")
+				"Check out how to secure your cluster: "+base.DocsURL("secure-a-cluster.html"))
 	}
+
+	maybeWarnCacheSize()
 
 	// We log build information to stdout (for the short summary), but also
 	// to stderr to coincide with the full logs.
 	info := build.GetInfo()
-	log.Infof(startCtx, info.Short())
+	log.Infof(ctx, info.Short())
 
-	initMemProfile(startCtx, outputDirectory)
-	initCPUProfile(startCtx, outputDirectory)
+	initMemProfile(ctx, outputDirectory)
+	initCPUProfile(ctx, outputDirectory)
 	initBlockProfile()
 
 	// Disable Stopper task tracking as performing that call site tracking is
 	// moderately expensive (certainly outweighing the infrequent benefit it
 	// provides).
 	stopper := initBacktrace(outputDirectory)
-	log.Event(startCtx, "initialized profiles")
+	log.Event(ctx, "initialized profiles")
 
 	return stopper, nil
 }
 
 func addrWithDefaultHost(addr string) (string, error) {
-	host, port, err := net.SplitHostPort(baseCfg.Addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return "", err
 	}
@@ -641,7 +881,7 @@ func getClientGRPCConn() (*grpc.ClientConn, *hlc.Clock, *stop.Stopper, error) {
 	clock := hlc.NewClock(hlc.UnixNano, 0)
 	stopper := stop.NewStopper()
 	rpcContext := rpc.NewContext(
-		log.AmbientContext{},
+		log.AmbientContext{Tracer: serverCfg.Settings.Tracer},
 		serverCfg.Config,
 		clock,
 		stopper,
@@ -751,7 +991,10 @@ func doShutdown(ctx context.Context, c serverpb.AdminClient, onModes []int32) er
 type errTryHardShutdown struct{ error }
 
 // runQuit accesses the quit shutdown path.
-func runQuit(_ *cobra.Command, _ []string) (err error) {
+func runQuit(cmd *cobra.Command, args []string) (err error) {
+	if len(args) != 0 {
+		return usageAndError(cmd)
+	}
 	defer func() {
 		if err == nil {
 			fmt.Println("ok")
@@ -769,6 +1012,12 @@ func runQuit(_ *cobra.Command, _ []string) (err error) {
 	ctx := stopperContext(stopper)
 	defer stopper.Stop(ctx)
 
+	if quitCtx.serverDecommission {
+		var myself []string // will remain empty, which means target yourself
+		if err := runDecommissionNodeImpl(ctx, c, nodeDecommissionWaitAll, myself); err != nil {
+			return err
+		}
+	}
 	errChan := make(chan error, 1)
 	go func() {
 		errChan <- doShutdown(ctx, c, onModes)

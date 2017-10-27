@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package client_test
 
 import (
 	"bytes"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -27,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 func setup(t *testing.T) (serverutils.TestServerInterface, *client.DB) {
@@ -154,14 +154,23 @@ func TestDB_InitPut(t *testing.T) {
 	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
 
-	if err := db.InitPut(ctx, "aa", "1"); err != nil {
+	if err := db.InitPut(ctx, "aa", "1", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitPut(ctx, "aa", "1"); err != nil {
+	if err := db.InitPut(ctx, "aa", "1", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InitPut(ctx, "aa", "2"); err == nil {
+	if err := db.InitPut(ctx, "aa", "2", false); err == nil {
 		t.Fatal("expected error from init put")
+	}
+	if err := db.Del(ctx, "aa"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitPut(ctx, "aa", "2", true); err == nil {
+		t.Fatal("expected error from init put")
+	}
+	if err := db.InitPut(ctx, "aa", "1", false); err != nil {
+		t.Fatal(err)
 	}
 	result, err := db.Get(ctx, "aa")
 	if err != nil {
@@ -332,7 +341,15 @@ func TestDebugName(t *testing.T) {
 	defer s.Stopper().Stop(context.TODO())
 
 	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
-		const expected = "unnamed"
+		// Manually override the txn ID, to make the DebugName below deterministic.
+		id := "00000000-b33f-b33f-b33f-000000000000"
+		uuid, err := uuid.FromString(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		txn.Proto().ID = uuid
+
+		expected := fmt.Sprintf("unnamed (id: %s)", id)
 		if txn.DebugName() != expected {
 			t.Fatalf("expected \"%s\", but found \"%s\"", expected, txn.DebugName())
 		}
@@ -366,12 +383,12 @@ func TestCommonMethods(t *testing.T) {
 		{batchType, "PutInline"}:                     {},
 		{batchType, "RawResponse"}:                   {},
 		{batchType, "MustPErr"}:                      {},
+		{dbType, "AddSSTable"}:                       {},
 		{dbType, "AdminMerge"}:                       {},
 		{dbType, "AdminSplit"}:                       {},
 		{dbType, "AdminTransferLease"}:               {},
 		{dbType, "AdminChangeReplicas"}:              {},
 		{dbType, "CheckConsistency"}:                 {},
-		{dbType, "ExperimentalAddSSTable"}:           {},
 		{dbType, "Run"}:                              {},
 		{dbType, "Txn"}:                              {},
 		{dbType, "GetSender"}:                        {},
@@ -384,13 +401,16 @@ func TestCommonMethods(t *testing.T) {
 		{txnType, "Rollback"}:                        {},
 		{txnType, "CleanupOnError"}:                  {},
 		{txnType, "DebugName"}:                       {},
-		{txnType, "EnsureProto"}:                     {},
+		{txnType, "GenerateForcedRetryableError"}:    {},
 		{txnType, "InternalSetPriority"}:             {},
 		{txnType, "IsFinalized"}:                     {},
+		{txnType, "IsSerializableRestart"}:           {},
 		{txnType, "NewBatch"}:                        {},
 		{txnType, "Exec"}:                            {},
+		{txnType, "PrepareForRetry"}:                 {},
 		{txnType, "ResetDeadline"}:                   {},
 		{txnType, "Run"}:                             {},
+		{txnType, "Send"}:                            {},
 		{txnType, "SetDebugName"}:                    {},
 		{txnType, "SetFixedTimestamp"}:               {},
 		{txnType, "SetIsolation"}:                    {},
@@ -408,6 +428,8 @@ func TestCommonMethods(t *testing.T) {
 		{txnType, "UserPriority"}:                    {},
 		{txnType, "AnchorKey"}:                       {},
 		{txnType, "ID"}:                              {},
+		{txnType, "IsAborted"}:                       {},
+		{txnType, "IsCommitted"}:                     {},
 	}
 
 	for b := range omittedChecks {

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package sql_test
 
@@ -155,12 +153,8 @@ func checkEndTransactionTrigger(args storagebase.FilterArgs) *roachpb.Error {
 
 	var hasSystemKey bool
 	for _, span := range req.IntentSpans {
-		keyAddr, err := keys.Addr(span.Key)
-		if err != nil {
-			return roachpb.NewError(err)
-		}
-		if bytes.Compare(keyAddr, keys.SystemConfigSpan.Key) >= 0 &&
-			bytes.Compare(keyAddr, keys.SystemConfigSpan.EndKey) < 0 {
+		if bytes.Compare(span.Key, keys.SystemConfigSpan.Key) >= 0 &&
+			bytes.Compare(span.Key, keys.SystemConfigSpan.EndKey) < 0 {
 			hasSystemKey = true
 			break
 		}
@@ -203,18 +197,17 @@ func createTestServerParams() (base.TestServerArgs, *CommandFilters) {
 func init() {
 	testingPlanHook := func(
 		stmt parser.Statement, state sql.PlanHookState,
-	) (func(context.Context) ([]parser.Datums, error), sqlbase.ResultColumns, error) {
-		show, ok := stmt.(*parser.Show)
+	) (func(context.Context, chan<- parser.Datums) error, sqlbase.ResultColumns, error) {
+		show, ok := stmt.(*parser.ShowVar)
 		if !ok || show.Name != "planhook" {
 			return nil, nil, nil
 		}
 		header := sqlbase.ResultColumns{
 			{Name: "value", Typ: parser.TypeString},
 		}
-		return func(_ context.Context) ([]parser.Datums, error) {
-			return []parser.Datums{
-				{parser.NewDString(show.Name)},
-			}, nil
+		return func(_ context.Context, resultsCh chan<- parser.Datums) error {
+			resultsCh <- parser.Datums{parser.NewDString(show.Name)}
+			return nil
 		}, header, nil
 	}
 	sql.AddPlanHook(testingPlanHook)

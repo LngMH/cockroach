@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package kv
 
@@ -107,8 +105,8 @@ func TestRangeSplitMeta(t *testing.T) {
 
 	ctx := context.TODO()
 
-	splitKeys := []roachpb.RKey{roachpb.RKey("G"), mustMeta(roachpb.RKey("F")),
-		mustMeta(roachpb.RKey("K")), mustMeta(roachpb.RKey("H"))}
+	splitKeys := []roachpb.RKey{roachpb.RKey("G"), keys.RangeMetaKey(roachpb.RKey("F")),
+		keys.RangeMetaKey(roachpb.RKey("K")), keys.RangeMetaKey(roachpb.RKey("H"))}
 
 	// Execute the consecutive splits.
 	for _, splitRKey := range splitKeys {

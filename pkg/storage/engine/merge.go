@@ -11,14 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package engine
 
 import (
-	"github.com/gogo/protobuf/proto"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -61,7 +57,7 @@ func MergeInternalTimeSeriesData(
 
 	// Unmarshal merged bytes and extract the time series value within.
 	var meta enginepb.MVCCMetadata
-	if err := proto.Unmarshal(mergedBytes, &meta); err != nil {
+	if err := protoutil.Unmarshal(mergedBytes, &meta); err != nil {
 		return roachpb.InternalTimeSeriesData{}, err
 	}
 	mergedTS, err := MakeValue(meta).GetTimeseries()

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package ts
 
@@ -207,10 +205,10 @@ func TestDataSpanIterator(t *testing.T) {
 		if !expectedValid {
 			return
 		}
-		if a, e := iter.offset(), int32(expectedOffset); a != e {
+		if a, e := iter.offset(), expectedOffset; a != e {
 			t.Fatalf("check %d: expected iterator to have offset %d, was %d", checkNum, e, a)
 		}
-		if a, e := iter.timestamp(), int64(expectedTimestamp); a != e {
+		if a, e := iter.timestamp(), expectedTimestamp; a != e {
 			t.Fatalf(
 				"check %d: expected iterator to have timestamp %d, was %d", checkNum, e, a,
 			)
@@ -370,15 +368,15 @@ func TestDownsamplingIterator(t *testing.T) {
 		if !expectedValid {
 			return
 		}
-		if a, e := iter.offset(), int32(expectedOffset); a != e {
+		if a, e := iter.offset(), expectedOffset; a != e {
 			t.Fatalf("check %d: expected iterator to have offset %d, was %d", checkNum, e, a)
 		}
-		if a, e := iter.timestamp(), int64(expectedTimestamp); a != e {
+		if a, e := iter.timestamp(), expectedTimestamp; a != e {
 			t.Fatalf(
 				"check %d: expected iterator to have timestamp %d, was %d", checkNum, e, a,
 			)
 		}
-		if a, e := iter.value(), float64(expectedValue); a != e {
+		if a, e := iter.value(), expectedValue; a != e {
 			t.Fatalf(
 				"check %d: expected iterator to have value %f, was %f", checkNum, e, a,
 			)

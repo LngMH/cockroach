@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package roachpb
 
@@ -25,7 +23,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
 
 	"github.com/cockroachdb/apd"
@@ -35,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
@@ -320,42 +318,6 @@ func TestSetGetChecked(t *testing.T) {
 	}
 }
 
-func TestTxnEqual(t *testing.T) {
-	u1, u2 := uuid.MakeV4(), uuid.MakeV4()
-	tc := []struct {
-		txn1, txn2 *Transaction
-		eq         bool
-	}{
-		{nil, nil, true},
-		{&Transaction{}, nil, false},
-		{&Transaction{TxnMeta: enginepb.TxnMeta{ID: &u1}}, &Transaction{TxnMeta: enginepb.TxnMeta{ID: &u2}}, false},
-	}
-	for i, c := range tc {
-		if c.txn1.Equal(c.txn2) != c.txn2.Equal(c.txn1) || c.txn1.Equal(c.txn2) != c.eq {
-			t.Errorf("%d: wanted %t", i, c.eq)
-		}
-	}
-}
-
-func TestTxnIDEqual(t *testing.T) {
-	txn1, txn2 := uuid.MakeV4(), uuid.MakeV4()
-	txn1Copy := txn1
-
-	testCases := []struct {
-		a, b     *uuid.UUID
-		expEqual bool
-	}{
-		{&txn1, &txn1, true},
-		{&txn1, &txn2, false},
-		{&txn1, &txn1Copy, true},
-	}
-	for i, test := range testCases {
-		if eq := TxnIDEqual(test.a, test.b); eq != test.expEqual {
-			t.Errorf("%d: expected %q == %q: %t; got %t", i, test.a, test.b, test.expEqual, eq)
-		}
-	}
-}
-
 // TestTransactionObservedTimestamp verifies that txn.{Get,Update}ObservedTimestamp work as
 // advertised.
 func TestTransactionObservedTimestamp(t *testing.T) {
@@ -394,14 +356,29 @@ func TestTransactionObservedTimestamp(t *testing.T) {
 	}
 }
 
+func TestFastPathObservedTimestamp(t *testing.T) {
+	var txn Transaction
+	nodeID := NodeID(1)
+	if _, ok := txn.GetObservedTimestamp(nodeID); ok {
+		t.Errorf("fetched observed timestamp where none should exist")
+	}
+	expTS := hlc.Timestamp{WallTime: 10}
+	txn.UpdateObservedTimestamp(nodeID, expTS)
+	if ts, ok := txn.GetObservedTimestamp(nodeID); !ok || !ts.Equal(expTS) {
+		t.Errorf("expected %s; got %s", expTS, ts)
+	}
+	expTS = hlc.Timestamp{WallTime: 9}
+	txn.UpdateObservedTimestamp(nodeID, expTS)
+	if ts, ok := txn.GetObservedTimestamp(nodeID); !ok || !ts.Equal(expTS) {
+		t.Errorf("expected %s; got %s", expTS, ts)
+	}
+}
+
 var nonZeroTxn = Transaction{
 	TxnMeta: enginepb.TxnMeta{
-		Isolation: enginepb.SNAPSHOT,
-		Key:       Key("foo"),
-		ID: func() *uuid.UUID {
-			u := uuid.MakeV4()
-			return &u
-		}(),
+		Isolation:  enginepb.SNAPSHOT,
+		Key:        Key("foo"),
+		ID:         uuid.MakeV4(),
 		Epoch:      2,
 		Timestamp:  makeTS(20, 21),
 		Priority:   957356782,
@@ -433,9 +410,8 @@ func TestTransactionUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	u := uuid.MakeV4()
 	var txn3 Transaction
-	txn3.ID = &u
+	txn3.ID = uuid.MakeV4()
 	txn3.Name = "carl"
 	txn3.Isolation = enginepb.SNAPSHOT
 	txn3.Update(&txn)
@@ -457,7 +433,6 @@ func TestTransactionClone(t *testing.T) {
 	expFields := []string{
 		"Intents.EndKey",
 		"Intents.Key",
-		"TxnMeta.ID",
 		"TxnMeta.Key",
 	}
 	if !reflect.DeepEqual(expFields, fields) {
@@ -595,19 +570,19 @@ func TestLeaseEquivalence(t *testing.T) {
 	ts2 := makeTS(2, 1)
 	ts3 := makeTS(3, 1)
 
-	epoch1 := Lease{Replica: r1, Start: ts1, Epoch: proto.Int64(1)}
-	epoch2 := Lease{Replica: r1, Start: ts1, Epoch: proto.Int64(2)}
-	expire1 := Lease{Replica: r1, Start: ts1, Expiration: ts2}
-	expire2 := Lease{Replica: r1, Start: ts1, Expiration: ts3}
-	epoch2TS2 := Lease{Replica: r2, Start: ts2, Epoch: proto.Int64(2)}
-	expire2TS2 := Lease{Replica: r2, Start: ts2, Expiration: ts3}
+	epoch1 := Lease{Replica: r1, Start: ts1, Epoch: 1}
+	epoch2 := Lease{Replica: r1, Start: ts1, Epoch: 2}
+	expire1 := Lease{Replica: r1, Start: ts1, Expiration: ts2.Clone()}
+	expire2 := Lease{Replica: r1, Start: ts1, Expiration: ts3.Clone()}
+	epoch2TS2 := Lease{Replica: r2, Start: ts2, Epoch: 2}
+	expire2TS2 := Lease{Replica: r2, Start: ts2, Expiration: ts3.Clone()}
 
-	proposed1 := Lease{Replica: r1, Start: ts1, Epoch: proto.Int64(1), ProposedTS: &ts1}
-	proposed2 := Lease{Replica: r1, Start: ts1, Epoch: proto.Int64(2), ProposedTS: &ts1}
-	proposed3 := Lease{Replica: r1, Start: ts1, Epoch: proto.Int64(1), ProposedTS: &ts2}
+	proposed1 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: ts1.Clone()}
+	proposed2 := Lease{Replica: r1, Start: ts1, Epoch: 2, ProposedTS: ts1.Clone()}
+	proposed3 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: ts2.Clone()}
 
-	stasis1 := Lease{Replica: r1, Start: ts1, Epoch: proto.Int64(1), DeprecatedStartStasis: ts1}
-	stasis2 := Lease{Replica: r1, Start: ts1, Epoch: proto.Int64(1), DeprecatedStartStasis: ts2}
+	stasis1 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts1.Clone()}
+	stasis2 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts2.Clone()}
 
 	testCases := []struct {
 		l, ol      Lease
@@ -632,6 +607,36 @@ func TestLeaseEquivalence(t *testing.T) {
 		if ok := tc.l.Equivalent(tc.ol); tc.expSuccess != ok {
 			t.Errorf("%d: expected success? %t; got %t", i, tc.expSuccess, ok)
 		}
+	}
+
+	// #18689 changed the nullability of the DeprecatedStartStasis, ProposedTS, and Expiration
+	// field. It introduced a bug whose regression is caught below where a zero Expiration and a nil
+	// Expiration in an epoch-based lease led to mistakenly considering leases non-equivalent.
+	prePRLease := Lease{
+		Start: hlc.Timestamp{WallTime: 10},
+		Epoch: 123,
+
+		// The bug-trigger.
+		Expiration: new(hlc.Timestamp),
+
+		// Similar potential bug triggers, but these were actually handled correctly.
+		DeprecatedStartStasis: new(hlc.Timestamp),
+		ProposedTS:            &hlc.Timestamp{WallTime: 10},
+	}
+	postPRLease := prePRLease
+	postPRLease.DeprecatedStartStasis = nil
+	postPRLease.Expiration = nil
+
+	if !postPRLease.Equivalent(prePRLease) || !prePRLease.Equivalent(postPRLease) {
+		t.Fatalf("leases not equivalent but should be despite diff(pre,post) = %s", pretty.Diff(prePRLease, postPRLease))
+	}
+}
+
+func TestLeaseFuzzNullability(t *testing.T) {
+	var l Lease
+	protoutil.Walk(&l, protoutil.ZeroInsertingVisitor)
+	if l.Expiration == nil {
+		t.Fatal("unexpectedly nil expiration")
 	}
 }
 
@@ -739,9 +744,9 @@ func TestRSpanContains(t *testing.T) {
 	}
 }
 
-// TestRSpanContainsExclusiveEndKey verifies ContainsExclusiveEndKey to check whether a key
-// or key range is contained within the span.
-func TestRSpanContainsExclusiveEndKey(t *testing.T) {
+// TestRSpanContainsKeyInverted verifies ContainsKeyInverted to check whether a key
+// is contained within the span.
+func TestRSpanContainsKeyInverted(t *testing.T) {
 	rs := RSpan{Key: []byte("b"), EndKey: []byte("c")}
 
 	testData := []struct {
@@ -756,7 +761,7 @@ func TestRSpanContainsExclusiveEndKey(t *testing.T) {
 		{RKey("c").Next(), false},
 	}
 	for i, test := range testData {
-		if rs.ContainsExclusiveEndKey(test.key) != test.contains {
+		if rs.ContainsKeyInverted(test.key) != test.contains {
 			t.Errorf("%d: expected key %q within range", i, test.key)
 		}
 	}

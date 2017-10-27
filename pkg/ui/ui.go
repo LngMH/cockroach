@@ -11,11 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
-// Package ui embeds into the Cockroach certain data such as web html and
-// stylesheets.
+// Package ui embeds the assets for the web UI into the Cockroach binary.
 package ui
-
-//go:generate make generate

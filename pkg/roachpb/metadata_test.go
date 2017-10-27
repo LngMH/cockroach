@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package roachpb
 
@@ -62,6 +60,47 @@ func TestAttributesSortedString(t *testing.T) {
 	c := Attributes{Attrs: []string{"c", "c", "a", "a", "b", "b"}}
 	if c.SortedString() != "a,b,c" {
 		t.Errorf("sorted string of %+v (%s) != \"a,b,c\"", c, c.SortedString())
+	}
+}
+
+func TestPercentilesFromData(t *testing.T) {
+	testCases := []struct {
+		data      []float64
+		percents  []float64
+		expecteds []float64
+	}{
+		{
+			[]float64{},
+			[]float64{-10, 0, 10, 25, 50, 75, 90, 100, 110},
+			[]float64{0, 0, 0, 0, 0, 0, 0, 0, 0},
+		},
+		{
+			[]float64{5},
+			[]float64{-10, 0, 10, 25, 50, 75, 90, 100, 110},
+			[]float64{5, 5, 5, 5, 5, 5, 5, 5, 5},
+		},
+		{
+			[]float64{1, 2},
+			[]float64{-10, 0, 10, 25, 50, 75, 90, 100, 110},
+			[]float64{1, 1, 1, 1, 2, 2, 2, 2, 2},
+		},
+		{
+			[]float64{1, 2, 3},
+			[]float64{-10, 0, 10, 25, 50, 75, 90, 100, 110},
+			[]float64{1, 1, 1, 1, 2, 3, 3, 3, 3},
+		},
+		{
+			[]float64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+			[]float64{-10, 0, 10, 25, 50, 75, 90, 100, 110},
+			[]float64{0, 0, 1, 2, 5, 8, 9, 10, 10},
+		},
+	}
+	for _, tc := range testCases {
+		for i := range tc.percents {
+			if actual := percentileFromSortedData(tc.data, tc.percents[i]); actual != tc.expecteds[i] {
+				t.Errorf("percentile(%v, %f) got %f, want %f", tc.data, tc.percents[i], actual, tc.expecteds[i])
+			}
+		}
 	}
 }
 

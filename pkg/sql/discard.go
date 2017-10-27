@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
 
 package sql
 
@@ -47,5 +46,5 @@ func (p *planner) Discard(ctx context.Context, s *parser.Discard) (planNode, err
 		return nil, pgerror.NewErrorf(pgerror.CodeInternalError,
 			"unknown mode for DISCARD: %d", s.Mode)
 	}
-	return &emptyNode{}, nil
+	return &zeroNode{}, nil
 }

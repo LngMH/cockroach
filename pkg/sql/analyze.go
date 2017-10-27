@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
@@ -133,6 +131,8 @@ func joinExprs(
 //   (a < 1 AND a > 2)  -> false
 //   (a > 1 OR a < 2)   -> true
 //   (a > 1 OR func(b)) -> true
+//   (b)                -> (b = true)
+//   (b != true)        -> (b < true)
 //
 // Note that simplification is not normalization. Normalization as performed by
 // parser.NormalizeExpr returns an expression that is equivalent to the
@@ -157,8 +157,10 @@ func simplifyExpr(
 		return simplifyOrExpr(evalCtx, t)
 	case *parser.ComparisonExpr:
 		return simplifyComparisonExpr(evalCtx, t)
-	case *parser.IndexedVar, *parser.DBool:
-		return e, true
+	case *parser.IndexedVar:
+		return simplifyBoolVar(evalCtx, t)
+	case *parser.DBool:
+		return t, true
 	}
 	// We don't know how to simplify expressions that fall through to here, so
 	// consider this part of the expression true.
@@ -170,6 +172,8 @@ func simplifyNotExpr(evalCtx *parser.EvalContext, n *parser.NotExpr) (parser.Typ
 		return parser.DNull, true
 	}
 	switch t := n.Expr.(type) {
+	case *parser.NotExpr:
+		return simplifyExpr(evalCtx, t.TypedInnerExpr())
 	case *parser.ComparisonExpr:
 		op := t.Operator
 		switch op {
@@ -203,8 +207,20 @@ func simplifyNotExpr(evalCtx *parser.EvalContext, n *parser.NotExpr) (parser.Typ
 			op = parser.SimilarTo
 		case parser.RegMatch:
 			op = parser.NotRegMatch
+		case parser.NotRegMatch:
+			op = parser.RegMatch
 		case parser.RegIMatch:
 			op = parser.NotRegIMatch
+		case parser.NotRegIMatch:
+			op = parser.RegIMatch
+		case parser.IsDistinctFrom:
+			op = parser.IsNotDistinctFrom
+		case parser.IsNotDistinctFrom:
+			op = parser.IsDistinctFrom
+		case parser.Is:
+			op = parser.IsNot
+		case parser.IsNot:
+			op = parser.Is
 		default:
 			return parser.MakeDBool(true), false
 		}
@@ -226,6 +242,10 @@ func simplifyNotExpr(evalCtx *parser.EvalContext, n *parser.NotExpr) (parser.Typ
 		return simplifyExpr(evalCtx, parser.NewTypedAndExpr(
 			parser.NewTypedNotExpr(t.TypedLeft()),
 			parser.NewTypedNotExpr(t.TypedRight()),
+		))
+	case *parser.IndexedVar:
+		return simplifyExpr(evalCtx, parser.NewTypedNotExpr(
+			boolVarToComparison(t),
 		))
 	}
 	return parser.MakeDBool(true), false
@@ -1427,7 +1447,28 @@ func simplifyComparisonExpr(
 				), true
 			}
 			return n, true
-		case parser.NE, parser.GE, parser.LE:
+		case parser.NE:
+			// Translate "a != MAX" to "a < MAX" and "a != MIN" to "a > MIN".
+			// These inequalities can be more easily used for index selection.
+			// For datum types with large domains, this isn't particularly
+			// useful. However, for types like BOOL, this is important because
+			// it means we can use an index constraint for queries like
+			// `SELECT * FROM t WHERE b != true`.
+			if right.(parser.Datum).IsMax() {
+				return parser.NewTypedComparisonExpr(
+					parser.LT,
+					left,
+					right,
+				), true
+			} else if right.(parser.Datum).IsMin() {
+				return parser.NewTypedComparisonExpr(
+					parser.GT,
+					left,
+					right,
+				), true
+			}
+			return n, true
+		case parser.GE, parser.LE:
 			return n, true
 		case parser.GT:
 			// This simplification is necessary so that subsequent transformation of
@@ -1474,6 +1515,21 @@ func simplifyComparisonExpr(
 		}
 	}
 	return parser.MakeDBool(true), false
+}
+
+// simplifyBoolVar transforms a boolean IndexedVar into a ComparisonExpr
+// (e.g. WHERE b -> WHERE b = true) This is so index selection only needs
+// to work on ComparisonExprs.
+func simplifyBoolVar(evalCtx *parser.EvalContext, n *parser.IndexedVar) (parser.TypedExpr, bool) {
+	return simplifyExpr(evalCtx, boolVarToComparison(n))
+}
+
+func boolVarToComparison(n *parser.IndexedVar) parser.TypedExpr {
+	return parser.NewTypedComparisonExpr(
+		parser.EQ,
+		n,
+		parser.MakeDBool(true),
+	)
 }
 
 func makePrefixRange(
@@ -1651,10 +1707,12 @@ func (p *planner) analyzeExpr(
 	if sources == nil {
 		resolved = replaced
 	} else {
-		resolved, _, err = p.resolveNames(replaced, sources, iVarHelper)
+		var hasStar bool
+		resolved, _, hasStar, err = p.resolveNames(replaced, sources, iVarHelper)
 		if err != nil {
 			return nil, err
 		}
+		p.hasStar = p.hasStar || hasStar
 	}
 
 	// Type check.

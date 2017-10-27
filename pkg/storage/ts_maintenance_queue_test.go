@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package storage_test
 
@@ -111,7 +109,7 @@ func TestTimeSeriesMaintenanceQueue(t *testing.T) {
 	splitKeys := []roachpb.Key{roachpb.Key("c"), roachpb.Key("b"), roachpb.Key("a")}
 	for _, k := range splitKeys {
 		repl := store.LookupReplica(roachpb.RKey(k), nil)
-		args := adminSplitArgs(k, k)
+		args := adminSplitArgs(k)
 		if _, pErr := client.SendWrappedWith(context.Background(), store, roachpb.Header{
 			RangeID: repl.RangeID,
 		}, args); pErr != nil {
@@ -237,8 +235,8 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 	seriesName := "test.metric"
 	sourceName := "source1"
 	now := tsrv.Clock().PhysicalNow()
-	nearPast := now - (ts.Resolution10s.PruneThreshold() * 2)
-	farPast := now - (ts.Resolution10s.PruneThreshold() * 4)
+	nearPast := now - (tsdb.PruneThreshold(ts.Resolution10s) * 2)
+	farPast := now - (tsdb.PruneThreshold(ts.Resolution10s) * 4)
 	sampleDuration := ts.Resolution10s.SampleDuration()
 	datapoints := []tspb.TimeSeriesDatapoint{
 		{

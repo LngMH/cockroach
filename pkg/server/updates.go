@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -72,19 +73,16 @@ const (
 	updateCheckJitterSeconds = 120
 )
 
-var (
-	diagnosticReportFrequency = settings.RegisterDurationSetting(
-		"diagnostics.reporting.interval",
-		"interval at which diagnostics data should be reported",
-		time.Hour,
-	)
+var diagnosticReportFrequency = settings.RegisterNonNegativeDurationSetting(
+	"diagnostics.reporting.interval",
+	"interval at which diagnostics data should be reported",
+	time.Hour,
+)
 
-	// TODO(dt): this should be split from the report interval.
-	// statsResetFrequency = settings.RegisterDurationSetting(
-	// 	"sql.metrics.statement_details.reset_interval",
-	// 	"interval at which the collected statement statistics should be reset",
-	// 	time.Hour,
-	// )
+var diagnosticsMetricsEnabled = settings.RegisterBoolSetting(
+	"diagnostics.reporting.report_metrics",
+	"enable collection and reporting diagnostic metrics to cockroach labs",
+	true,
 )
 
 // randomly shift `d` to be up to `jitterSec` shorter or longer.
@@ -217,12 +215,6 @@ func (s *Server) checkForUpdates(runningTime time.Duration) bool {
 	return true
 }
 
-var diagnosticsMetricsEnabled = settings.RegisterBoolSetting(
-	"diagnostics.reporting.report_metrics",
-	"enable collection and reporting diagnostic metrics to cockroach labs",
-	true,
-)
-
 func (s *Server) maybeReportDiagnostics(
 	ctx context.Context, now, scheduled time.Time, running time.Duration,
 ) time.Time {
@@ -233,13 +225,13 @@ func (s *Server) maybeReportDiagnostics(
 	// TODO(dt): we should allow tuning the reset and report intervals separately.
 	// Consider something like rand.Float() > resetFreq/reportFreq here to sample
 	// stat reset periods for reporting.
-	if log.DiagnosticsReportingEnabled.Get() && diagnosticsMetricsEnabled.Get() {
+	if log.DiagnosticsReportingEnabled.Get(&s.st.SV) && diagnosticsMetricsEnabled.Get(&s.st.SV) {
 		s.reportDiagnostics(running)
 	}
 	s.sqlExecutor.ResetStatementStats(ctx)
 	s.sqlExecutor.ResetUnimplementedCounts()
 
-	return scheduled.Add(diagnosticReportFrequency.Get())
+	return scheduled.Add(diagnosticReportFrequency.Get(&s.st.SV))
 }
 
 func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.DiagnosticReport {
@@ -276,7 +268,7 @@ func (s *Server) reportDiagnostics(runningTime time.Duration) {
 	ctx, span := s.AnnotateCtxWithSpan(context.Background(), "usageReport")
 	defer span.Finish()
 
-	b, err := s.getReportingInfo(ctx).Marshal()
+	b, err := protoutil.Marshal(s.getReportingInfo(ctx))
 	if err != nil {
 		log.Warning(ctx, err)
 		return
@@ -284,7 +276,6 @@ func (s *Server) reportDiagnostics(runningTime time.Duration) {
 
 	addInfoToURL(reportingURL, s, runningTime)
 	res, err := http.Post(reportingURL.String(), "application/x-protobuf", bytes.NewReader(b))
-
 	if err != nil {
 		if log.V(2) {
 			// This is probably going to be relatively common in production
@@ -293,6 +284,7 @@ func (s *Server) reportDiagnostics(runningTime time.Duration) {
 		}
 		return
 	}
+	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
 		b, err := ioutil.ReadAll(res.Body)

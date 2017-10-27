@@ -11,16 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"math/big"
+	"net"
 	"regexp"
 	"sort"
 	"strconv"
@@ -30,13 +30,16 @@ import (
 	"unsafe"
 
 	"github.com/lib/pq/oid"
-	"github.com/pkg/errors"
 	"golang.org/x/text/collate"
 	"golang.org/x/text/language"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -182,7 +185,8 @@ func makeParseError(s string, typ Type, err error) error {
 	if err != nil {
 		suffix = fmt.Sprintf(": %v", err)
 	}
-	return fmt.Errorf("could not parse '%s' as type %s%s", s, typ, suffix)
+	return pgerror.NewErrorf(
+		pgerror.CodeInvalidTextRepresentationError, "could not parse %q as type %s%s", s, typ, suffix)
 }
 
 func makeUnsupportedComparisonMessage(d1, d2 Datum) string {
@@ -199,6 +203,19 @@ func ParseDBool(s string) (*DBool, error) {
 		return nil, makeParseError(s, TypeBool, err)
 	}
 	return MakeDBool(DBool(b)), nil
+}
+
+// ParseDByte parses a string representation of hex encoded binary data.
+// allowBackslashXFormat determines if the `\x` format of inputting a hex string should be allowed.
+func ParseDByte(s string, allowBackslashXFormat bool) (*DBytes, error) {
+	if allowBackslashXFormat && len(s) >= 2 && (s[0] == '\\' && (s[1] == 'x' || s[1] == 'X')) {
+		hexstr, err := hex.DecodeString(s[2:])
+		if err != nil {
+			return nil, makeParseError(s, TypeBytes, err)
+		}
+		return NewDBytes(DBytes(hexstr)), nil
+	}
+	return NewDBytes(DBytes(s)), nil
 }
 
 // ParseDUuidFromString parses and returns the *DUuid Datum value represented
@@ -221,6 +238,17 @@ func ParseDUuidFromBytes(b []byte) (*DUuid, error) {
 	return NewDUuid(DUuid{uv}), nil
 }
 
+// ParseDIPAddrFromINetString parses and returns the *DIPAddr Datum value
+// represented by the provided input INet string, or an error.
+func ParseDIPAddrFromINetString(s string) (*DIPAddr, error) {
+	var d DIPAddr
+	err := ipaddr.ParseINet(s, &d.IPAddr)
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
 // GetBool gets DBool or an error (also treats NULL as false, not an error).
 func GetBool(d Datum) (DBool, error) {
 	if v, ok := d.(*DBool); ok {
@@ -229,7 +257,8 @@ func GetBool(d Datum) (DBool, error) {
 	if d == DNull {
 		return DBool(false), nil
 	}
-	return false, fmt.Errorf("cannot convert %s to type %s", d.ResolvedType(), TypeBool)
+	return false, pgerror.NewErrorf(
+		pgerror.CodeInternalError, "cannot convert %s to type %s", d.ResolvedType(), TypeBool)
 }
 
 // ResolvedType implements the TypedExpr interface.
@@ -336,7 +365,7 @@ func AsDInt(e Expr) (DInt, bool) {
 func MustBeDInt(e Expr) DInt {
 	i, ok := AsDInt(e)
 	if !ok {
-		panic(fmt.Errorf("expected *DInt, found %T", e))
+		panic(pgerror.NewErrorf(pgerror.CodeInternalError, "expected *DInt, found %T", e))
 	}
 	return i
 }
@@ -408,7 +437,16 @@ func (*DInt) AmbiguousFormat() bool { return true }
 
 // Format implements the NodeFormatter interface.
 func (d *DInt) Format(buf *bytes.Buffer, f FmtFlags) {
+	// If the number is negative, we need to use parens or the `:::INT` type hint
+	// will take precedence over the negation sign.
+	quote := f.disambiguateDatumTypes && *d < 0
+	if quote {
+		buf.WriteByte('(')
+	}
 	buf.WriteString(strconv.FormatInt(int64(*d), 10))
+	if quote {
+		buf.WriteByte(')')
+	}
 }
 
 // Size implements the Datum interface.
@@ -515,11 +553,18 @@ func (*DFloat) AmbiguousFormat() bool { return true }
 // Format implements the NodeFormatter interface.
 func (d *DFloat) Format(buf *bytes.Buffer, f FmtFlags) {
 	fl := float64(*d)
+	quote := f.disambiguateDatumTypes && (math.IsNaN(fl) || math.IsInf(fl, 0))
+	if quote {
+		buf.WriteByte('\'')
+	}
 	if _, frac := math.Modf(fl); frac == 0 && -1000000 < *d && *d < 1000000 {
 		// d is a small whole number. Ensure it is printed using a decimal point.
 		fmt.Fprintf(buf, "%.1f", fl)
 	} else {
 		fmt.Fprintf(buf, "%g", fl)
+	}
+	if quote {
+		buf.WriteByte('\'')
 	}
 }
 
@@ -543,6 +588,14 @@ type DDecimal struct {
 // provided string, or an error if parsing is unsuccessful.
 func ParseDDecimal(s string) (*DDecimal, error) {
 	dd := &DDecimal{}
+	err := dd.SetString(s)
+	return dd, err
+}
+
+// ParseDDecimalVal parses and returns the DDecimal value represented by the
+// provided string, or an error if parsing is unsuccessful.
+func ParseDDecimalVal(s string) (DDecimal, error) {
+	dd := DDecimal{}
 	err := dd.SetString(s)
 	return dd, err
 }
@@ -640,16 +693,20 @@ func (d *DDecimal) Format(buf *bytes.Buffer, f FmtFlags) {
 	if quote {
 		buf.WriteByte('\'')
 	}
-	buf.WriteString(d.Decimal.ToStandard())
+	buf.WriteString(d.Decimal.String())
 	if quote {
-		buf.WriteString(`'::DECIMAL`)
+		buf.WriteByte('\'')
 	}
+}
+
+func (d *DDecimal) rawSize() uintptr {
+	intVal := d.Decimal.Coeff
+	return uintptr(cap(intVal.Bits())) * unsafe.Sizeof(big.Word(0))
 }
 
 // Size implements the Datum interface.
 func (d *DDecimal) Size() uintptr {
-	intVal := d.Decimal.Coeff
-	return unsafe.Sizeof(*d) + uintptr(cap(intVal.Bits()))*unsafe.Sizeof(big.Word(0))
+	return unsafe.Sizeof(*d) + d.rawSize()
 }
 
 var (
@@ -699,7 +756,7 @@ func AsDString(e Expr) (DString, bool) {
 func MustBeDString(e Expr) DString {
 	i, ok := AsDString(e)
 	if !ok {
-		panic(fmt.Errorf("expected *DString, found %T", e))
+		panic(pgerror.NewErrorf(pgerror.CodeInternalError, "expected *DString, found %T", e))
 	}
 	return i
 }
@@ -765,7 +822,11 @@ func (*DString) AmbiguousFormat() bool { return true }
 
 // Format implements the NodeFormatter interface.
 func (d *DString) Format(buf *bytes.Buffer, f FmtFlags) {
-	encodeSQLStringWithFlags(buf, string(*d), f)
+	if f.withinArray {
+		encodeSQLStringInsideArray(buf, string(*d))
+	} else {
+		encodeSQLStringWithFlags(buf, string(*d), f)
+	}
 }
 
 // Size implements the Datum interface.
@@ -786,7 +847,7 @@ type DCollatedString struct {
 // construct collation keys efficiently.
 type CollationEnvironment struct {
 	cache  map[string]collationEnvironmentCacheEntry
-	buffer collate.Buffer
+	buffer *collate.Buffer
 }
 
 type collationEnvironmentCacheEntry struct {
@@ -814,7 +875,10 @@ func NewDCollatedString(
 	contents string, locale string, env *CollationEnvironment,
 ) *DCollatedString {
 	entry := env.getCacheEntry(locale)
-	key := entry.collator.KeyFromString(&env.buffer, contents)
+	if env.buffer == nil {
+		env.buffer = &collate.Buffer{}
+	}
+	key := entry.collator.KeyFromString(env.buffer, contents)
 	d := DCollatedString{contents, entry.locale, make([]byte, len(key))}
 	copy(d.Key, key)
 	env.buffer.Reset()
@@ -826,9 +890,13 @@ func (*DCollatedString) AmbiguousFormat() bool { return false }
 
 // Format implements the NodeFormatter interface.
 func (d *DCollatedString) Format(buf *bytes.Buffer, f FmtFlags) {
-	encodeSQLString(buf, d.Contents)
-	buf.WriteString(" COLLATE ")
-	encodeSQLIdent(buf, d.Locale, FmtSimple)
+	if f.withinArray {
+		encodeSQLStringInsideArray(buf, d.Contents)
+	} else {
+		encodeSQLString(buf, d.Contents)
+		buf.WriteString(" COLLATE ")
+		encodeSQLIdent(buf, d.Locale, FmtSimple)
+	}
 }
 
 // ResolvedType implements the TypedExpr interface.
@@ -956,11 +1024,16 @@ func (d *DBytes) max() (Datum, bool) {
 }
 
 // AmbiguousFormat implements the Datum interface.
-func (*DBytes) AmbiguousFormat() bool { return false }
+func (*DBytes) AmbiguousFormat() bool { return true }
 
 // Format implements the NodeFormatter interface.
 func (d *DBytes) Format(buf *bytes.Buffer, f FmtFlags) {
-	encodeSQLBytes(buf, string(*d))
+	buf.WriteString("'\\x")
+	b := string(*d)
+	for i := 0; i < len(b); i++ {
+		buf.Write(rawHexMap[b[i]])
+	}
+	buf.WriteByte('\'')
 }
 
 // Size implements the Datum interface.
@@ -1044,11 +1117,175 @@ func (*DUuid) AmbiguousFormat() bool { return false }
 
 // Format implements the NodeFormatter interface.
 func (d *DUuid) Format(buf *bytes.Buffer, f FmtFlags) {
-	encodeSQLString(buf, d.UUID.String())
+	if !f.bareStrings {
+		buf.WriteByte('\'')
+	}
+	buf.WriteString(d.UUID.String())
+	if !f.bareStrings {
+		buf.WriteByte('\'')
+	}
 }
 
 // Size implements the Datum interface.
 func (d *DUuid) Size() uintptr {
+	return unsafe.Sizeof(*d)
+}
+
+// DIPAddr is the IPAddr Datum.
+type DIPAddr struct {
+	ipaddr.IPAddr
+}
+
+// NewDIPAddr is a helper routine to create a *DIPAddr initialized from its
+// argument.
+func NewDIPAddr(d DIPAddr) *DIPAddr {
+	return &d
+}
+
+// AsDIPAddr attempts to retrieve a *DIPAddr from an Expr, returning a *DIPAddr and
+// a flag signifying whether the assertion was successful. The function should
+// be used instead of direct type assertions wherever a *DIPAddr wrapped by a
+// *DOidWrapper is possible.
+func AsDIPAddr(e Expr) (DIPAddr, bool) {
+	switch t := e.(type) {
+	case *DIPAddr:
+		return *t, true
+	case *DOidWrapper:
+		return AsDIPAddr(t.Wrapped)
+	}
+	return DIPAddr{}, false
+}
+
+// MustBeDIPAddr attempts to retrieve a DIPAddr from an Expr, panicking if the
+// assertion fails.
+func MustBeDIPAddr(e Expr) DIPAddr {
+	i, ok := AsDIPAddr(e)
+	if !ok {
+		panic(pgerror.NewErrorf(pgerror.CodeInternalError, "expected *DIPAddr, found %T", e))
+	}
+	return i
+}
+
+// ResolvedType implements the TypedExpr interface.
+func (*DIPAddr) ResolvedType() Type {
+	return TypeINet
+}
+
+// Compare implements the Datum interface.
+func (d *DIPAddr) Compare(ctx *EvalContext, other Datum) int {
+	if other == DNull {
+		// NULL is less than any non-NULL value.
+		return 1
+	}
+	v, ok := other.(*DIPAddr)
+	if !ok {
+		panic(makeUnsupportedComparisonMessage(d, other))
+	}
+
+	return d.IPAddr.Compare(&v.IPAddr)
+}
+
+func (d DIPAddr) equal(other *DIPAddr) bool {
+	return d.IPAddr.Equal(&other.IPAddr)
+}
+
+// Prev implements the Datum interface.
+func (d *DIPAddr) Prev() (Datum, bool) {
+	// We will do one of the following to get the Prev IPAddr:
+	//	- Decrement IP address if we won't underflow the IP.
+	//	- Decrement mask and set the IP to max in family if we will underflow.
+	//	- Jump down from IPv6 to IPv4 if we will underflow both IP and mask.
+	if d.Family == ipaddr.IPv6family && d.Addr.Equal(dIPv6min) {
+		if d.Mask == 0 {
+			// Jump down IP family.
+			return dMaxIPv4Addr, true
+		}
+		// Decrease mask size, wrap IPv6 IP address.
+		return NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv6family, Addr: dIPv6max, Mask: d.Mask - 1}}), true
+	} else if d.Family == ipaddr.IPv4family && d.Addr.Equal(dIPv4min) {
+		// Decrease mask size, wrap IPv4 IP address.
+		return NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv4family, Addr: dIPv4max, Mask: d.Mask - 1}}), true
+	}
+	// Decrement IP address.
+	return NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: d.Family, Addr: d.Addr.Sub(1), Mask: d.Mask}}), true
+}
+
+// Next implements the Datum interface.
+func (d *DIPAddr) Next() (Datum, bool) {
+	// We will do one of a few things to get the Next IP address:
+	//	- Increment IP address if we won't overflow the IP.
+	//	- Increment mask and set the IP to min in family if we will overflow.
+	//	- Jump up from IPv4 to IPv6 if we will overflow both IP and mask.
+	if d.Family == ipaddr.IPv4family && d.Addr.Equal(dIPv4max) {
+		if d.Mask == 32 {
+			// Jump up IP family.
+			return dMinIPv6Addr, true
+		}
+		// Increase mask size, wrap IPv4 IP address.
+		return NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv4family, Addr: dIPv4min, Mask: d.Mask + 1}}), true
+	} else if d.Family == ipaddr.IPv6family && d.Addr.Equal(dIPv6max) {
+		// Increase mask size, wrap IPv6 IP address.
+		return NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv6family, Addr: dIPv6min, Mask: d.Mask + 1}}), true
+	}
+	// Increment IP address.
+	return NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: d.Family, Addr: d.Addr.Add(1), Mask: d.Mask}}), true
+}
+
+// IsMax implements the Datum interface.
+func (d *DIPAddr) IsMax() bool {
+	return d.equal(dMaxIPAddr)
+}
+
+// IsMin implements the Datum interface.
+func (d *DIPAddr) IsMin() bool {
+	return d.equal(dMinIPAddr)
+}
+
+// dIPv4 and dIPv6 min and maxes use ParseIP because the actual byte constant is
+// no equal to solely zeros or ones. For IPv4 there is a 0xffff prefix. Without
+// this prefix this makes IP arithmetic invalid.
+var dIPv4min = ipaddr.Addr(uint128.FromBytes([]byte(net.ParseIP("0.0.0.0"))))
+var dIPv4max = ipaddr.Addr(uint128.FromBytes([]byte(net.ParseIP("255.255.255.255"))))
+var dIPv6min = ipaddr.Addr(uint128.FromBytes([]byte(net.ParseIP("::"))))
+var dIPv6max = ipaddr.Addr(uint128.FromBytes([]byte(net.ParseIP("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"))))
+
+// dMaxIPv4Addr and dMinIPv6Addr are used as global constants to prevent extra
+// heap extra allocation
+var dMaxIPv4Addr = NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv4family, Addr: dIPv4max, Mask: 32}})
+var dMinIPv6Addr = NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv6family, Addr: dIPv6min, Mask: 0}})
+
+// dMinIPAddr and dMaxIPAddr are used as the DIPAddr global min and max.
+var dMinIPAddr = NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv4family, Addr: dIPv4min, Mask: 0}})
+var dMaxIPAddr = NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv6family, Addr: dIPv6max, Mask: 128}})
+
+// min implements the Datum interface.
+func (*DIPAddr) min() (Datum, bool) {
+	return dMinIPAddr, true
+}
+
+// max implements the Datum interface.
+func (*DIPAddr) max() (Datum, bool) {
+	return dMaxIPAddr, true
+}
+
+// AmbiguousFormat implements the Datum interface.
+func (*DIPAddr) AmbiguousFormat() bool {
+	return false
+}
+
+// Format implements the NodeFormatter interface.
+func (d *DIPAddr) Format(buf *bytes.Buffer, f FmtFlags) {
+	if !f.bareStrings {
+		buf.WriteByte('\'')
+	}
+	buf.WriteString(d.IPAddr.String())
+	if !f.bareStrings {
+		buf.WriteByte('\'')
+	}
+}
+
+// Size implements the Datum interface.
+func (d *DIPAddr) Size() uintptr {
 	return unsafe.Sizeof(*d)
 }
 
@@ -1078,7 +1315,7 @@ func ParseDDate(s string, loc *time.Location) (*DDate, error) {
 		return nil, err
 	}
 
-	return NewDDateFromTime(t, loc), nil
+	return NewDDateFromTime(t, time.UTC), nil
 }
 
 // ResolvedType implements the TypedExpr interface.
@@ -1150,7 +1387,7 @@ func (d *DDate) Format(buf *bytes.Buffer, f FmtFlags) {
 	if !f.bareStrings {
 		buf.WriteByte('\'')
 	}
-	buf.WriteString(time.Unix(int64(*d)*secondsInDay, 0).UTC().Format(dateFormat))
+	buf.WriteString(timeutil.Unix(int64(*d)*secondsInDay, 0).Format(dateFormat))
 	if !f.bareStrings {
 		buf.WriteByte('\'')
 	}
@@ -1222,13 +1459,15 @@ var (
 func parseTimestampInLocation(s string, loc *time.Location, typ Type) (time.Time, error) {
 	origS := s
 	l := len(s)
-	// HACK: go doesn't handle offsets that are not zero-padded from psql/jdbc.
-	// Thus, if we see `2015-10-05 3:0:5 +0:0:0` we need to change it to
-	// `... 3:00:50 +00:00:00`.
-	s = loneZeroRMatch.ReplaceAllString(s, ":0${1}")
-	// This must be run twice, since ReplaceAllString doesn't touch overlapping
-	// matches and thus wouldn't fix a string of the form 3:3:3.
-	s = loneZeroRMatch.ReplaceAllString(s, ":0${1}")
+	if loneZeroRMatch.MatchString(s) {
+		// HACK: go doesn't handle offsets that are not zero-padded from psql/jdbc.
+		// Thus, if we see `2015-10-05 3:0:5 +0:0:0` we need to change it to
+		// `... 3:00:50 +00:00:00`.
+		s = loneZeroRMatch.ReplaceAllString(s, ":0${1}")
+		// This must be run twice, since ReplaceAllString doesn't touch overlapping
+		// matches and thus wouldn't fix a string of the form 3:3:3.
+		s = loneZeroRMatch.ReplaceAllString(s, ":0${1}")
+	}
 
 	if loc := tzMatch.FindStringIndex(s); loc != nil && l > loc[1] {
 		// Remove `:` characters from timezone specifier and pad to 6 digits. A
@@ -1273,7 +1512,7 @@ func parseTimestampInLocation(s string, loc *time.Location, typ Type) (time.Time
 // ends up catching too many users, we may need to do the same.
 func checkForMissingZone(t time.Time, parseLoc *time.Location) error {
 	if z, off := t.Zone(); off == 0 && t.Location() != parseLoc && z != "UTC" && !strings.HasPrefix(z, "GMT") {
-		return errors.Errorf("unknown zone %q", z)
+		return pgerror.NewErrorf(pgerror.CodeInvalidDatetimeFormatError, "unknown zone %q", z)
 	}
 	return nil
 }
@@ -1403,7 +1642,7 @@ func MakeDTimestampTZ(t time.Time, precision time.Duration) *DTimestampTZ {
 
 // MakeDTimestampTZFromDate creates a DTimestampTZ from a DDate.
 func MakeDTimestampTZFromDate(loc *time.Location, d *DDate) *DTimestampTZ {
-	year, month, day := time.Unix(int64(*d)*secondsInDay, 0).UTC().Date()
+	year, month, day := timeutil.Unix(int64(*d)*secondsInDay, 0).Date()
 	return MakeDTimestampTZ(time.Date(year, month, day, 0, 0, 0, 0, loc), time.Microsecond)
 }
 
@@ -1477,7 +1716,7 @@ func (d *DTimestampTZ) Format(buf *bytes.Buffer, f FmtFlags) {
 	if !f.bareStrings {
 		buf.WriteByte('\'')
 	}
-	buf.WriteString(d.UTC().Format(TimestampOutputFormat))
+	buf.WriteString(d.Time.Format(TimestampOutputFormat))
 	if !f.bareStrings {
 		buf.WriteByte('\'')
 	}
@@ -1694,6 +1933,204 @@ func (d *DInterval) Size() uintptr {
 	return unsafe.Sizeof(*d)
 }
 
+type jsonType int
+
+// The ordering in this enum is significant and used for JSON value ordering.
+const (
+	_ jsonType = iota
+	nullJSONType
+	stringJSONType
+	numberJSONType
+	falseJSONType
+	trueJSONType
+	arrayJSONType
+	objectJSONType
+)
+
+type jsonKeyValuePair struct {
+	k DString
+	v DJSON
+}
+
+// DJSON is the JSON Datum.
+// TODO(justin): stored as a struct rather than an interface with the belief
+// that this might help with method dispatch overhead and GC pressure, but this
+// assumption still needs to be tested with a benchmark.
+// It's very possibly a net lose, because in the common case we'll have objects
+// or arrays at the top level and thus have pointers anyway, and this bloats the
+// size of a DJSON considerably.
+// Not to mention it will largely be dealt with as a Datum anyway, so it's
+// already a pointer in that case.
+type DJSON struct {
+	typ      jsonType
+	numVal   DDecimal
+	strVal   DString
+	arrayVal []DJSON
+	// objectVal is a list of kv pairs sorted by key.
+	// TODO(justin): it might make more sense to store this as a map (or ALSO as a
+	// map) for lookups, but for the moment this simplifies comparisons and it will
+	// simplify encoding.
+	objectVal []jsonKeyValuePair
+}
+
+// ResolvedType implements the TypedExpr interface.
+func (*DJSON) ResolvedType() Type {
+	return TypeJSON
+}
+
+// Compare implements the Datum interface.
+func (d *DJSON) Compare(ctx *EvalContext, other Datum) int {
+	if other == DNull {
+		// NULL is less than any non-NULL value.
+		return 1
+	}
+	v, ok := other.(*DJSON)
+	if !ok {
+		panic(makeUnsupportedComparisonMessage(d, other))
+	}
+	if v.typ > d.typ {
+		return -1
+	}
+	if v.typ < d.typ {
+		return 1
+	}
+	switch d.typ {
+	case numberJSONType:
+		return d.numVal.Compare(ctx, &v.numVal)
+	case stringJSONType:
+		return d.strVal.Compare(ctx, &v.strVal)
+	case arrayJSONType:
+		if len(v.arrayVal) > len(d.arrayVal) {
+			return -1
+		}
+		if len(v.arrayVal) < len(d.arrayVal) {
+			return 1
+		}
+		for i := 0; i < len(d.arrayVal); i++ {
+			cmp := d.arrayVal[i].Compare(ctx, &v.arrayVal[i])
+			if cmp != 0 {
+				return cmp
+			}
+		}
+		return 0
+	case objectJSONType:
+		if len(v.objectVal) > len(d.objectVal) {
+			return -1
+		}
+		if len(v.objectVal) < len(d.objectVal) {
+			return 1
+		}
+		for i := 0; i < len(d.objectVal); i++ {
+			cmpKey := d.objectVal[i].k.Compare(ctx, &v.objectVal[i].k)
+			if cmpKey != 0 {
+				return cmpKey
+			}
+			cmpVal := d.objectVal[i].v.Compare(ctx, &v.objectVal[i].v)
+			if cmpVal != 0 {
+				return cmpVal
+			}
+		}
+		return 0
+	}
+	return 0
+}
+
+// Prev implements the Datum interface.
+func (d *DJSON) Prev() (Datum, bool) {
+	return nil, false
+}
+
+// Next implements the Datum interface.
+func (d *DJSON) Next() (Datum, bool) {
+	return nil, false
+}
+
+// IsMax implements the Datum interface.
+func (d *DJSON) IsMax() bool {
+	return false
+}
+
+// IsMin implements the Datum interface.
+func (d *DJSON) IsMin() bool {
+	return d.typ == nullJSONType
+}
+
+// max implements the Datum interface.
+func (d *DJSON) max() (Datum, bool) {
+	return nil, false
+}
+
+// min implements the Datum interface.
+func (d *DJSON) min() (Datum, bool) {
+	return &DJSON{typ: nullJSONType}, true
+}
+
+// AmbiguousFormat implements the Datum interface.
+func (*DJSON) AmbiguousFormat() bool { return true }
+
+// Format implements the NodeFormatter interface.
+func (d *DJSON) Format(buf *bytes.Buffer, f FmtFlags) {
+	switch d.typ {
+	case numberJSONType:
+		d.numVal.Format(buf, f)
+	case stringJSONType:
+		encodeJSONString(buf, string(d.strVal), f)
+	case trueJSONType:
+		buf.WriteString("true")
+	case falseJSONType:
+		buf.WriteString("false")
+	case nullJSONType:
+		buf.WriteString("null")
+	case arrayJSONType:
+		buf.WriteByte('[')
+		for i := range d.arrayVal {
+			if i != 0 {
+				buf.WriteByte(',')
+			}
+			d.arrayVal[i].Format(buf, f)
+		}
+		buf.WriteByte(']')
+	case objectJSONType:
+		buf.WriteByte('{')
+		for i := range d.objectVal {
+			if i != 0 {
+				buf.WriteByte(',')
+			}
+			encodeJSONString(buf, string(d.objectVal[i].k), f)
+			buf.WriteByte(':')
+			d.objectVal[i].v.Format(buf, f)
+		}
+		buf.WriteByte('}')
+	}
+}
+
+// Size implements the Datum interface.
+// TODO(justin): is this a frequently-called method? Should we be caching the computed size?
+func (d *DJSON) Size() uintptr {
+	var valSize uintptr
+	switch d.typ {
+	// We can't defer to DDecimal or DString for number or string because those
+	// count the size of the containing pointer, which we already account for.
+	case numberJSONType:
+		valSize = d.numVal.rawSize()
+	case stringJSONType:
+		valSize = uintptr(len(d.strVal))
+	case arrayJSONType:
+		for i := range d.arrayVal {
+			valSize += d.arrayVal[i].Size()
+		}
+	case objectJSONType:
+		for i := range d.objectVal {
+			valSize += d.objectVal[i].k.Size()
+			valSize += d.objectVal[i].v.Size()
+		}
+	case trueJSONType: // 0
+	case falseJSONType: // 0
+	case nullJSONType: // 0
+	}
+	return unsafe.Sizeof(*d) + valSize
+}
+
 // DTuple is the tuple Datum.
 type DTuple struct {
 	D Datums
@@ -1716,6 +2153,20 @@ func NewDTupleWithLen(l int) *DTuple {
 // NewDTupleWithCap creates a *DTuple with the provided capacity.
 func NewDTupleWithCap(c int) *DTuple {
 	return &DTuple{D: make(Datums, 0, c)}
+}
+
+// AsDTuple attempts to retrieve a *DTuple from an Expr, returning a *DTuple and
+// a flag signifying whether the assertion was successful. The function should
+// be used instead of direct type assertions wherever a *DTuple wrapped by a
+// *DOidWrapper is possible.
+func AsDTuple(e Expr) (*DTuple, bool) {
+	switch t := e.(type) {
+	case *DTuple:
+		return t, true
+	case *DOidWrapper:
+		return AsDTuple(t.Wrapped)
+	}
+	return nil, false
 }
 
 // ResolvedType implements the TypedExpr interface.
@@ -2047,7 +2498,7 @@ func AsDArray(e Expr) (*DArray, bool) {
 func MustBeDArray(e Expr) *DArray {
 	i, ok := AsDArray(e)
 	if !ok {
-		panic(fmt.Errorf("expected *DArray, found %T", e))
+		panic(pgerror.NewErrorf(pgerror.CodeInternalError, "expected *DArray, found %T", e))
 	}
 	return i
 }
@@ -2134,6 +2585,20 @@ func (d *DArray) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteByte(']')
 }
 
+const maxArrayLength = math.MaxInt32
+
+var arrayTooLongError = pgerror.NewErrorf(
+	pgerror.CodeDataExceptionError, "ARRAYs can be at most 2^31-1 elements long")
+
+// Validate checks that the given array is valid,
+// for example, that it's not too big.
+func (d *DArray) Validate() error {
+	if d.Len() > maxArrayLength {
+		return arrayTooLongError
+	}
+	return nil
+}
+
 // Len returns the length of the Datum array.
 func (d *DArray) Len() int {
 	return len(d.Array)
@@ -2149,14 +2614,18 @@ func (d *DArray) Size() uintptr {
 	return sz
 }
 
-var errNonHomogeneousArray = errors.New("multidimensional arrays must have array expressions with matching dimensions")
+var errNonHomogeneousArray = pgerror.NewError(pgerror.CodeArraySubscriptError, "multidimensional arrays must have array expressions with matching dimensions")
 
 // Append appends a Datum to the array, whose parameterized type must be
 // consistent with the type of the Datum.
 func (d *DArray) Append(v Datum) error {
 	if v != DNull && !d.ParamTyp.Equivalent(v.ResolvedType()) {
-		return errors.Errorf("cannot append %s to array containing %s", d.ParamTyp,
+		return pgerror.NewErrorf(
+			pgerror.CodeInternalError, "cannot append %s to array containing %s", d.ParamTyp,
 			v.ResolvedType())
+	}
+	if d.Len() >= maxArrayLength {
+		return arrayTooLongError
 	}
 	if _, ok := d.ParamTyp.(TArray); ok {
 		if v == DNull {
@@ -2177,7 +2646,7 @@ func (d *DArray) Append(v Datum) error {
 		d.HasNulls = true
 	}
 	d.Array = append(d.Array, v)
-	return nil
+	return d.Validate()
 }
 
 // DTable is the table Datum. It is used for datums that hold an
@@ -2202,7 +2671,7 @@ func (t *DTable) Format(buf *bytes.Buffer, _ FmtFlags) {
 
 // ResolvedType implements the TypedExpr interface.
 func (t *DTable) ResolvedType() Type {
-	return TTable{t.ValueGenerator.ColumnTypes()}
+	return t.ValueGenerator.ResolvedType()
 }
 
 // Compare implements the Datum interface.
@@ -2370,13 +2839,14 @@ func wrapWithOid(d Datum, oid oid.Oid) Datum {
 	case *DString:
 	case *DArray:
 	case dNull, *DOidWrapper:
-		panic(fmt.Errorf("cannot wrap %T with an Oid", v))
+		panic(pgerror.NewErrorf(
+			pgerror.CodeInternalError, "cannot wrap %T with an Oid", v))
 	default:
 		// Currently only *DInt, *DString, *DArray are hooked up to work with
 		// *DOidWrapper. To support another base Datum type, replace all type
 		// assertions to that type with calls to functions like AsDInt and
 		// MustBeDInt.
-		panic(fmt.Errorf("unsupported Datum type passed to wrapWithOid: %T", d))
+		panic(pgerror.NewErrorf(pgerror.CodeInternalError, "unsupported Datum type passed to wrapWithOid: %T", d))
 	}
 	return &DOidWrapper{
 		Wrapped: d,

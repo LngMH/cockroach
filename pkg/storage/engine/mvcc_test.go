@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Jiang-Ming Yang (jiangming.yang@gmail.com)
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package engine
 
@@ -21,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"math/rand"
 	"reflect"
 	"sort"
 	"strconv"
@@ -39,11 +37,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/zerofields"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/shuffle"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -60,13 +60,13 @@ var (
 	testKey4     = roachpb.Key("/db4")
 	testKey5     = roachpb.Key("/db5")
 	testKey6     = roachpb.Key("/db6")
-	txn1         = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: &txn1ID, Epoch: 1, Timestamp: hlc.Timestamp{Logical: 1}}}
-	txn1Commit   = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: &txn1ID, Epoch: 1, Timestamp: hlc.Timestamp{Logical: 1}}, Status: roachpb.COMMITTED}
-	txn1Abort    = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: &txn1ID, Epoch: 1}, Status: roachpb.ABORTED}
-	txn1e2       = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: &txn1ID, Epoch: 2, Timestamp: hlc.Timestamp{Logical: 1}}}
-	txn1e2Commit = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: &txn1ID, Epoch: 2, Timestamp: hlc.Timestamp{Logical: 1}}, Status: roachpb.COMMITTED}
-	txn2         = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: &txn2ID, Timestamp: hlc.Timestamp{Logical: 1}}}
-	txn2Commit   = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: &txn2ID, Timestamp: hlc.Timestamp{Logical: 1}}, Status: roachpb.COMMITTED}
+	txn1         = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 1, Timestamp: hlc.Timestamp{Logical: 1}}}
+	txn1Commit   = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 1, Timestamp: hlc.Timestamp{Logical: 1}}, Status: roachpb.COMMITTED}
+	txn1Abort    = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 1}, Status: roachpb.ABORTED}
+	txn1e2       = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 2, Timestamp: hlc.Timestamp{Logical: 1}}}
+	txn1e2Commit = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn1ID, Epoch: 2, Timestamp: hlc.Timestamp{Logical: 1}}, Status: roachpb.COMMITTED}
+	txn2         = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn2ID, Timestamp: hlc.Timestamp{Logical: 1}}}
+	txn2Commit   = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{Key: roachpb.Key("a"), ID: txn2ID, Timestamp: hlc.Timestamp{Logical: 1}}, Status: roachpb.COMMITTED}
 	value1       = roachpb.MakeValueFromString("testValue1")
 	value2       = roachpb.MakeValueFromString("testValue2")
 	value3       = roachpb.MakeValueFromString("testValue3")
@@ -249,6 +249,7 @@ func TestMVCCKeys(t *testing.T) {
 	}
 	sortKeys := make(mvccKeys, len(keys))
 	copy(sortKeys, keys)
+	shuffle.Shuffle(sortKeys)
 	sort.Sort(sortKeys)
 	if !reflect.DeepEqual(sortKeys, keys) {
 		t.Errorf("expected keys to sort in order %s, but got %s", keys, sortKeys)
@@ -634,8 +635,7 @@ func TestMVCCGetUncertainty(t *testing.T) {
 	engine := createTestEngine()
 	defer engine.Close()
 
-	u := uuid.MakeV4()
-	txn := &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{ID: &u, Timestamp: hlc.Timestamp{WallTime: 5}}, MaxTimestamp: hlc.Timestamp{WallTime: 10}}
+	txn := &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{ID: uuid.MakeV4(), Timestamp: hlc.Timestamp{WallTime: 5}}, MaxTimestamp: hlc.Timestamp{WallTime: 10}}
 	// Put a value from the past.
 	if err := MVCCPut(context.Background(), engine, nil, testKey1, hlc.Timestamp{WallTime: 1}, value1, nil); err != nil {
 		t.Fatal(err)
@@ -2039,19 +2039,45 @@ func TestMVCCInitPut(t *testing.T) {
 	engine := createTestEngine()
 	defer engine.Close()
 
-	err := MVCCInitPut(context.Background(), engine, nil, testKey1, hlc.Timestamp{Logical: 1}, value1, nil)
+	ctx := context.Background()
+	err := MVCCInitPut(ctx, engine, nil, testKey1, hlc.Timestamp{Logical: 1}, value1, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// A repeat of the command will still succeed
-	err = MVCCInitPut(context.Background(), engine, nil, testKey1, hlc.Timestamp{Logical: 2}, value1, nil)
+	err = MVCCInitPut(ctx, engine, nil, testKey1, hlc.Timestamp{Logical: 2}, value1, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete.
+	err = MVCCDelete(ctx, engine, nil, testKey1, hlc.Timestamp{Logical: 3}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Reinserting the value fails if we fail on tombstones.
+	err = MVCCInitPut(ctx, engine, nil, testKey1, hlc.Timestamp{Logical: 4}, value1, true, nil)
+	switch e := err.(type) {
+	case *roachpb.ConditionFailedError:
+		if !bytes.Equal(e.ActualValue.RawBytes, nil) {
+			t.Fatalf("the value %s in get result is not a tombstone", e.ActualValue.RawBytes)
+		}
+	case nil:
+		t.Fatal("MVCCInitPut with a different value did not fail")
+	default:
+		t.Fatalf("unexpected error %T", e)
+	}
+
+	// But doesn't if we *don't* fail on tombstones.
+	err = MVCCInitPut(ctx, engine, nil, testKey1, hlc.Timestamp{Logical: 5}, value1, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// A repeat of the command with a different value will fail.
-	err = MVCCInitPut(context.Background(), engine, nil, testKey1, hlc.Timestamp{Logical: 3}, value2, nil)
+	err = MVCCInitPut(ctx, engine, nil, testKey1, hlc.Timestamp{Logical: 6}, value2, false, nil)
 	switch e := err.(type) {
 	case *roachpb.ConditionFailedError:
 		if !bytes.Equal(e.ActualValue.RawBytes, value1.RawBytes) {
@@ -2065,7 +2091,7 @@ func TestMVCCInitPut(t *testing.T) {
 	}
 
 	for _, ts := range []hlc.Timestamp{{Logical: 1}, {Logical: 2}, {WallTime: 1}} {
-		value, _, err := MVCCGet(context.Background(), engine, testKey1, ts, true, nil)
+		value, _, err := MVCCGet(ctx, engine, testKey1, ts, true, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2074,12 +2100,18 @@ func TestMVCCInitPut(t *testing.T) {
 				value1.RawBytes, value.RawBytes)
 		}
 		// Ensure that the timestamp didn't get updated.
-		if expTS := (hlc.Timestamp{Logical: 1}); value.Timestamp != expTS {
+		expTS := (hlc.Timestamp{Logical: 1})
+		if ts.WallTime != 0 {
+			// If we're checking the future wall time case, the rewrite after delete
+			// will be present.
+			expTS.Logical = 5
+		}
+		if value.Timestamp != expTS {
 			t.Errorf("value at timestamp %s seen, expected %s", value.Timestamp, expTS)
 		}
 	}
 
-	value, _, pErr := MVCCGet(context.Background(), engine, testKey1, hlc.Timestamp{Logical: 0}, true, nil)
+	value, _, pErr := MVCCGet(ctx, engine, testKey1, hlc.Timestamp{Logical: 0}, true, nil)
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -2097,14 +2129,14 @@ func TestMVCCInitPutWithTxn(t *testing.T) {
 
 	txn := *txn1
 	txn.Sequence++
-	err := MVCCInitPut(context.Background(), engine, nil, testKey1, clock.Now(), value1, &txn)
+	err := MVCCInitPut(context.Background(), engine, nil, testKey1, clock.Now(), value1, false, &txn)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// A repeat of the command will still succeed.
 	txn.Sequence++
-	err = MVCCInitPut(context.Background(), engine, nil, testKey1, clock.Now(), value1, &txn)
+	err = MVCCInitPut(context.Background(), engine, nil, testKey1, clock.Now(), value1, false, &txn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2113,7 +2145,7 @@ func TestMVCCInitPutWithTxn(t *testing.T) {
 	// will still succeed.
 	txn.Sequence++
 	txn.Epoch = 2
-	err = MVCCInitPut(context.Background(), engine, nil, testKey1, clock.Now(), value2, &txn)
+	err = MVCCInitPut(context.Background(), engine, nil, testKey1, clock.Now(), value2, false, &txn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2133,7 +2165,7 @@ func TestMVCCInitPutWithTxn(t *testing.T) {
 	}
 
 	// Write value4 with an old timestamp without txn...should get an error.
-	err = MVCCInitPut(context.Background(), engine, nil, testKey1, clock.Now(), value4, nil)
+	err = MVCCInitPut(context.Background(), engine, nil, testKey1, clock.Now(), value4, false, nil)
 	switch e := err.(type) {
 	case *roachpb.ConditionFailedError:
 		if !bytes.Equal(e.ActualValue.RawBytes, value2.RawBytes) {
@@ -2276,6 +2308,41 @@ func TestMVCCReverseScan(t *testing.T) {
 	}
 	if expected := (roachpb.Span{Key: testKey2, EndKey: testKey4}); !resumeSpan.EqualValue(expected) {
 		t.Fatalf("expected = %+v, resumeSpan = %+v", expected, resumeSpan)
+	}
+}
+
+// TestMVCCReverseScanFirstKeyInFuture verifies that when MVCCReverseScan scans
+// encounter a key with only future timestamps first, that it skips the key and
+// continues to scan in reverse. #17825 was caused by this not working correctly.
+func TestMVCCReverseScanFirstKeyInFuture(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	engine := createTestEngine()
+	defer engine.Close()
+
+	// The value at key2 will be at a lower timestamp than the ReverseScan, but
+	// the value at key3 will be at a larger timetamp. The ReverseScan should
+	// see key3 and ignore it because none of it versions are at a low enough
+	// timestamp to read. It should then continue scanning backwards and find a
+	// value at key2.
+	//
+	// Before fixing #17825, the MVCC version scan on key3 would fall out of the
+	// scan bounds and if it never found another valid key before reaching
+	// KeyMax, would stop the ReverseScan from continuing.
+	if err := MVCCPut(context.Background(), engine, nil, testKey2, hlc.Timestamp{WallTime: 1}, value2, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := MVCCPut(context.Background(), engine, nil, testKey3, hlc.Timestamp{WallTime: 3}, value3, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	kvs, _, _, err := MVCCReverseScan(context.Background(), engine, testKey1, testKey4, math.MaxInt64, hlc.Timestamp{WallTime: 2}, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kvs) != 1 ||
+		!bytes.Equal(kvs[0].Key, testKey2) ||
+		!bytes.Equal(kvs[0].Value.RawBytes, value2.RawBytes) {
+		t.Errorf("unexpected value: %v", kvs)
 	}
 }
 
@@ -2956,31 +3023,54 @@ func TestMVCCResolveTxnRange(t *testing.T) {
 
 func TestValidSplitKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	testCases := []struct {
+
+	versionedTestCases := map[bool][]struct {
 		key   roachpb.Key
 		valid bool
 	}{
-		{roachpb.Key("\x02"), false},
-		{roachpb.Key("\x02\x00"), false},
-		{roachpb.Key("\x02\xff"), false},
-		{roachpb.Key("\x03"), true},
-		{roachpb.Key("\x03\x00"), true},
-		{roachpb.Key("\x03\xff"), true},
-		{roachpb.Key("\x03\xff\xff"), false},
-		{roachpb.Key("\x04"), true},
-		{roachpb.Key("\x05"), true},
-		{roachpb.Key("a"), true},
-		{roachpb.Key("\xff"), true},
-		{roachpb.Key("\xff\x01"), true},
-		{roachpb.Key(keys.MakeTablePrefix(keys.MaxSystemConfigDescID)), false},
-		{roachpb.Key(keys.MakeTablePrefix(keys.MaxSystemConfigDescID + 1)), true},
+		false /* allowMeta2Splits */ : {
+			{roachpb.Key("\x02"), false},
+			{roachpb.Key("\x02\x00"), false},
+			{roachpb.Key("\x02\xff"), false},
+			{roachpb.Key("\x03"), false},
+			{roachpb.Key("\x03\x00"), false},
+			{roachpb.Key("\x03\xff"), false},
+			{roachpb.Key("\x03\xff\xff"), false},
+			{roachpb.Key("\x04"), true},
+			{roachpb.Key("\x05"), true},
+			{roachpb.Key("a"), true},
+			{roachpb.Key("\xff"), true},
+			{roachpb.Key("\xff\x01"), true},
+			{roachpb.Key(keys.MakeTablePrefix(keys.MaxSystemConfigDescID)), false},
+			{roachpb.Key(keys.MakeTablePrefix(keys.MaxSystemConfigDescID + 1)), true},
+		},
+		true /* allowMeta2Splits */ : {
+			{roachpb.Key("\x02"), false},
+			{roachpb.Key("\x02\x00"), false},
+			{roachpb.Key("\x02\xff"), false},
+			{roachpb.Key("\x03"), true},     // different
+			{roachpb.Key("\x03\x00"), true}, // different
+			{roachpb.Key("\x03\xff"), true}, // different
+			{roachpb.Key("\x03\xff\xff"), false},
+			{roachpb.Key("\x04"), true},
+			{roachpb.Key("\x05"), true},
+			{roachpb.Key("a"), true},
+			{roachpb.Key("\xff"), true},
+			{roachpb.Key("\xff\x01"), true},
+			{roachpb.Key(keys.MakeTablePrefix(keys.MaxSystemConfigDescID)), false},
+			{roachpb.Key(keys.MakeTablePrefix(keys.MaxSystemConfigDescID + 1)), true},
+		},
 	}
-
-	for i, test := range testCases {
-		if valid := IsValidSplitKey(test.key); valid != test.valid {
-			t.Errorf("%d: expected %q [%x] valid %t; got %t",
-				i, test.key, []byte(test.key), test.valid, valid)
-		}
+	for allowMeta2Splits, testCases := range versionedTestCases {
+		t.Run(fmt.Sprintf("allowMeta2Splits=%t", allowMeta2Splits), func(t *testing.T) {
+			for i, test := range testCases {
+				valid := IsValidSplitKey(test.key, allowMeta2Splits)
+				if valid != test.valid {
+					t.Errorf("%d: expected %q [%x] valid %t; got %t",
+						i, test.key, []byte(test.key), test.valid, valid)
+				}
+			}
+		})
 	}
 }
 
@@ -3010,8 +3100,6 @@ func TestFindSplitKey(t *testing.T) {
 	if err := MVCCSetRangeStats(context.Background(), engine, rangeID, ms); err != nil {
 		t.Fatal(err)
 	}
-	snap := engine.NewSnapshot()
-	defer snap.Close()
 
 	testData := []struct {
 		targetSize int64
@@ -3023,8 +3111,8 @@ func TestFindSplitKey(t *testing.T) {
 	}
 
 	for i, td := range testData {
-		humanSplitKey, err := MVCCFindSplitKey(
-			context.Background(), snap, rangeID, roachpb.RKeyMin, roachpb.RKeyMax, td.targetSize)
+		humanSplitKey, err := MVCCFindSplitKey(context.Background(), engine,
+			roachpb.RKeyMin, roachpb.RKeyMax, td.targetSize, true /* allowMeta2Splits */)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3042,11 +3130,30 @@ func TestFindSplitKey(t *testing.T) {
 // they avoid splits through invalid key ranges.
 func TestFindValidSplitKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	// Manually creates rows corresponding to the schema:
+	// CREATE TABLE t (id STRING PRIMARY KEY, col INT)
+	encodeTableKey := func(rowVal string, colFam uint32) roachpb.Key {
+		tableKey := keys.MakeTablePrefix(keys.MaxReservedDescID + 1)
+		rowKey := roachpb.Key(encoding.EncodeVarintAscending(append([]byte(nil), tableKey...), 1))
+		rowKey = encoding.EncodeStringAscending(encoding.EncodeVarintAscending(rowKey, 1), rowVal)
+		colKey := keys.MakeFamilyKey(append([]byte(nil), rowKey...), colFam)
+		return colKey
+	}
+	splitKeyFromTableKey := func(tableKey roachpb.Key) roachpb.Key {
+		splitKey, err := keys.EnsureSafeSplitKey(tableKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return splitKey
+	}
+
 	rangeID := roachpb.RangeID(1)
 	testCases := []struct {
-		keys     []roachpb.Key
-		expSplit roachpb.Key
-		expError bool
+		keys       []roachpb.Key
+		rangeStart roachpb.Key // optional
+		expSplit   roachpb.Key
+		expError   bool
 	}{
 		// All m1 cannot be split.
 		{
@@ -3125,51 +3232,100 @@ func TestFindValidSplitKeys(t *testing.T) {
 			expSplit: nil,
 			expError: false,
 		},
+		// Some example table data. Make sure we don't split in the middle of a row
+		// or return the start key of the range.
+		{
+			keys: []roachpb.Key{
+				encodeTableKey("a", 1),
+				encodeTableKey("a", 2),
+				encodeTableKey("a", 3),
+				encodeTableKey("a", 4),
+				encodeTableKey("a", 5),
+				encodeTableKey("b", 1),
+				encodeTableKey("c", 1),
+			},
+			rangeStart: splitKeyFromTableKey(encodeTableKey("a", 1)),
+			expSplit:   splitKeyFromTableKey(encodeTableKey("b", 1)),
+			expError:   false,
+		},
+		// More example table data. Make sure ranges at the start of a table can
+		// be split properly - this checks that the minSplitKey logic doesn't
+		// break for such ranges.
+		{
+			keys: []roachpb.Key{
+				encodeTableKey("a", 1),
+				encodeTableKey("b", 1),
+				encodeTableKey("c", 1),
+				encodeTableKey("d", 1),
+			},
+			rangeStart: keys.MakeTablePrefix(keys.MaxReservedDescID + 1),
+			expSplit:   splitKeyFromTableKey(encodeTableKey("c", 1)),
+			expError:   false,
+		},
+		// More example table data. Make sure ranges at the start of a table can
+		// be split properly (even if "properly" means creating an empty LHS,
+		// splitting here will at least allow the resulting RHS to split again).
+		{
+			keys: []roachpb.Key{
+				encodeTableKey("a", 1),
+				encodeTableKey("a", 2),
+				encodeTableKey("a", 3),
+				encodeTableKey("a", 4),
+				encodeTableKey("a", 5),
+				encodeTableKey("b", 1),
+				encodeTableKey("c", 1),
+			},
+			rangeStart: keys.MakeTablePrefix(keys.MaxReservedDescID + 1),
+			expSplit:   splitKeyFromTableKey(encodeTableKey("a", 1)),
+			expError:   false,
+		},
 	}
 
 	for i, test := range testCases {
-		engine := createTestEngine()
-		defer engine.Close()
+		t.Run("", func(t *testing.T) {
+			engine := createTestEngine()
+			defer engine.Close()
 
-		ms := &enginepb.MVCCStats{}
-		val := roachpb.MakeValueFromString(strings.Repeat("X", 10))
-		for _, k := range test.keys {
-			if err := MVCCPut(context.Background(), engine, ms, []byte(k), hlc.Timestamp{Logical: 1}, val, nil); err != nil {
+			ms := &enginepb.MVCCStats{}
+			val := roachpb.MakeValueFromString(strings.Repeat("X", 10))
+			for _, k := range test.keys {
+				if err := MVCCPut(context.Background(), engine, ms, []byte(k), hlc.Timestamp{Logical: 1}, val, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// write stats
+			if err := MVCCSetRangeStats(context.Background(), engine, rangeID, ms); err != nil {
 				t.Fatal(err)
 			}
-		}
-		// write stats
-		if err := MVCCSetRangeStats(context.Background(), engine, rangeID, ms); err != nil {
-			t.Fatal(err)
-		}
-		snap := engine.NewSnapshot()
-		defer snap.Close()
-		rangeStart := test.keys[0]
-		rangeEnd := test.keys[len(test.keys)-1].Next()
-		rangeStartAddr, err := keys.Addr(rangeStart)
-		if err != nil {
-			t.Fatal(err)
-		}
-		rangeEndAddr, err := keys.Addr(rangeEnd)
-		if err != nil {
-			t.Fatal(err)
-		}
-		targetSize := (ms.KeyBytes + ms.ValBytes) / 2
-		splitKey, err := MVCCFindSplitKey(
-			context.Background(), snap, rangeID, rangeStartAddr, rangeEndAddr, targetSize)
-		if test.expError {
-			if !testutils.IsError(err, "has no valid splits") {
-				t.Errorf("%d: unexpected error: %v", i, err)
+			rangeStart := test.keys[0]
+			if len(test.rangeStart) > 0 {
+				rangeStart = test.rangeStart
 			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("%d; unexpected error: %s", i, err)
-			continue
-		}
-		if !splitKey.Equal(test.expSplit) {
-			t.Errorf("%d: expected split key %q; got %q", i, test.expSplit, splitKey)
-		}
+			rangeEnd := test.keys[len(test.keys)-1].Next()
+			rangeStartAddr, err := keys.Addr(rangeStart)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rangeEndAddr, err := keys.Addr(rangeEnd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			targetSize := (ms.KeyBytes + ms.ValBytes) / 2
+			splitKey, err := MVCCFindSplitKey(context.Background(), engine,
+				rangeStartAddr, rangeEndAddr, targetSize, true /* allowMeta2Splits */)
+			if test.expError {
+				if !testutils.IsError(err, "has no valid splits") {
+					t.Fatalf("%d: unexpected error: %v", i, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%d; unexpected error: %s", i, err)
+			}
+			if !splitKey.Equal(test.expSplit) {
+				t.Errorf("%d: expected split key %q; got %q", i, test.expSplit, splitKey)
+			}
+		})
 	}
 }
 
@@ -3222,47 +3378,37 @@ func TestFindBalancedSplitKeys(t *testing.T) {
 	}
 
 	for i, test := range testCases {
-		engine := createTestEngine()
-		defer engine.Close()
+		t.Run("", func(t *testing.T) {
+			engine := createTestEngine()
+			defer engine.Close()
 
-		ms := &enginepb.MVCCStats{}
-		var expKey roachpb.Key
-		for j, keySize := range test.keySizes {
-			key := roachpb.Key(fmt.Sprintf("%d%s", j, strings.Repeat("X", keySize)))
-			if test.expSplit == j {
-				expKey = key
+			ms := &enginepb.MVCCStats{}
+			var expKey roachpb.Key
+			for j, keySize := range test.keySizes {
+				key := roachpb.Key(fmt.Sprintf("%d%s", j, strings.Repeat("X", keySize)))
+				if test.expSplit == j {
+					expKey = key
+				}
+				val := roachpb.MakeValueFromString(strings.Repeat("X", test.valSizes[j]))
+				if err := MVCCPut(context.Background(), engine, ms, key, hlc.Timestamp{Logical: 1}, val, nil); err != nil {
+					t.Fatal(err)
+				}
 			}
-			val := roachpb.MakeValueFromString(strings.Repeat("X", test.valSizes[j]))
-			if err := MVCCPut(context.Background(), engine, ms, key, hlc.Timestamp{Logical: 1}, val, nil); err != nil {
+			// write stats
+			if err := MVCCSetRangeStats(context.Background(), engine, rangeID, ms); err != nil {
 				t.Fatal(err)
 			}
-		}
-		// write stats
-		if err := MVCCSetRangeStats(context.Background(), engine, rangeID, ms); err != nil {
-			t.Fatal(err)
-		}
-		snap := engine.NewSnapshot()
-		defer snap.Close()
-		targetSize := (ms.KeyBytes + ms.ValBytes) / 2
-		splitKey, err := MVCCFindSplitKey(
-			context.Background(), snap, rangeID, roachpb.RKey("\x02"), roachpb.RKeyMax, targetSize)
-		if err != nil {
-			t.Errorf("unexpected error: %s", err)
-			continue
-		}
-		if !splitKey.Equal(expKey) {
-			t.Errorf("%d: expected split key %q; got %q", i, expKey, splitKey)
-		}
+			targetSize := (ms.KeyBytes + ms.ValBytes) / 2
+			splitKey, err := MVCCFindSplitKey(context.Background(), engine,
+				roachpb.RKey("\x02"), roachpb.RKeyMax, targetSize, true /* allowMeta2Splits */)
+			if err != nil {
+				t.Fatalf("unexpected error: %s", err)
+			}
+			if !splitKey.Equal(expKey) {
+				t.Errorf("%d: expected split key %q; got %q", i, expKey, splitKey)
+			}
+		})
 	}
-}
-
-// encodedSize returns the encoded size of the protobuf message.
-func encodedSize(msg proto.Message, t *testing.T) int64 {
-	data, err := protoutil.Marshal(msg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return int64(len(data))
 }
 
 func verifyStats(debug string, ms, expMS *enginepb.MVCCStats, t *testing.T) {
@@ -3352,13 +3498,16 @@ func TestMVCCStatsBasic(t *testing.T) {
 	}
 
 	// Delete the value using a transaction.
-	u := uuid.MakeV4()
-	txn := &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{ID: &u, Timestamp: hlc.Timestamp{WallTime: 1 * 1E9}}}
+	txn := &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{ID: uuid.MakeV4(), Timestamp: hlc.Timestamp{WallTime: 1 * 1E9}}}
 	ts2 := hlc.Timestamp{WallTime: 2 * 1E9}
 	if err := MVCCDelete(context.Background(), engine, ms, key, ts2, txn); err != nil {
 		t.Fatal(err)
 	}
-	m2ValSize := encodedSize(&enginepb.MVCCMetadata{Timestamp: ts2, Deleted: true, Txn: &txn.TxnMeta}, t)
+	m2ValSize := int64((&enginepb.MVCCMetadata{
+		Timestamp: hlc.LegacyTimestamp(ts2),
+		Deleted:   true,
+		Txn:       &txn.TxnMeta,
+	}).Size())
 	v2KeySize := mvccVersionTimestampSize
 	v2ValSize := int64(0)
 
@@ -3414,7 +3563,10 @@ func TestMVCCStatsBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 	mKey2Size := int64(mvccKey(key2).EncodedSize())
-	mVal2Size := encodedSize(&enginepb.MVCCMetadata{Timestamp: ts4, Txn: &txn.TxnMeta}, t)
+	mVal2Size := int64((&enginepb.MVCCMetadata{
+		Timestamp: hlc.LegacyTimestamp(ts4),
+		Txn:       &txn.TxnMeta,
+	}).Size())
 	vKey2Size := mvccVersionTimestampSize
 	vVal2Size := int64(len(value2.RawBytes))
 	expMS3 := enginepb.MVCCStats{
@@ -3509,17 +3661,35 @@ func TestMVCCStatsBasic(t *testing.T) {
 	verifyStats("after overwrite", ms, &expMS5, t)
 
 	// Write a transaction record which is a system-local key.
-	txnKey := keys.TransactionKey(txn.Key, *txn.ID)
+	txnKey := keys.TransactionKey(txn.Key, txn.ID)
 	txnVal := roachpb.MakeValueFromString("txn-data")
 	if err := MVCCPut(context.Background(), engine, ms, txnKey, hlc.Timestamp{}, txnVal, nil); err != nil {
 		t.Fatal(err)
 	}
 	txnKeySize := int64(mvccKey(txnKey).EncodedSize())
-	txnValSize := encodedSize(&enginepb.MVCCMetadata{RawBytes: txnVal.RawBytes}, t)
+	txnValSize := int64((&enginepb.MVCCMetadata{RawBytes: txnVal.RawBytes}).Size())
 	expMS6 := expMS5
 	expMS6.SysBytes += txnKeySize + txnValSize
 	expMS6.SysCount++
 	verifyStats("after sys-local key", ms, &expMS6, t)
+}
+
+var mvccStatsTests = []struct {
+	name string
+	fn   func(Iterator, MVCCKey, MVCCKey, int64) (enginepb.MVCCStats, error)
+}{
+	{
+		name: "ComputeStats",
+		fn: func(iter Iterator, start, end MVCCKey, nowNanos int64) (enginepb.MVCCStats, error) {
+			return iter.ComputeStats(start, end, nowNanos)
+		},
+	},
+	{
+		name: "ComputeStatsGo",
+		fn: func(iter Iterator, start, end MVCCKey, nowNanos int64) (enginepb.MVCCStats, error) {
+			return ComputeStatsGo(iter, start, end, nowNanos)
+		},
+	},
 }
 
 // TestMVCCStatsWithRandomRuns creates a random sequence of puts,
@@ -3528,108 +3698,114 @@ func TestMVCCStatsBasic(t *testing.T) {
 // underlying engine.
 func TestMVCCStatsWithRandomRuns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	rng, seed := randutil.NewPseudoRand()
+	seed := randutil.NewPseudoSeed()
 	log.Infof(context.Background(), "using pseudo random number generator with seed %d", seed)
-	engine := createTestEngine()
-	defer engine.Close()
 
-	ms := &enginepb.MVCCStats{}
+	for _, mvccStatsTest := range mvccStatsTests {
+		t.Run(mvccStatsTest.name, func(t *testing.T) {
+			rng := rand.New(rand.NewSource(seed))
 
-	// Now, generate a random sequence of puts, deletes and resolves.
-	// Each put and delete may or may not involve a txn. Resolves may
-	// either commit or abort.
-	keys := map[int32][]byte{}
-	var lastWT int64
-	for i := int32(0); i < int32(1000); i++ {
-		// Create random future timestamp, up to a few seconds ahead.
-		ts := hlc.Timestamp{WallTime: lastWT + int64(rng.Float32()*4E9), Logical: int32(rng.Int())}
-		lastWT = ts.WallTime
+			engine := createTestEngine()
+			defer engine.Close()
 
-		if log.V(1) {
-			log.Infof(context.Background(), "*** cycle %d @ %s", i, ts)
-		}
-		// Manually advance aggregate intent age based on one extra second of simulation.
-		// Same for aggregate gc'able bytes age.
-		key := []byte(fmt.Sprintf("%s-%d", randutil.RandBytes(rng, int(rng.Int31n(32))), i))
-		keys[i] = key
+			ms := &enginepb.MVCCStats{}
 
-		var txn *roachpb.Transaction
-		if rng.Int31n(2) == 0 { // create a txn with 50% prob
-			u := uuid.MakeV4()
-			txn = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{ID: &u, Timestamp: ts}}
-		}
-		// With 25% probability, put a new value; otherwise, delete an earlier
-		// key. Because an earlier step in this process may have itself been
-		// a delete, we could end up deleting a non-existent key, which is good;
-		// we don't mind testing that case as well.
-		isDelete := rng.Int31n(4) == 0
-		if i > 0 && isDelete {
-			idx := rng.Int31n(i)
-			if log.V(1) {
-				log.Infof(context.Background(), "*** DELETE index %d", idx)
-			}
-			if err := MVCCDelete(context.Background(), engine, ms, keys[idx], ts, txn); err != nil {
-				// Abort any write intent on an earlier, unresolved txn.
-				if wiErr, ok := err.(*roachpb.WriteIntentError); ok {
-					wiErr.Intents[0].Status = roachpb.ABORTED
+			// Now, generate a random sequence of puts, deletes and resolves.
+			// Each put and delete may or may not involve a txn. Resolves may
+			// either commit or abort.
+			keys := map[int32][]byte{}
+			var lastWT int64
+			for i := int32(0); i < int32(1000); i++ {
+				// Create random future timestamp, up to a few seconds ahead.
+				ts := hlc.Timestamp{WallTime: lastWT + int64(rng.Float32()*4E9), Logical: int32(rng.Int())}
+				lastWT = ts.WallTime
+
+				if log.V(1) {
+					log.Infof(context.Background(), "*** cycle %d @ %s", i, ts)
+				}
+				// Manually advance aggregate intent age based on one extra second of simulation.
+				// Same for aggregate gc'able bytes age.
+				key := []byte(fmt.Sprintf("%s-%d", randutil.RandBytes(rng, int(rng.Int31n(32))), i))
+				keys[i] = key
+
+				var txn *roachpb.Transaction
+				if rng.Int31n(2) == 0 { // create a txn with 50% prob
+					txn = &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{ID: uuid.MakeV4(), Timestamp: ts}}
+				}
+				// With 25% probability, put a new value; otherwise, delete an earlier
+				// key. Because an earlier step in this process may have itself been
+				// a delete, we could end up deleting a non-existent key, which is good;
+				// we don't mind testing that case as well.
+				isDelete := rng.Int31n(4) == 0
+				if i > 0 && isDelete {
+					idx := rng.Int31n(i)
 					if log.V(1) {
-						log.Infof(context.Background(), "*** ABORT index %d", idx)
-					}
-					// Note that this already incorporates committing an intent
-					// at a later time (since we use a potentially later ts here
-					// for the resolution).
-					if err := MVCCResolveWriteIntent(context.Background(), engine, ms, wiErr.Intents[0]); err != nil {
-						t.Fatal(err)
-					}
-					// Now, re-delete.
-					if log.V(1) {
-						log.Infof(context.Background(), "*** RE-DELETE index %d", idx)
+						log.Infof(context.Background(), "*** DELETE index %d", idx)
 					}
 					if err := MVCCDelete(context.Background(), engine, ms, keys[idx], ts, txn); err != nil {
-						t.Fatal(err)
+						// Abort any write intent on an earlier, unresolved txn.
+						if wiErr, ok := err.(*roachpb.WriteIntentError); ok {
+							wiErr.Intents[0].Status = roachpb.ABORTED
+							if log.V(1) {
+								log.Infof(context.Background(), "*** ABORT index %d", idx)
+							}
+							// Note that this already incorporates committing an intent
+							// at a later time (since we use a potentially later ts here
+							// for the resolution).
+							if err := MVCCResolveWriteIntent(context.Background(), engine, ms, wiErr.Intents[0]); err != nil {
+								t.Fatal(err)
+							}
+							// Now, re-delete.
+							if log.V(1) {
+								log.Infof(context.Background(), "*** RE-DELETE index %d", idx)
+							}
+							if err := MVCCDelete(context.Background(), engine, ms, keys[idx], ts, txn); err != nil {
+								t.Fatal(err)
+							}
+						} else {
+							t.Fatal(err)
+						}
 					}
 				} else {
-					t.Fatal(err)
+					rngVal := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, int(rng.Int31n(128))))
+					if log.V(1) {
+						log.Infof(context.Background(), "*** PUT index %d; TXN=%t", i, txn != nil)
+					}
+					if err := MVCCPut(context.Background(), engine, ms, key, ts, rngVal, txn); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if !isDelete && txn != nil && rng.Int31n(2) == 0 { // resolve txn with 50% prob
+					txn.Status = roachpb.COMMITTED
+					if rng.Int31n(10) == 0 { // abort txn with 10% prob
+						txn.Status = roachpb.ABORTED
+					}
+					if log.V(1) {
+						log.Infof(context.Background(), "*** RESOLVE index %d; COMMIT=%t", i, txn.Status == roachpb.COMMITTED)
+					}
+					if err := MVCCResolveWriteIntent(context.Background(), engine, ms, roachpb.Intent{Span: roachpb.Span{Key: key}, Status: txn.Status, Txn: txn.TxnMeta}); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				ms.AgeTo(ts.WallTime) // a noop may not have updated the stats
+				// Every 10th step, verify the stats via manual engine scan.
+				if i%10 == 0 {
+					// Compute the stats manually.
+					iter := engine.NewIterator(false)
+					expMS, err := mvccStatsTest.fn(iter, mvccKey(roachpb.KeyMin),
+						mvccKey(roachpb.KeyMax), ts.WallTime)
+					iter.Close()
+					if err != nil {
+						t.Fatal(err)
+					}
+					verifyStats(fmt.Sprintf("cycle %d", i), ms, &expMS, t)
+					if t.Failed() {
+						t.Fatal("giving up")
+					}
 				}
 			}
-		} else {
-			rngVal := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, int(rng.Int31n(128))))
-			if log.V(1) {
-				log.Infof(context.Background(), "*** PUT index %d; TXN=%t", i, txn != nil)
-			}
-			if err := MVCCPut(context.Background(), engine, ms, key, ts, rngVal, txn); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if !isDelete && txn != nil && rng.Int31n(2) == 0 { // resolve txn with 50% prob
-			txn.Status = roachpb.COMMITTED
-			if rng.Int31n(10) == 0 { // abort txn with 10% prob
-				txn.Status = roachpb.ABORTED
-			}
-			if log.V(1) {
-				log.Infof(context.Background(), "*** RESOLVE index %d; COMMIT=%t", i, txn.Status == roachpb.COMMITTED)
-			}
-			if err := MVCCResolveWriteIntent(context.Background(), engine, ms, roachpb.Intent{Span: roachpb.Span{Key: key}, Status: txn.Status, Txn: txn.TxnMeta}); err != nil {
-				t.Fatal(err)
-			}
-		}
-
-		ms.AgeTo(ts.WallTime) // a noop may not have updated the stats
-		// Every 10th step, verify the stats via manual engine scan.
-		if i%10 == 0 {
-			// Compute the stats manually.
-			iter := engine.NewIterator(false)
-			expMS, err := iter.ComputeStats(mvccKey(roachpb.KeyMin),
-				mvccKey(roachpb.KeyMax), ts.WallTime)
-			iter.Close()
-			if err != nil {
-				t.Fatal(err)
-			}
-			verifyStats(fmt.Sprintf("cycle %d", i), ms, &expMS, t)
-			if t.Failed() {
-				t.Fatal("giving up")
-			}
-		}
+		})
 	}
 }
 
@@ -3731,13 +3907,17 @@ func TestMVCCGarbageCollect(t *testing.T) {
 
 	// Verify aggregated stats match computed stats after GC.
 	iter := engine.NewIterator(false)
-	expMS, err := iter.ComputeStats(mvccKey(roachpb.KeyMin),
-		mvccKey(roachpb.KeyMax), ts3.WallTime)
-	iter.Close()
-	if err != nil {
-		t.Fatal(err)
+	defer iter.Close()
+	for _, mvccStatsTest := range mvccStatsTests {
+		t.Run(mvccStatsTest.name, func(t *testing.T) {
+			expMS, err := mvccStatsTest.fn(iter, mvccKey(roachpb.KeyMin),
+				mvccKey(roachpb.KeyMax), ts3.WallTime)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verifyStats("verification", ms, &expMS, t)
+		})
 	}
-	verifyStats("verification", ms, &expMS, t)
 }
 
 func TestMVCCComputeStatsError(t *testing.T) {
@@ -3752,11 +3932,14 @@ func TestMVCCComputeStatsError(t *testing.T) {
 	}
 
 	iter := engine.NewIterator(false)
-	_, err := iter.ComputeStats(mvccKey(roachpb.KeyMin),
-		mvccKey(roachpb.KeyMax), 100)
-	iter.Close()
-	if e := "unable to decode MVCCMetadata"; !testutils.IsError(err, e) {
-		t.Fatalf("expected %s, got %v", e, err)
+	defer iter.Close()
+	for _, mvccStatsTest := range mvccStatsTests {
+		t.Run(mvccStatsTest.name, func(t *testing.T) {
+			_, err := mvccStatsTest.fn(iter, mvccKey(roachpb.KeyMin), mvccKey(roachpb.KeyMax), 100)
+			if e := "unable to decode MVCCMetadata"; !testutils.IsError(err, e) {
+				t.Fatalf("expected %s, got %v", e, err)
+			}
+		})
 	}
 }
 
@@ -3818,8 +4001,7 @@ func TestMVCCGarbageCollectIntent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	u := uuid.MakeV4()
-	txn := &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{ID: &u, Timestamp: ts2}}
+	txn := &roachpb.Transaction{TxnMeta: enginepb.TxnMeta{ID: uuid.MakeV4(), Timestamp: ts2}}
 	if err := MVCCDelete(context.Background(), engine, nil, key, ts2, txn); err != nil {
 		t.Fatal(err)
 	}

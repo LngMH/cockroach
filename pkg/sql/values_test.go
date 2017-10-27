@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf
 
 package sql
 
@@ -137,8 +135,8 @@ func TestValues(t *testing.T) {
 				continue
 			}
 			var rows []parser.Datums
-			next, err := plan.Next(ctx)
-			for ; next; next, err = plan.Next(ctx) {
+			next, err := plan.Next(runParams{ctx: ctx})
+			for ; next; next, err = plan.Next(runParams{ctx: ctx}) {
 				rows = append(rows, plan.Values())
 			}
 			if err != nil {
@@ -214,7 +212,7 @@ func TestGolangQueryArgs(t *testing.T) {
 	pinfo := &parser.PlaceholderInfo{}
 	for i, tcase := range testCases {
 		golangFillQueryArguments(pinfo, []interface{}{tcase.value})
-		output, valid := pinfo.Type("1")
+		output, valid := pinfo.Type("1", false)
 		if !valid {
 			t.Errorf("case %d failed: argument was invalid", i)
 			continue

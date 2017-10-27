@@ -11,16 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
 import (
-	"errors"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 )
@@ -157,8 +156,8 @@ func TestScanKeyword(t *testing.T) {
 		s := MakeScanner(kwName)
 		var lval sqlSymType
 		id := s.Lex(&lval)
-		if kwID != id {
-			t.Errorf("%s: expected %d, but found %d", kwName, kwID, id)
+		if kwID.tok != id {
+			t.Errorf("%s: expected %d, but found %d", kwName, kwID.tok, id)
 		}
 	}
 }
@@ -330,7 +329,7 @@ func TestScanError(t *testing.T) {
 		if id != ERROR {
 			t.Errorf("%s: expected ERROR, but found %d", d.sql, id)
 		}
-		if !testutils.IsError(errors.New(lval.str), d.err) {
+		if !testutils.IsError(pgerror.NewError(pgerror.CodeInternalError, lval.str), d.err) {
 			t.Errorf("%s: expected %s, but found %v", d.sql, d.err, lval.str)
 		}
 	}

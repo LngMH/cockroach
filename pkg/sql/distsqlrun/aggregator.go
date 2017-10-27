@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package distsqlrun
 
@@ -21,10 +19,10 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -69,7 +67,12 @@ func GetAggregateInfo(
 			constructAgg := func(evalCtx *parser.EvalContext) parser.AggregateFunc {
 				return b.AggregateFunc(datumTypes, evalCtx)
 			}
-			return constructAgg, sqlbase.DatumTypeToColumnType(b.FixedReturnType()), nil
+
+			colTyp, err := sqlbase.DatumTypeToColumnType(b.FixedReturnType())
+			if err != nil {
+				return nil, sqlbase.ColumnType{}, err
+			}
+			return constructAgg, colTyp, nil
 		}
 	}
 	return nil, sqlbase.ColumnType{}, errors.Errorf(
@@ -85,8 +88,11 @@ func GetAggregateInfo(
 // aggregator's output schema is comprised of what is specified by the
 // accompanying SELECT expressions.
 type aggregator struct {
+	processorBase
+
 	flowCtx     *FlowCtx
 	input       RowSource
+	inputTypes  []sqlbase.ColumnType
 	funcs       []*aggregateFuncHolder
 	outputTypes []sqlbase.ColumnType
 	datumAlloc  sqlbase.DatumAlloc
@@ -97,11 +103,9 @@ type aggregator struct {
 	aggregations []AggregatorSpec_Aggregation
 
 	buckets map[string]struct{} // The set of bucket keys.
-
-	out procOutputHelper
 }
 
-var _ processor = &aggregator{}
+var _ Processor = &aggregator{}
 
 func newAggregator(
 	flowCtx *FlowCtx,
@@ -118,7 +122,7 @@ func newAggregator(
 		buckets:      make(map[string]struct{}),
 		funcs:        make([]*aggregateFuncHolder, len(spec.Aggregations)),
 		outputTypes:  make([]sqlbase.ColumnType, len(spec.Aggregations)),
-		bucketsAcc:   flowCtx.evalCtx.Mon.MakeBoundAccount(),
+		bucketsAcc:   flowCtx.EvalCtx.Mon.MakeBoundAccount(),
 	}
 
 	// Loop over the select expressions and extract any aggregate functions --
@@ -126,14 +130,14 @@ func newAggregator(
 	// (which just returns the last value added to them for a bucket) to provide
 	// grouped-by values for each bucket.  ag.funcs is updated to contain all
 	// the functions which need to be fed values.
-	inputTypes := input.Types()
+	ag.inputTypes = input.Types()
 	for i, aggInfo := range spec.Aggregations {
 		if aggInfo.FilterColIdx != nil {
 			col := *aggInfo.FilterColIdx
-			if col >= uint32(len(inputTypes)) {
+			if col >= uint32(len(ag.inputTypes)) {
 				return nil, errors.Errorf("FilterColIdx out of range (%d)", col)
 			}
-			t := inputTypes[col].SemanticType
+			t := ag.inputTypes[col].SemanticType
 			if t != sqlbase.ColumnType_BOOL && t != sqlbase.ColumnType_NULL {
 				return nil, errors.Errorf(
 					"filter column %d must be of boolean type, not %s", *aggInfo.FilterColIdx, t,
@@ -142,10 +146,10 @@ func newAggregator(
 		}
 		argTypes := make([]sqlbase.ColumnType, len(aggInfo.ColIdx))
 		for i, c := range aggInfo.ColIdx {
-			if c >= uint32(len(inputTypes)) {
+			if c >= uint32(len(ag.inputTypes)) {
 				return nil, errors.Errorf("ColIdx out of range (%d)", aggInfo.ColIdx)
 			}
-			argTypes[i] = inputTypes[c]
+			argTypes[i] = ag.inputTypes[c]
 		}
 		aggConstructor, retType, err := GetAggregateInfo(aggInfo.Func, argTypes...)
 		if err != nil {
@@ -159,7 +163,7 @@ func newAggregator(
 
 		ag.outputTypes[i] = retType
 	}
-	if err := ag.out.init(post, ag.outputTypes, &flowCtx.evalCtx, output); err != nil {
+	if err := ag.out.Init(post, ag.outputTypes, &flowCtx.EvalCtx, output); err != nil {
 		return nil, err
 	}
 
@@ -229,7 +233,7 @@ func (ag *aggregator) Run(ctx context.Context, wg *sync.WaitGroup) {
 	// output.
 	if !consumerDone {
 		sendTraceData(ctx, ag.out.output)
-		ag.out.close()
+		ag.out.Close()
 	}
 }
 
@@ -262,7 +266,7 @@ func (ag *aggregator) accumulateRows(ctx context.Context) (err error) {
 				// any more. If the producer doesn't push any metadata, then there's no
 				// opportunity to find this out until the accumulation phase is done. We
 				// should have a way to periodically peek at the state of the
-				// RowReceiver that's hiding behind the procOutputHelper.
+				// RowReceiver that's hiding behind the ProcOutputHelper.
 				cleanupRequired = false
 				return errors.Errorf("consumer stopped before it received rows")
 			}
@@ -287,7 +291,8 @@ func (ag *aggregator) accumulateRows(ctx context.Context) (err error) {
 		// Feed the func holders for this bucket the non-grouping datums.
 		for i, a := range ag.aggregations {
 			if a.FilterColIdx != nil {
-				if err := row[*a.FilterColIdx].EnsureDecoded(&ag.datumAlloc); err != nil {
+				col := *a.FilterColIdx
+				if err := row[col].EnsureDecoded(&ag.inputTypes[col], &ag.datumAlloc); err != nil {
 					return err
 				}
 				if row[*a.FilterColIdx].Datum != parser.DBoolTrue {
@@ -295,15 +300,30 @@ func (ag *aggregator) accumulateRows(ctx context.Context) (err error) {
 					continue
 				}
 			}
-			var value parser.Datum
-			if len(a.ColIdx) != 0 {
-				c := a.ColIdx[0]
-				if err := row[c].EnsureDecoded(&ag.datumAlloc); err != nil {
+			// Extract the corresponding arguments from the row to feed into the
+			// aggregate function.
+			// Most functions require at most one argument thus we separate
+			// the first argument and allocation of (if applicable) a variadic
+			// collection of arguments thereafter.
+			var firstArg parser.Datum
+			var otherArgs parser.Datums
+			if len(a.ColIdx) > 1 {
+				otherArgs = make(parser.Datums, len(a.ColIdx)-1)
+			}
+			isFirstArg := true
+			for j, c := range a.ColIdx {
+				if err := row[c].EnsureDecoded(&ag.inputTypes[c], &ag.datumAlloc); err != nil {
 					return err
 				}
-				value = row[c].Datum
+				if isFirstArg {
+					firstArg = row[c].Datum
+					isFirstArg = false
+					continue
+				}
+				otherArgs[j-1] = row[c].Datum
 			}
-			if err := ag.funcs[i].add(ctx, encoded, value); err != nil {
+
+			if err := ag.funcs[i].add(ctx, encoded, firstArg, otherArgs); err != nil {
 				return err
 			}
 		}
@@ -332,11 +352,20 @@ func (ag *aggregator) newAggregateFuncHolder(
 	}
 }
 
-func (a *aggregateFuncHolder) add(ctx context.Context, bucket []byte, d parser.Datum) error {
+func (a *aggregateFuncHolder) add(
+	ctx context.Context, bucket []byte, firstArg parser.Datum, otherArgs parser.Datums,
+) error {
 	if a.seen != nil {
-		encoded, err := sqlbase.EncodeDatum(bucket, d)
+		encoded, err := sqlbase.EncodeDatum(bucket, firstArg)
 		if err != nil {
 			return err
+		}
+		// Encode additional arguments if necessary.
+		if otherArgs != nil {
+			encoded, err = sqlbase.EncodeDatums(bucket, otherArgs)
+			if err != nil {
+				return err
+			}
 		}
 		if _, ok := a.seen[string(encoded)]; ok {
 			// skip
@@ -352,7 +381,7 @@ func (a *aggregateFuncHolder) add(ctx context.Context, bucket []byte, d parser.D
 	if !ok {
 		// TODO(radu): we should account for the size of impl (this needs to be done
 		// in each aggregate constructor).
-		impl = a.create(&a.group.flowCtx.evalCtx)
+		impl = a.create(&a.group.flowCtx.EvalCtx)
 		usage := int64(len(bucket))
 		usage += sizeOfAggregateFunc
 		// TODO(radu): this model of each func having a map of buckets (one per
@@ -364,13 +393,13 @@ func (a *aggregateFuncHolder) add(ctx context.Context, bucket []byte, d parser.D
 		a.buckets[string(bucket)] = impl
 	}
 
-	return impl.Add(ctx, d)
+	return impl.Add(ctx, firstArg, otherArgs...)
 }
 
 func (a *aggregateFuncHolder) get(bucket string) (parser.Datum, error) {
 	found, ok := a.buckets[bucket]
 	if !ok {
-		found = a.create(&a.group.flowCtx.evalCtx)
+		found = a.create(&a.group.flowCtx.EvalCtx)
 	}
 
 	return found.Result()
@@ -382,7 +411,7 @@ func (ag *aggregator) encode(
 	appendTo []byte, row sqlbase.EncDatumRow,
 ) (encoding []byte, err error) {
 	for _, colIdx := range ag.groupCols {
-		appendTo, err = row[colIdx].Encode(&ag.datumAlloc, sqlbase.DatumEncoding_VALUE, appendTo)
+		appendTo, err = row[colIdx].Encode(&ag.inputTypes[colIdx], &ag.datumAlloc, sqlbase.DatumEncoding_ASCENDING_KEY, appendTo)
 		if err != nil {
 			return appendTo, err
 		}

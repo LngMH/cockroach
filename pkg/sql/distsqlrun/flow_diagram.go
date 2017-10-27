@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
@@ -91,12 +89,7 @@ func (a *AggregatorSpec) summary() (string, []string) {
 		if agg.Distinct {
 			buf.WriteString("DISTINCT ")
 		}
-		for i, c := range agg.ColIdx {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			fmt.Fprintf(&buf, "@%d", c+1)
-		}
+		buf.WriteString(colListStr(agg.ColIdx))
 		buf.WriteByte(')')
 		if agg.FilterColIdx != nil {
 			fmt.Fprintf(&buf, " FILTER @%d", *agg.FilterColIdx+1)
@@ -132,7 +125,7 @@ func (jr *JoinReaderSpec) summary() (string, []string) {
 }
 
 func (hj *HashJoinerSpec) summary() (string, []string) {
-	details := make([]string, 0, 2)
+	details := make([]string, 0, 3)
 
 	if len(hj.LeftEqColumns) > 0 {
 		details = append(details, fmt.Sprintf(
@@ -143,7 +136,23 @@ func (hj *HashJoinerSpec) summary() (string, []string) {
 	if hj.OnExpr.Expr != "" {
 		details = append(details, fmt.Sprintf("ON %s", hj.OnExpr.Expr))
 	}
+	if hj.MergedColumns {
+		details = append(details, fmt.Sprintf("Merged columns: %d", len(hj.LeftEqColumns)))
+	}
+
 	return "HashJoiner", details
+}
+
+func (hj *MergeJoinerSpec) summary() (string, []string) {
+	details := make([]string, 1, 2)
+	details[0] = fmt.Sprintf(
+		"left(%s)=right(%s)", hj.LeftOrdering.diagramString(), hj.RightOrdering.diagramString(),
+	)
+
+	if hj.OnExpr.Expr != "" {
+		details = append(details, fmt.Sprintf("ON %s", hj.OnExpr.Expr))
+	}
+	return "MergeJoiner", details
 }
 
 func (s *SorterSpec) summary() (string, []string) {
@@ -233,6 +242,14 @@ func (post *PostProcessSpec) summary() []string {
 		res = append(res, buf.String())
 	}
 	return res
+}
+
+func (c *ReadCSVSpec) summary() (string, []string) {
+	return "ReadCSV", []string{c.Uri}
+}
+
+func (s *SSTWriterSpec) summary() (string, []string) {
+	return "SSTWriter", []string{fmt.Sprintf("%s/%s", s.Destination, s.Name)}
 }
 
 type diagramCell struct {

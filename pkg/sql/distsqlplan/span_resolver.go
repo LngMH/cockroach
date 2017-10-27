@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package distsqlplan
 
@@ -270,7 +268,7 @@ func (it *spanResolverIterator) Seek(
 	if it.dir == oldDir && it.it.Valid() {
 		reverse := (it.dir == kv.Descending)
 		desc := it.it.Desc()
-		if (reverse && desc.ContainsExclusiveEndKey(seekKey)) ||
+		if (reverse && desc.ContainsKeyInverted(seekKey)) ||
 			(!reverse && desc.ContainsKey(seekKey)) {
 			if log.V(1) {
 				log.Infof(ctx, "not seeking (key=%s); existing descriptor %s", seekKey, desc)
@@ -310,16 +308,24 @@ func (it *spanResolverIterator) ReplicaInfo(ctx context.Context) (kv.ReplicaInfo
 
 	resolvedLH := false
 	var repl kv.ReplicaInfo
-	if lh, ok := it.it.LeaseHolder(ctx); ok {
-		repl.ReplicaDescriptor = lh
+	if storeID, ok := it.it.LeaseHolderStoreID(ctx); ok {
+		repl.ReplicaDescriptor = roachpb.ReplicaDescriptor{StoreID: storeID}
 		// Fill in the node descriptor.
-		nd, err := it.gossip.GetNodeDescriptor(repl.NodeID)
+		nodeID, err := it.gossip.GetNodeIDForStoreID(storeID)
 		if err != nil {
-			// Ignore the error; ask the oracle to pick another replica below.
-			log.VEventf(ctx, 2, "failed to resolve node %d: %s", repl.NodeID, err)
+			log.VEventf(ctx, 2, "failed to lookup store %d: %s", storeID, err)
+		} else {
+			nd, err := it.gossip.GetNodeDescriptor(nodeID)
+			if err != nil {
+				// Ignore the error; ask the oracle to pick another replica below.
+				log.VEventf(ctx, 2, "failed to resolve node %d: %s", nodeID, err)
+			} else {
+				repl.ReplicaDescriptor.NodeID = nodeID
+				repl.NodeDesc = nd
+				resolvedLH = true
+			}
 		}
-		repl.NodeDesc = nd
-		resolvedLH = true
+
 	}
 	if !resolvedLH {
 		leaseHolder, err := it.oracle.ChoosePreferredLeaseHolder(

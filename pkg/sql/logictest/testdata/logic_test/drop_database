@@ -14,7 +14,18 @@ system
 test
 
 statement ok
-DROP DATABASE "foo-bar"
+CREATE TABLE "foo-bar".t(x INT)
+
+statement error database.*is not empty and RESTRICT was specified
+DROP DATABASE "foo-bar" RESTRICT
+
+statement ok
+DROP DATABASE "foo-bar" CASCADE
+
+query TTT
+SELECT name, database_name, state FROM crdb_internal.tables WHERE name = 't'
+----
+t  [51]  DROP
 
 query T
 SHOW DATABASES
@@ -39,7 +50,7 @@ system
 test
 
 statement ok
-DROP DATABASE "foo bar"
+DROP DATABASE "foo bar" CASCADE
 
 query T
 SHOW DATABASES
@@ -100,8 +111,8 @@ GRANT ALL ON d2.v3 TO testuser
 
 user testuser
 
-statement error user testuser does not have DROP privilege on view v4
-DROP DATABASE d1
+statement error user testuser does not have DROP privilege on relation v4
+DROP DATABASE d1 CASCADE
 
 user root
 
@@ -138,7 +149,7 @@ system
 test
 
 statement ok
-DROP DATABASE d1
+DROP DATABASE d1 CASCADE
 
 query T
 SHOW DATABASES
@@ -153,13 +164,13 @@ test
 query error database "d1" does not exist
 SELECT * FROM d1.v2
 
-query error table "d2.v2" does not exist
+query error relation "d2.v2" does not exist
 SELECT * FROM d2.v2
 
-query error table "d2.v3" does not exist
+query error relation "d2.v3" does not exist
 SELECT * FROM d2.v3
 
-query error table "d2.v4" does not exist
+query error relation "d2.v4" does not exist
 SELECT * FROM d2.v4
 
 query TT
@@ -167,7 +178,7 @@ SELECT * FROM d2.v1
 ----
 
 statement ok
-DROP DATABASE d2
+DROP DATABASE d2 CASCADE
 
 query T
 SHOW DATABASES
@@ -201,7 +212,7 @@ CREATE TABLE constraint_db.t2 (
 )
 
 statement ok
-DROP DATABASE constraint_db
+DROP DATABASE constraint_db CASCADE
 
 query T
 SHOW DATABASES
@@ -214,3 +225,17 @@ test
 
 query error database "constraint_db" does not exist
 SELECT * FROM constraint_db.t1
+
+# Check that the default option is CASCADE, but that safe_updates blocks it
+
+statement ok
+CREATE DATABASE foo; CREATE TABLE foo.bar(x INT);
+
+statement ok
+SET sql_safe_updates = TRUE;
+
+statement error DROP DATABASE on non-empty database without explicit CASCADE
+DROP DATABASE foo
+
+statement ok
+SET sql_safe_updates = FALSE; DROP DATABASE foo

@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package sql
 
@@ -24,6 +21,7 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
@@ -46,11 +44,31 @@ func TestDisableTableLeases() func() {
 	}
 }
 
-// tableKey implements sqlbase.DescriptorKey.
-type tableKey struct {
+type namespaceKey struct {
 	parentID sqlbase.ID
 	name     string
 }
+
+// getAllNames returns a map from ID to namespaceKey for every entry in
+// system.namespace.
+func (p *planner) getAllNames(ctx context.Context) (map[sqlbase.ID]namespaceKey, error) {
+	namespace := map[sqlbase.ID]namespaceKey{}
+	rows, err := p.queryRows(ctx, `SELECT id, "parentID", name FROM system.namespace`)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		id, parentID, name := parser.MustBeDInt(r[0]), parser.MustBeDInt(r[1]), parser.MustBeDString(r[2])
+		namespace[sqlbase.ID(id)] = namespaceKey{
+			parentID: sqlbase.ID(parentID),
+			name:     string(name),
+		}
+	}
+	return namespace, nil
+}
+
+// tableKey implements sqlbase.DescriptorKey.
+type tableKey namespaceKey
 
 func (tk tableKey) Key() roachpb.Key {
 	return sqlbase.MakeNameMetadataKey(tk.parentID, tk.name)
@@ -65,7 +83,7 @@ func (tk tableKey) Name() string {
 func GetKeysForTableDescriptor(
 	tableDesc *sqlbase.TableDescriptor,
 ) (zoneKey roachpb.Key, nameKey roachpb.Key, descKey roachpb.Key) {
-	zoneKey = sqlbase.MakeZoneKey(tableDesc.ID)
+	zoneKey = config.MakeZoneKey(uint32(tableDesc.ID))
 	nameKey = sqlbase.MakeNameMetadataKey(tableDesc.ParentID, tableDesc.GetName())
 	descKey = sqlbase.MakeDescMetadataKey(tableDesc.ID)
 	return
@@ -105,7 +123,7 @@ func getTableOrViewDesc(
 ) (*sqlbase.TableDescriptor, error) {
 	virtual, err := vt.getVirtualTableDesc(tn)
 	if err != nil || virtual != nil {
-		if sqlbase.IsUndefinedTableError(err) {
+		if sqlbase.IsUndefinedRelationError(err) {
 			return nil, nil
 		}
 		return virtual, err
@@ -141,7 +159,7 @@ func getTableDesc(
 		return desc, err
 	}
 	if desc != nil && !desc.IsTable() {
-		return nil, sqlbase.NewWrongObjectTypeError(tn.String(), "table")
+		return nil, sqlbase.NewWrongObjectTypeError(tn, "table")
 	}
 	return desc, nil
 }
@@ -159,15 +177,15 @@ func getViewDesc(
 		return desc, err
 	}
 	if desc != nil && !desc.IsView() {
-		return nil, sqlbase.NewWrongObjectTypeError(tn.String(), "view")
+		return nil, sqlbase.NewWrongObjectTypeError(tn, "view")
 	}
 	return desc, nil
 }
 
-// mustGetTableOrViewDesc returns a table descriptor for either a table or
+// MustGetTableOrViewDesc returns a table descriptor for either a table or
 // view, or an error if the descriptor is not found. allowAdding when set allows
 // a table descriptor in the ADD state to also be returned.
-func mustGetTableOrViewDesc(
+func MustGetTableOrViewDesc(
 	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName, allowAdding bool,
 ) (*sqlbase.TableDescriptor, error) {
 	desc, err := getTableOrViewDesc(ctx, txn, vt, tn)
@@ -175,7 +193,7 @@ func mustGetTableOrViewDesc(
 		return nil, err
 	}
 	if desc == nil {
-		return nil, sqlbase.NewUndefinedTableError(tn.String())
+		return nil, sqlbase.NewUndefinedRelationError(tn)
 	}
 	if err := filterTableState(desc); err != nil {
 		if !allowAdding && err != errTableAdding {
@@ -185,10 +203,10 @@ func mustGetTableOrViewDesc(
 	return desc, nil
 }
 
-// mustGetTableDesc returns a table descriptor for a table, or an error if
+// MustGetTableDesc returns a table descriptor for a table, or an error if
 // the descriptor is not found. allowAdding when set allows a table descriptor
 // in the ADD state to also be returned.
-func mustGetTableDesc(
+func MustGetTableDesc(
 	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName, allowAdding bool,
 ) (*sqlbase.TableDescriptor, error) {
 	desc, err := getTableDesc(ctx, txn, vt, tn)
@@ -196,30 +214,12 @@ func mustGetTableDesc(
 		return nil, err
 	}
 	if desc == nil {
-		return nil, sqlbase.NewUndefinedTableError(tn.String())
+		return nil, sqlbase.NewUndefinedRelationError(tn)
 	}
 	if err := filterTableState(desc); err != nil {
 		if !allowAdding && err != errTableAdding {
 			return nil, err
 		}
-	}
-	return desc, nil
-}
-
-// mustGetViewDesc returns a table descriptor for a view, or an error if the
-// descriptor is not found or descriptor.Dropped().
-func mustGetViewDesc(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName,
-) (*sqlbase.TableDescriptor, error) {
-	desc, err := getViewDesc(ctx, txn, vt, tn)
-	if err != nil {
-		return nil, err
-	}
-	if desc == nil {
-		return nil, sqlbase.NewUndefinedViewError(tn.String())
-	}
-	if err := filterTableState(desc); err != nil {
-		return nil, err
 	}
 	return desc, nil
 }
@@ -239,15 +239,44 @@ func filterTableState(tableDesc *sqlbase.TableDescriptor) error {
 	return nil
 }
 
+// An uncommitted database is a database that has been created/dropped
+// within the current transaction using the TableCollection. A rename
+// is a drop of the old name and creation of the new name.
+type uncommittedDatabase struct {
+	name    string
+	id      sqlbase.ID
+	dropped bool
+}
+
 // TableCollection is a collection of tables held by a single session that
-// serves SQL requests, or a background job using a table descriptor.
+// serves SQL requests, or a background job using a table descriptor. The
+// collection is cleared using releaseTables() which is called at the
+// end of each transaction on the session, or on hitting conditions such
+// as errors, or retries that result in transaction timestamp changes.
 type TableCollection struct {
+	// The timestamp used to pick tables. The timestamp falls within the
+	// validity window of every table in tables.
 	timestamp hlc.Timestamp
 	// A collection of table descriptor valid for the timestamp.
 	// They are released once the transaction using them is complete.
 	// If the transaction gets pushed and the timestamp changes,
 	// the tables are released.
-	tables []sqlbase.TableDescriptor
+	tables []*sqlbase.TableDescriptor
+
+	// Tables modified by the uncommitted transaction affiliated
+	// with this TableCollection. This allows a transaction to see
+	// its own modifications while bypassing the table lease mechanism.
+	// The table lease mechanism will have its own transaction to read
+	// the table and will hang waiting for the uncommitted changes to
+	// the table. These table descriptors are local to this
+	// TableCollection and invisible to other transactions. A dropped
+	// table is marked dropped.
+	uncommittedTables []*sqlbase.TableDescriptor
+
+	// Same as uncommittedTables applying to databases modified within
+	// an uncommitted transaction.
+	uncommittedDatabases []uncommittedDatabase
+
 	// leaseMgr manages acquiring and releasing per-table leases.
 	leaseMgr *LeaseManager
 	// databaseCache is used as a cache for database names.
@@ -256,26 +285,27 @@ type TableCollection struct {
 	databaseCache *databaseCache
 }
 
-func (tc *TableCollection) maybeChangeTimestamp(ctx context.Context, txn *client.Txn) {
+// Check if the timestamp used so far to pick tables has changed because
+// of a transaction retry.
+func (tc *TableCollection) resetForTxnRetry(ctx context.Context, txn *client.Txn) {
 	if tc.timestamp != (hlc.Timestamp{}) && tc.timestamp != txn.OrigTimestamp() {
-		txn.ResetDeadline()
 		tc.releaseTables(ctx)
 	}
 }
 
 // getTableVersion returns a table descriptor with a version suitable for
-// the transaction. The table must be released by calling tc.releaseTables().
+// the transaction: table.ModificationTime <= txn.Timestamp < expirationTime.
+// The table must be released by calling tc.releaseTables().
 //
-// TODO(vivek): The suitability of the table version returned is only partial
-// checked. The expiration time for the table descriptor is added as a deadline
-// for the transaction. The ModificationTime of the table is not compared to the
-// timestamp of the transaction. Fix this to be such that:
-// table.ModificationTime <= txn.Timestamp < expirationTime
+// TODO(vivek): #6418 introduced a transaction deadline that is enforced at
+// the KV layer, and was introduced to manager the validity window of a
+// table descriptor. Since we will be checking for the valid use of a table
+// descriptor here, we do not need the extra check at the KV layer. However,
+// for a SNAPSHOT_ISOLATION transaction the commit timestamp of the transaction
+// can change, so we have kept the transaction deadline. It's worth
+// reconsidering if this is really needed.
 //
-// TODO(vivek): Rollback most of #6418. #6418 introduced a transaction deadline
-// that is enforced at the KV layer, and was introduced to manager the validity
-// window of a table descriptor. Since we will be checking for the valid use
-// of a table descriptor here, we do not need the extra check at the KV layer.
+// TODO(vivek): Allow cached descriptors for AS OF SYSTEM TIME queries.
 func (tc *TableCollection) getTableVersion(
 	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName,
 ) (*sqlbase.TableDescriptor, error) {
@@ -294,63 +324,74 @@ func (tc *TableCollection) getTableVersion(
 		//   so they cannot be leased. Instead, we simply return the static
 		//   descriptor and rely on the immutability privileges set on the
 		//   descriptors to cause upper layers to reject mutations statements.
-		tbl, err := mustGetTableDesc(ctx, txn, vt, tn, false /*allowAdding*/)
+		tbl, err := MustGetTableDesc(ctx, txn, vt, tn, false /*allowAdding*/)
 		if err != nil {
 			return nil, err
 		}
 		return tbl, nil
 	}
 
-	dbID, err := tc.databaseCache.getDatabaseID(ctx, txn, vt, tn.Database())
+	dbID, err := tc.getUncommittedDatabaseID(tn)
 	if err != nil {
 		return nil, err
 	}
 
+	if dbID == 0 {
+		// Resolve the database from the database cache when the transaction
+		// hasn't modified the database.
+		dbID, err = tc.databaseCache.getDatabaseID(ctx, tc.leaseMgr.LeaseStore.db.Txn, vt, tn.Database())
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// If the txn has been pushed the table collection is released and
 	// txn deadline is reset.
-	tc.maybeChangeTimestamp(ctx, txn)
+	tc.resetForTxnRetry(ctx, txn)
+
+	if table, err := tc.getUncommittedTable(dbID, tn); err != nil {
+		return nil, err
+	} else if table != nil {
+		log.VEventf(ctx, 2, "found uncommitted table %d", table.ID)
+		return table, nil
+	}
 
 	// First, look to see if we already have the table.
 	// This ensures that, once a SQL transaction resolved name N to id X, it will
 	// continue to use N to refer to X even if N is renamed during the
 	// transaction.
 	for _, table := range tc.tables {
-		if parser.ReNormalizeName(table.Name) == tn.TableName.Normalize() &&
+		if table.Name == string(tn.TableName) &&
 			table.ParentID == dbID {
-			if log.V(2) {
-				log.Infof(ctx, "found table in table collection for table '%s'", tn)
-			}
-			return &table, nil
+			log.VEventf(ctx, 2, "found table in table collection for table '%s'", tn)
+			return table, nil
 		}
 	}
 
-	table, expiration, err := tc.leaseMgr.AcquireByName(ctx, txn, dbID, tn.Table())
+	table, expiration, err := tc.leaseMgr.AcquireByName(ctx, txn.OrigTimestamp(), dbID, tn.Table())
 	if err != nil {
 		if err == sqlbase.ErrDescriptorNotFound {
 			// Transform the descriptor error into an error that references the
 			// table's name.
-			return nil, sqlbase.NewUndefinedTableError(tn.String())
+			return nil, sqlbase.NewUndefinedRelationError(tn)
 		}
 		return nil, err
 	}
 	tc.timestamp = txn.OrigTimestamp()
 	tc.tables = append(tc.tables, table)
-	if log.V(2) {
-		log.Infof(ctx, "added table '%s' to table collection", tn)
-	}
+	log.VEventf(ctx, 2, "added table '%s' to table collection", tn)
+
 	// If the table we just acquired expires before the txn's deadline, reduce
 	// the deadline.
-	txn.UpdateDeadlineMaybe(expiration)
-	return &table, nil
+	txn.UpdateDeadlineMaybe(ctx, expiration)
+	return table, nil
 }
 
 // getTableVersionByID is a by-ID variant of getTableVersion (i.e. uses same cache).
 func (tc *TableCollection) getTableVersionByID(
 	ctx context.Context, txn *client.Txn, tableID sqlbase.ID,
 ) (*sqlbase.TableDescriptor, error) {
-	if log.V(2) {
-		log.Infof(ctx, "planner getting table on table ID %d", tableID)
-	}
+	log.VEventf(ctx, 2, "planner getting table on table ID %d", tableID)
 
 	if testDisableTableLeases {
 		table, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
@@ -365,59 +406,137 @@ func (tc *TableCollection) getTableVersionByID(
 
 	// If the txn has been pushed the table collection is released and
 	// txn deadline is reset.
-	tc.maybeChangeTimestamp(ctx, txn)
+	tc.resetForTxnRetry(ctx, txn)
+
+	for _, table := range tc.uncommittedTables {
+		if table.ID == tableID {
+			log.VEventf(ctx, 2, "found uncommitted table %d", tableID)
+			if table.Dropped() {
+				return nil, sqlbase.NewUndefinedRelationError(
+					&parser.TableName{TableName: parser.Name(fmt.Sprintf("<id=%d>", tableID))},
+				)
+			}
+			return table, nil
+		}
+	}
 
 	// First, look to see if we already have the table -- including those
 	// via `getTableVersion`.
 	for _, table := range tc.tables {
 		if table.ID == tableID {
-			if log.V(2) {
-				log.Infof(ctx, "found table %d in table cache", tableID)
-			}
-			return &table, nil
+			log.VEventf(ctx, 2, "found table %d in table cache", tableID)
+			return table, nil
 		}
 	}
 
-	table, expiration, err := tc.leaseMgr.Acquire(ctx, txn, tableID, 0)
+	table, expiration, err := tc.leaseMgr.Acquire(ctx, txn.OrigTimestamp(), tableID)
 	if err != nil {
 		if err == sqlbase.ErrDescriptorNotFound {
 			// Transform the descriptor error into an error that references the
 			// table's ID.
-			return nil, sqlbase.NewUndefinedTableError(fmt.Sprintf("<id=%d>", tableID))
+			return nil, sqlbase.NewUndefinedRelationError(
+				&parser.TableRef{TableID: int64(tableID)})
 		}
 		return nil, err
 	}
 	tc.timestamp = txn.OrigTimestamp()
 	tc.tables = append(tc.tables, table)
-	if log.V(2) {
-		log.Infof(ctx, "added table '%s' to table collection", table.Name)
-	}
+	log.VEventf(ctx, 2, "added table '%s' to table collection", table.Name)
+
 	// If the table we just acquired expires before the txn's deadline, reduce
 	// the deadline.
-	txn.UpdateDeadlineMaybe(expiration)
-	return &table, nil
+	txn.UpdateDeadlineMaybe(ctx, expiration)
+	return table, nil
 }
 
 // releaseTables releases all tables currently held by the Session.
 func (tc *TableCollection) releaseTables(ctx context.Context) {
-	if tc.tables != nil {
+	tc.timestamp = hlc.Timestamp{}
+	if len(tc.tables) > 0 {
 		log.VEventf(ctx, 2, "releasing %d tables", len(tc.tables))
 		for _, table := range tc.tables {
 			if err := tc.leaseMgr.Release(table); err != nil {
 				log.Warning(ctx, err)
 			}
 		}
-		tc.tables = nil
+		tc.tables = tc.tables[:0]
 	}
+	tc.uncommittedTables = nil
+	tc.uncommittedDatabases = nil
+}
+
+func (tc *TableCollection) addUncommittedTable(desc sqlbase.TableDescriptor) {
+	for i, table := range tc.uncommittedTables {
+		if table.ID == desc.ID {
+			tc.uncommittedTables[i] = &desc
+			return
+		}
+	}
+	tc.uncommittedTables = append(tc.uncommittedTables, &desc)
+}
+
+func (tc *TableCollection) addUncommittedDatabase(name string, id sqlbase.ID, dropped bool) {
+	db := uncommittedDatabase{name: name, id: id, dropped: dropped}
+	tc.uncommittedDatabases = append(tc.uncommittedDatabases, db)
+}
+
+// getUncommittedDatabaseID returns a database ID for the requested tablename
+// if the requested tablename is for a database modified within the transaction
+// affiliated with the LeaseCollection.
+func (tc *TableCollection) getUncommittedDatabaseID(tn *parser.TableName) (sqlbase.ID, error) {
+	// Walk latest to earliest.
+	for i := len(tc.uncommittedDatabases) - 1; i >= 0; i-- {
+		db := tc.uncommittedDatabases[i]
+		if tn.Database() == db.name {
+			if db.dropped {
+				return 0, sqlbase.NewUndefinedRelationError(tn)
+			}
+			return db.id, nil
+		}
+	}
+	return 0, nil
+}
+
+// getUncommittedTable returns a table for the requested tablename
+// if the requested tablename is for a table modified within the transaction
+// affiliated with the LeaseCollection.
+func (tc *TableCollection) getUncommittedTable(
+	dbID sqlbase.ID, tn *parser.TableName,
+) (*sqlbase.TableDescriptor, error) {
+	for _, table := range tc.uncommittedTables {
+		if table.Name == string(tn.TableName) &&
+			table.ParentID == dbID {
+			if err := filterTableState(table); err != nil {
+				return nil, sqlbase.NewUndefinedRelationError(tn)
+			}
+			return table, nil
+		}
+		// If a table has gotten renamed we'd like to disallow using the old names.
+		// The renames could have happened in another transaction but it's still okay
+		// to disallow the use of the old name in this transaction because the other
+		// transaction has already committed and this transaction is seeing the
+		// effect of it.
+		for _, rename := range table.GetRenames() {
+			if rename.OldName == string(tn.TableName) &&
+				rename.OldParentID == dbID {
+				return nil, sqlbase.NewUndefinedRelationError(tn)
+			}
+		}
+	}
+	return nil, nil
 }
 
 // getTableNames retrieves the list of qualified names of tables
 // present in the given database.
 func getTableNames(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, dbDesc *sqlbase.DatabaseDescriptor,
+	ctx context.Context,
+	txn *client.Txn,
+	vt VirtualTabler,
+	dbDesc *sqlbase.DatabaseDescriptor,
+	dbNameOriginallyOmitted bool,
 ) (parser.TableNames, error) {
 	if e, ok := vt.getVirtualSchemaEntry(dbDesc.Name); ok {
-		return e.tableNames(), nil
+		return e.tableNames(dbNameOriginallyOmitted), nil
 	}
 
 	prefix := sqlbase.MakeNameMetadataKey(dbDesc.ID, "")
@@ -434,8 +553,9 @@ func getTableNames(
 			return nil, err
 		}
 		tn := parser.TableName{
-			DatabaseName: parser.Name(dbDesc.Name),
-			TableName:    parser.Name(tableName),
+			DatabaseName:            parser.Name(dbDesc.Name),
+			TableName:               parser.Name(tableName),
+			DBNameOriginallyOmitted: dbNameOriginallyOmitted,
 		}
 		tableNames = append(tableNames, tn)
 	}
@@ -460,22 +580,33 @@ func (p *planner) getAliasedTableName(n parser.TableExpr) (*parser.TableName, er
 func (p *planner) createSchemaChangeJob(
 	ctx context.Context, tableDesc *sqlbase.TableDescriptor, stmt string,
 ) (sqlbase.MutationID, error) {
+	span := tableDesc.PrimaryIndexSpan()
 	mutationID, err := tableDesc.FinalizeMutation()
 	if err != nil {
 		return sqlbase.InvalidMutationID, err
 	}
-	jobRecord := jobs.JobRecord{
+	var spanList []jobs.ResumeSpanList
+	for i := 0; i < len(tableDesc.Mutations); i++ {
+		if tableDesc.Mutations[i].MutationID == mutationID {
+			spanList = append(spanList,
+				jobs.ResumeSpanList{
+					ResumeSpans: []roachpb.Span{span},
+				},
+			)
+		}
+	}
+	jobRecord := jobs.Record{
 		Description:   stmt,
 		Username:      p.User(),
 		DescriptorIDs: sqlbase.IDs{tableDesc.GetID()},
-		Details:       jobs.SchemaChangeJobDetails{},
+		Details:       jobs.SchemaChangeDetails{ResumeSpanList: spanList},
 	}
-	jobLogger := jobs.NewJobLogger(p.ExecCfg().DB, InternalExecutor{LeaseManager: p.session.tables.leaseMgr}, jobRecord)
-	if err := jobLogger.WithTxn(p.txn).Created(ctx); err != nil {
+	job := p.ExecCfg().JobRegistry.NewJob(jobRecord)
+	if err := job.WithTxn(p.txn).Created(ctx, jobs.WithoutCancel); err != nil {
 		return sqlbase.InvalidMutationID, nil
 	}
 	tableDesc.MutationJobs = append(tableDesc.MutationJobs, sqlbase.TableDescriptor_MutationJob{
-		MutationID: mutationID, JobID: *jobLogger.JobID()})
+		MutationID: mutationID, JobID: *job.ID()})
 	return mutationID, nil
 }
 
@@ -484,10 +615,11 @@ func (p *planner) notifySchemaChange(
 	tableDesc *sqlbase.TableDescriptor, mutationID sqlbase.MutationID,
 ) {
 	sc := SchemaChanger{
-		tableID:    tableDesc.GetID(),
-		mutationID: mutationID,
-		nodeID:     p.evalCtx.NodeID,
-		leaseMgr:   p.LeaseMgr(),
+		tableID:     tableDesc.GetID(),
+		mutationID:  mutationID,
+		nodeID:      p.evalCtx.NodeID,
+		leaseMgr:    p.LeaseMgr(),
+		jobRegistry: p.ExecCfg().JobRegistry,
 	}
 	p.session.TxnState.schemaChangers.queueSchemaChanger(sc)
 }
@@ -502,6 +634,8 @@ func (p *planner) writeTableDesc(ctx context.Context, tableDesc *sqlbase.TableDe
 	// the descriptor the verification of the overwritten descriptor cannot be
 	// done.
 	p.session.setTestingVerifyMetadata(nil)
+
+	p.session.tables.addUncommittedTable(*tableDesc)
 
 	descKey := sqlbase.MakeDescMetadataKey(tableDesc.GetID())
 	descVal := sqlbase.WrapDescriptor(tableDesc)
@@ -538,7 +672,7 @@ func expandTableGlob(
 		return nil, err
 	}
 
-	tableNames, err := getTableNames(ctx, txn, vt, dbDesc)
+	tableNames, err := getTableNames(ctx, txn, vt, dbDesc, glob.DBNameOriginallyOmitted)
 	if err != nil {
 		return nil, err
 	}
@@ -566,7 +700,7 @@ func (p *planner) searchAndQualifyDatabase(ctx context.Context, tn *parser.Table
 	if p.session.Database != "" {
 		t.DatabaseName = parser.Name(p.session.Database)
 		desc, err := descFunc(ctx, p.txn, p.getVirtualTabler(), &t)
-		if err != nil && !sqlbase.IsUndefinedTableError(err) && !sqlbase.IsUndefinedDatabaseError(err) {
+		if err != nil && !sqlbase.IsUndefinedRelationError(err) && !sqlbase.IsUndefinedDatabaseError(err) {
 			return err
 		}
 		if desc != nil {
@@ -578,10 +712,11 @@ func (p *planner) searchAndQualifyDatabase(ctx context.Context, tn *parser.Table
 
 	// Not found using the current session's database, so try
 	// the search path instead.
-	for _, database := range p.session.SearchPath {
+	iter := p.session.SearchPath.Iter()
+	for database, ok := iter(); ok; database, ok = iter() {
 		t.DatabaseName = parser.Name(database)
 		desc, err := descFunc(ctx, p.txn, p.getVirtualTabler(), &t)
-		if err != nil && !sqlbase.IsUndefinedTableError(err) && !sqlbase.IsUndefinedDatabaseError(err) {
+		if err != nil && !sqlbase.IsUndefinedRelationError(err) && !sqlbase.IsUndefinedDatabaseError(err) {
 			return err
 		}
 		if desc != nil {
@@ -591,7 +726,7 @@ func (p *planner) searchAndQualifyDatabase(ctx context.Context, tn *parser.Table
 		}
 	}
 
-	return sqlbase.NewUndefinedTableError(string(t.TableName))
+	return sqlbase.NewUndefinedRelationError(&t)
 }
 
 // getQualifiedTableName returns the database-qualified name of the table
@@ -617,38 +752,37 @@ func (p *planner) getQualifiedTableName(
 func (p *planner) findTableContainingIndex(
 	ctx context.Context, txn *client.Txn, vt VirtualTabler, dbName parser.Name, idxName parser.Name,
 ) (result *parser.TableName, err error) {
-	dbDesc, err := MustGetDatabaseDesc(ctx, txn, vt, dbName.Normalize())
+	dbDesc, err := MustGetDatabaseDesc(ctx, txn, vt, string(dbName))
 	if err != nil {
 		return nil, err
 	}
 
-	tns, err := getTableNames(ctx, txn, vt, dbDesc)
+	tns, err := getTableNames(ctx, txn, vt, dbDesc, false)
 	if err != nil {
 		return nil, err
 	}
 
-	normName := idxName.Normalize()
 	result = nil
 	for i := range tns {
 		tn := &tns[i]
-		tableDesc, err := mustGetTableDesc(
+		tableDesc, err := MustGetTableDesc(
 			ctx, p.txn, p.getVirtualTabler(), tn, true, /*allowAdding*/
 		)
 		if err != nil {
 			return nil, err
 		}
-		_, dropped, err := tableDesc.FindIndexByName(idxName)
+		_, dropped, err := tableDesc.FindIndexByName(string(idxName))
 		if err != nil || dropped {
 			continue
 		}
 		if result != nil {
 			return nil, fmt.Errorf("index name %q is ambiguous (found in %s and %s)",
-				normName, tn.String(), result.String())
+				idxName, tn.String(), result.String())
 		}
 		result = tn
 	}
 	if result == nil {
-		return nil, fmt.Errorf("index %q does not exist", normName)
+		return nil, fmt.Errorf("index %q not in any of the tables %v", idxName, tns)
 	}
 	return result, nil
 }
@@ -665,11 +799,19 @@ func (p *planner) expandIndexName(
 	}
 
 	if index.SearchTable {
-		realTableName, err := p.findTableContainingIndex(ctx, p.txn, p.getVirtualTabler(), tn.DatabaseName, tn.TableName)
+		// On the first call to expandIndexName(), index.Index is empty and
+		// index.Table is the index name. Once the table name is resolved
+		// for the index below, index.Table references a new table name
+		// (not the index), so a subsequent call to expandIndexName()
+		// will generate tn using the new value of index.Table, which
+		// is a table name. Therefore assign index.Index only once.
+		if index.Index == "" {
+			index.Index = tn.TableName
+		}
+		realTableName, err := p.findTableContainingIndex(ctx, p.txn, p.getVirtualTabler(), tn.DatabaseName, index.Index)
 		if err != nil {
 			return nil, err
 		}
-		index.Index = tn.TableName
 		index.Table.TableNameReference = realTableName
 		tn = realTableName
 	}
@@ -704,7 +846,7 @@ func (p *planner) getTableAndIndex(
 		return nil, nil, err
 	}
 	if tableDesc == nil {
-		return nil, nil, sqlbase.NewUndefinedTableError(tn.String())
+		return nil, nil, sqlbase.NewUndefinedRelationError(tn)
 	}
 	if err := p.CheckPrivilege(tableDesc, privilege); err != nil {
 		return nil, nil, err
@@ -715,7 +857,7 @@ func (p *planner) getTableAndIndex(
 	if tableWithIndex == nil {
 		index = tableDesc.PrimaryIndex
 	} else {
-		idx, dropped, err := tableDesc.FindIndexByName(tableWithIndex.Index)
+		idx, dropped, err := tableDesc.FindIndexByName(string(tableWithIndex.Index))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -725,4 +867,24 @@ func (p *planner) getTableAndIndex(
 		index = idx
 	}
 	return tableDesc, &index, nil
+}
+
+// resolveTableNameFromID computes a table name suitable for logging
+// from the table ID and the ID-to-desc mappings.
+func resolveTableNameFromID(
+	ctx context.Context,
+	tableID sqlbase.ID,
+	tables map[sqlbase.ID]*sqlbase.TableDescriptor,
+	databases map[sqlbase.ID]*sqlbase.DatabaseDescriptor,
+) string {
+	table := tables[tableID]
+	tn := parser.TableName{TableName: parser.Name(table.Name)}
+	if parentDB, ok := databases[table.ParentID]; ok {
+		tn.DatabaseName = parser.Name(parentDB.Name)
+	} else {
+		tn.DatabaseName = parser.Name(fmt.Sprintf("[%d]", table.ParentID))
+		log.Errorf(ctx, "relation [%d] (%q) has no parent database (corrupted schema?)",
+			tableID, parser.ErrString(&tn))
+	}
+	return parser.ErrString(&tn)
 }

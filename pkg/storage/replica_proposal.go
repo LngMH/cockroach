@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package storage
 
@@ -30,6 +28,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
@@ -78,6 +77,7 @@ type ProposalData struct {
 
 	// doneCh is used to signal the waiting RPC handler (the contents of
 	// proposalResult come from LocalEvalResult).
+	//
 	// Attention: this channel is not to be signaled directly downstream of Raft.
 	// Always use ProposalData.finishRaftApplication().
 	doneCh chan proposalResult
@@ -115,18 +115,6 @@ type ProposalData struct {
 // upstream of Raft, pr.intents represent intents encountered by a request, not
 // the current txn's intents.
 func (proposal *ProposalData) finishRaftApplication(pr proposalResult) {
-	if pr.Err != nil {
-		// Clear the intents so that the intent resolution process does not take
-		// place: if an EndTransaction fails, we don't want to commit the txn's
-		// writes. In principle we'd still want to resolve any intents ancountered
-		// by the EndTransaction's batch of requests, other than the current txn's
-		// intents, but we don't make an attempt to separate the two categories of
-		// intents.
-		// TODO(tschottdorf,bdarnell): refactor this so there are two Intents
-		// fields, one for intents to be resolved if the command applies
-		// successfully, and one for intents to be resolved no matter what.
-		pr.Intents = nil
-	}
 	if proposal.endCmds != nil {
 		proposal.endCmds.done(pr.Reply, pr.Err, pr.ProposalRetry)
 		proposal.endCmds = nil
@@ -139,11 +127,6 @@ func (proposal *ProposalData) finishRaftApplication(pr proposalResult) {
 // only used on the node on which the command was proposed. Note that
 // the proposing node may die before the local results are processed,
 // so any side effects here are only best-effort.
-//
-// TODO(tschottdorf): once the WriteBatch is available in the replicated
-// proposal data (i.e. once we really do proposer-evaluted KV), experiment with
-// holding on to the proposer's constructed engine.Batch in this struct, which
-// could give a performance gain.
 type LocalEvalResult struct {
 	// The error resulting from the proposal. Most failing proposals will
 	// fail-fast, i.e. will return an error to the client above Raft. However,
@@ -154,14 +137,19 @@ type LocalEvalResult struct {
 	Err   *roachpb.Error
 	Reply *roachpb.BatchResponse
 
-	// intents stores any intents encountered but not conflicted with. They
-	// should be handed off to asynchronous intent processing on the proposer,
-	// so that an attempt to resolve them is made.
-	// In particular, this is the pathway used by EndTransaction to communicate
-	// its non-local intents up the stack.
+	// intentsAlways stores any intents encountered but not conflicted with.
+	// They should be handed off to asynchronous intent processing on the
+	// proposer, so that an attempt to resolve them is made. In particular, this
+	// is the pathway used by EndTransaction to communicate its non-local
+	// intents up the stack.
 	//
 	// This is a pointer to allow the zero (and as an unwelcome side effect,
 	// all) values to be compared.
+	intentsAlways *[]intentsWithArg
+	// Like intentsAlways, but specifies intents that must be left alone if the
+	// corresponding command/proposal didn't succeed. For example, resolving
+	// intents of a committing txn should not happen if the commit fails, or
+	// we may accidentally make uncommitted values live.
 	intents *[]intentsWithArg
 	// Whether we successfully or non-successfully requested a lease.
 	//
@@ -187,13 +175,28 @@ type LocalEvalResult struct {
 	updatedTxn *roachpb.Transaction
 }
 
-func (lResult *LocalEvalResult) detachIntents() []intentsWithArg {
-	if lResult == nil || lResult.intents == nil {
+// detachIntents returns (and removes) those intents from the LocalEvalResult
+// which are supposed to be handled. When hasError is false, returns all
+// intents. When it is true, returns only a subset of intents for which it is
+// known that it is safe to handle them even if the command that discovered them
+// has failed (e.g. omitting intents associated to a committing EndTransaction).
+func (lResult *LocalEvalResult) detachIntents(hasError bool) []intentsWithArg {
+	if lResult == nil {
 		return nil
 	}
-	intents := *lResult.intents
-	lResult.intents = nil
-	return intents
+	var r []intentsWithArg
+	if !hasError && lResult.intents != nil {
+		r = *lResult.intents
+	}
+	if lResult.intentsAlways != nil {
+		if r == nil {
+			r = *lResult.intentsAlways
+		} else {
+			r = append(r, *lResult.intentsAlways...)
+		}
+	}
+	lResult.intents, lResult.intentsAlways = nil, nil
+	return r
 }
 
 // EvalResult is the result of evaluating a KV request. That is, the
@@ -237,40 +240,62 @@ func coalesceBool(lhs *bool, rhs *bool) {
 //
 // The passed EvalResult must not be used once passed to Merge.
 func (p *EvalResult) MergeAndDestroy(q EvalResult) error {
-	if q.Replicated.State.RaftAppliedIndex != 0 {
-		return errors.New("must not specify RaftApplyIndex")
-	}
-	if q.Replicated.State.LeaseAppliedIndex != 0 {
-		return errors.New("must not specify RaftApplyIndex")
-	}
-	if p.Replicated.State.Desc == nil {
-		p.Replicated.State.Desc = q.Replicated.State.Desc
-	} else if q.Replicated.State.Desc != nil {
-		return errors.New("conflicting RangeDescriptor")
-	}
-	q.Replicated.State.Desc = nil
+	if q.Replicated.State != nil {
+		if q.Replicated.State.RaftAppliedIndex != 0 {
+			return errors.New("must not specify RaftApplyIndex")
+		}
+		if q.Replicated.State.LeaseAppliedIndex != 0 {
+			return errors.New("must not specify RaftApplyIndex")
+		}
+		if p.Replicated.State == nil {
+			p.Replicated.State = &storagebase.ReplicaState{}
+		}
+		if p.Replicated.State.Desc == nil {
+			p.Replicated.State.Desc = q.Replicated.State.Desc
+		} else if q.Replicated.State.Desc != nil {
+			return errors.New("conflicting RangeDescriptor")
+		}
+		q.Replicated.State.Desc = nil
 
-	if p.Replicated.State.Lease == nil {
-		p.Replicated.State.Lease = q.Replicated.State.Lease
-	} else if q.Replicated.State.Lease != nil {
-		return errors.New("conflicting Lease")
-	}
-	q.Replicated.State.Lease = nil
+		if p.Replicated.State.Lease == nil {
+			p.Replicated.State.Lease = q.Replicated.State.Lease
+		} else if q.Replicated.State.Lease != nil {
+			return errors.New("conflicting Lease")
+		}
+		q.Replicated.State.Lease = nil
 
-	if p.Replicated.State.TruncatedState == nil {
-		p.Replicated.State.TruncatedState = q.Replicated.State.TruncatedState
-	} else if q.Replicated.State.TruncatedState != nil {
-		return errors.New("conflicting TruncatedState")
-	}
-	q.Replicated.State.TruncatedState = nil
+		if p.Replicated.State.TruncatedState == nil {
+			p.Replicated.State.TruncatedState = q.Replicated.State.TruncatedState
+		} else if q.Replicated.State.TruncatedState != nil {
+			return errors.New("conflicting TruncatedState")
+		}
+		q.Replicated.State.TruncatedState = nil
 
-	p.Replicated.State.GCThreshold.Forward(q.Replicated.State.GCThreshold)
-	q.Replicated.State.GCThreshold = hlc.Timestamp{}
-	p.Replicated.State.TxnSpanGCThreshold.Forward(q.Replicated.State.TxnSpanGCThreshold)
-	q.Replicated.State.TxnSpanGCThreshold = hlc.Timestamp{}
+		if q.Replicated.State.GCThreshold != nil {
+			if p.Replicated.State.GCThreshold == nil {
+				p.Replicated.State.GCThreshold = q.Replicated.State.GCThreshold
+			} else {
+				p.Replicated.State.GCThreshold.Forward(*q.Replicated.State.GCThreshold)
+			}
+			q.Replicated.State.GCThreshold = nil
+		}
+		if q.Replicated.State.TxnSpanGCThreshold != nil {
+			if p.Replicated.State.TxnSpanGCThreshold == nil {
+				p.Replicated.State.TxnSpanGCThreshold = q.Replicated.State.TxnSpanGCThreshold
+			} else {
+				p.Replicated.State.TxnSpanGCThreshold.Forward(*q.Replicated.State.TxnSpanGCThreshold)
+			}
+			q.Replicated.State.TxnSpanGCThreshold = nil
+		}
 
-	if (q.Replicated.State.Stats != enginepb.MVCCStats{}) {
-		return errors.New("must not specify Stats")
+		if q.Replicated.State.Stats != nil {
+			return errors.New("must not specify Stats")
+		}
+		if (*q.Replicated.State != storagebase.ReplicaState{}) {
+			log.Fatalf(context.TODO(), "unhandled EvalResult: %s",
+				pretty.Diff(*q.Replicated.State, storagebase.ReplicaState{}))
+		}
+		q.Replicated.State = nil
 	}
 
 	p.Replicated.BlockReads = p.Replicated.BlockReads || q.Replicated.BlockReads
@@ -304,12 +329,12 @@ func (p *EvalResult) MergeAndDestroy(q EvalResult) error {
 	}
 	q.Replicated.ComputeChecksum = nil
 
-	if p.Replicated.RaftLogDelta == nil {
+	if p.Replicated.RaftLogDelta == 0 {
 		p.Replicated.RaftLogDelta = q.Replicated.RaftLogDelta
-	} else if q.Replicated.RaftLogDelta != nil {
+	} else if q.Replicated.RaftLogDelta != 0 {
 		return errors.New("conflicting RaftLogDelta")
 	}
-	q.Replicated.RaftLogDelta = nil
+	q.Replicated.RaftLogDelta = 0
 
 	if p.Replicated.AddSSTable == nil {
 		p.Replicated.AddSSTable = q.Replicated.AddSSTable
@@ -317,6 +342,15 @@ func (p *EvalResult) MergeAndDestroy(q EvalResult) error {
 		return errors.New("conflicting AddSSTable")
 	}
 	q.Replicated.AddSSTable = nil
+
+	if q.Local.intentsAlways != nil {
+		if p.Local.intentsAlways == nil {
+			p.Local.intentsAlways = q.Local.intentsAlways
+		} else {
+			*p.Local.intentsAlways = append(*p.Local.intentsAlways, *q.Local.intentsAlways...)
+		}
+	}
+	q.Local.intentsAlways = nil
 
 	if q.Local.intents != nil {
 		if p.Local.intents == nil {
@@ -398,7 +432,9 @@ func (r *Replica) computeChecksumPostApply(
 	r.mu.checksums[id] = replicaChecksum{started: true, notify: notify}
 	desc := *r.mu.state.Desc
 	r.mu.Unlock()
-	snap := r.store.NewSnapshot()
+	// Caller is holding raftMu, so an engine snapshot is automatically
+	// Raft-consistent (i.e. not in the middle of an AddSSTable).
+	snap := r.store.engine.NewSnapshot()
 
 	// Compute SHA asynchronously and store it in a map by UUID.
 	if err := stopper.RunAsyncTask(ctx, "storage.Replica: computing checksum", func(ctx context.Context) {
@@ -423,9 +459,12 @@ func (r *Replica) computeChecksumPostApply(
 
 // leasePostApply is called when a RequestLease or TransferLease
 // request is executed for a range.
-func (r *Replica) leasePostApply(
-	ctx context.Context, newLease roachpb.Lease, replicaID roachpb.ReplicaID, prevLease roachpb.Lease,
-) {
+func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease) {
+	r.mu.Lock()
+	replicaID := r.mu.replicaID
+	prevLease := *r.mu.state.Lease
+	r.mu.Unlock()
+
 	iAmTheLeaseHolder := newLease.Replica.ReplicaID == replicaID
 	leaseChangingHands := prevLease.Replica.StoreID != newLease.Replica.StoreID
 
@@ -452,11 +491,7 @@ func (r *Replica) leasePostApply(
 		desc := r.Desc()
 		r.store.tsCacheMu.Lock()
 		for _, keyRange := range makeReplicatedKeyRanges(desc) {
-			for _, readOnly := range []bool{true, false} {
-				r.store.tsCacheMu.cache.add(
-					keyRange.start.Key, keyRange.end.Key,
-					newLease.Start, lowWaterTxnIDMarker, readOnly)
-			}
+			r.store.tsCacheMu.cache.SetLowWater(keyRange.start.Key, keyRange.end.Key, newLease.Start)
 		}
 		r.store.tsCacheMu.Unlock()
 
@@ -465,14 +500,23 @@ func (r *Replica) leasePostApply(
 		if r.leaseholderStats != nil {
 			r.leaseholderStats.resetRequestCounts()
 		}
-
-		// Gossip the first range whenever its lease is acquired. We check to
-		// make sure the lease is active so that a trailing replica won't process
-		// an old lease request and attempt to gossip the first range.
-		if r.IsFirstRange() && r.IsLeaseValid(newLease, r.store.Clock().Now()) {
-			r.gossipFirstRange(ctx)
-		}
 	}
+
+	// We're setting the new lease after we've updated the timestamp cache in
+	// order to avoid race conditions where a replica starts serving requests
+	// for a lease without first having taken into account requests served
+	// by the previous lease holder.
+	r.mu.Lock()
+	r.mu.state.Lease = &newLease
+	r.mu.Unlock()
+
+	// Gossip the first range whenever its lease is acquired. We check to
+	// make sure the lease is active so that a trailing replica won't process
+	// an old lease request and attempt to gossip the first range.
+	if leaseChangingHands && iAmTheLeaseHolder && r.IsFirstRange() && r.IsLeaseValid(newLease, r.store.Clock().Now()) {
+		r.gossipFirstRange(ctx)
+	}
+
 	if leaseChangingHands && !iAmTheLeaseHolder {
 		// Also clear and disable the push transaction queue. Any waiters
 		// must be redirected to the new lease holder.
@@ -495,6 +539,9 @@ func (r *Replica) leasePostApply(
 	if leaseChangingHands && (prevLease.OwnedBy(r.store.StoreID()) ||
 		newLease.OwnedBy(r.store.StoreID())) {
 		r.store.maybeGossipOnCapacityChange(ctx, leaseChangeEvent)
+		if r.leaseholderStats != nil {
+			r.leaseholderStats.resetRequestCounts()
+		}
 	}
 
 	// Potentially re-gossip if the range contains system data (e.g. system
@@ -523,6 +570,7 @@ func (r *Replica) leasePostApply(
 
 func addSSTablePreApply(
 	ctx context.Context,
+	st *cluster.Settings,
 	eng engine.Engine,
 	sideloaded sideloadStorage,
 	term, index uint64,
@@ -549,29 +597,35 @@ func addSSTablePreApply(
 	}
 	path += ".ingested"
 
-	var move bool
+	limitBulkIOWrite(ctx, st, len(sst.Data))
+
 	if inmem, ok := eng.(engine.InMem); ok {
 		path = fmt.Sprintf("%x", checksum)
-		move = false
 		if err := inmem.WriteFile(path, sst.Data); err != nil {
 			panic(err)
 		}
 	} else {
-		move = true
 		// TODO(tschottdorf): remove this once sideloaded storage guarantees its
 		// existence.
 		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 			panic(err)
 		}
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			if err := ioutil.WriteFile(path, sst.Data, 0600); err != nil {
-				log.Fatalf(ctx, "while ingesting %s: %s", path, err)
+		if _, err := os.Stat(path); err == nil {
+			// The file we want to ingest exists. This can happen since the
+			// ingestion may apply twice (we ingest before we mark the Raft
+			// command as committed). Just unlink the file (RocksDB created a
+			// hard link); after that we're free to write it again.
+			if err := os.Remove(path); err != nil {
+				log.Fatalf(ctx, "while removing existing file during ingestion of %s: %s", path, err)
 			}
-		} else if err != nil {
+		}
+
+		if err := ioutil.WriteFile(path, sst.Data, 0600); err != nil {
 			log.Fatalf(ctx, "while ingesting %s: %s", path, err)
 		}
 	}
 
+	const move = true
 	if err := eng.IngestExternalFile(ctx, path, move); err != nil {
 		panic(err)
 	}
@@ -608,7 +662,9 @@ func (r *Replica) maybeTransferRaftLeadership(ctx context.Context, target roachp
 }
 
 func (r *Replica) handleReplicatedEvalResult(
-	ctx context.Context, rResult storagebase.ReplicatedEvalResult,
+	ctx context.Context,
+	rResult storagebase.ReplicatedEvalResult,
+	raftAppliedIndex, leaseAppliedIndex uint64,
 ) (shouldAssert bool) {
 	// Fields for which no action is taken in this method are zeroed so that
 	// they don't trigger an assertion at the end of the method (which checks
@@ -627,27 +683,24 @@ func (r *Replica) handleReplicatedEvalResult(
 	}
 
 	// Update MVCC stats and Raft portion of ReplicaState.
+	deltaStats := rResult.Delta.ToStats()
 	r.mu.Lock()
-	r.mu.state.Stats.Add(rResult.Delta)
-	if rResult.State.RaftAppliedIndex != 0 {
-		r.mu.state.RaftAppliedIndex = rResult.State.RaftAppliedIndex
+	r.mu.state.Stats.Add(deltaStats)
+	if raftAppliedIndex != 0 {
+		r.mu.state.RaftAppliedIndex = raftAppliedIndex
 	}
-	if rResult.State.LeaseAppliedIndex != 0 {
-		r.mu.state.LeaseAppliedIndex = rResult.State.LeaseAppliedIndex
+	if leaseAppliedIndex != 0 {
+		r.mu.state.LeaseAppliedIndex = leaseAppliedIndex
 	}
 	needsSplitBySize := r.needsSplitBySizeRLocked()
 	r.mu.Unlock()
 
-	r.store.metrics.addMVCCStats(rResult.Delta)
-	rResult.Delta = enginepb.MVCCStats{}
+	r.store.metrics.addMVCCStats(deltaStats)
+	rResult.Delta = enginepb.MVCCNetworkStats{}
 
 	if needsSplitBySize {
 		r.store.splitQueue.MaybeAdd(r, r.store.Clock().Now())
 	}
-
-	rResult.State.Stats = enginepb.MVCCStats{}
-	rResult.State.LeaseAppliedIndex = 0
-	rResult.State.RaftAppliedIndex = 0
 
 	// The above are always present, so we assert only if there are
 	// "nontrivial" actions below.
@@ -667,9 +720,9 @@ func (r *Replica) handleReplicatedEvalResult(
 		{
 			r.mu.Lock()
 			r.mu.state.Stats.ContainsEstimates = false
-			stats := r.mu.state.Stats
+			stats := *r.mu.state.Stats
 			r.mu.Unlock()
-			if err := r.raftMu.stateLoader.setMVCCStats(ctx, r.store.Engine(), &stats); err != nil {
+			if err := r.raftMu.stateLoader.SetMVCCStats(ctx, r.store.Engine(), &stats); err != nil {
 				log.Fatal(ctx, errors.Wrap(err, "unable to write MVCC stats"))
 			}
 		}
@@ -695,17 +748,118 @@ func (r *Replica) handleReplicatedEvalResult(
 
 	// Update the remaining ReplicaState.
 
-	if newDesc := rResult.State.Desc; newDesc != nil {
-		if err := r.setDesc(newDesc); err != nil {
-			// Log the error. There's not much we can do because the commit may
-			// have already occurred at this point.
-			log.Fatalf(
-				ctx,
-				"failed to update range descriptor to %+v: %s",
-				newDesc, err,
-			)
+	if rResult.State != nil {
+		if newDesc := rResult.State.Desc; newDesc != nil {
+			if err := r.setDesc(newDesc); err != nil {
+				// Log the error. There's not much we can do because the commit may
+				// have already occurred at this point.
+				log.Fatalf(
+					ctx,
+					"failed to update range descriptor to %+v: %s",
+					newDesc, err,
+				)
+			}
+			rResult.State.Desc = nil
 		}
-		rResult.State.Desc = nil
+
+		if newLease := rResult.State.Lease; newLease != nil {
+			rResult.State.Lease = nil // for assertion
+
+			r.leasePostApply(ctx, *newLease)
+		}
+
+		if newTruncState := rResult.State.TruncatedState; newTruncState != nil {
+			rResult.State.TruncatedState = nil // for assertion
+
+			r.mu.Lock()
+			r.mu.state.TruncatedState = newTruncState
+			r.mu.Unlock()
+
+			// TODO(tschottdorf): everything below doesn't need to be on this
+			// goroutine. Worth moving out -- truncations are frequent and missing
+			// one of the side effects below doesn't matter. Need to be careful
+			// about the interaction with `evalTruncateLog` though, which computes
+			// some stats based on the log entries it sees. Also, sideloaded storage
+			// needs to hold the raft mu. Perhaps it should just get its own mutex
+			// (which is usually held together with raftMu, except when accessing
+			// the storage for a truncation). Or, even better, make use of the fact
+			// that all we need to synchronize is disk i/o, and there is no overlap
+			// between files *removed* during truncation and those active in Raft.
+
+			if r.store.cfg.Settings.Version.IsActive(cluster.VersionRaftLogTruncationBelowRaft) {
+				// Truncate the Raft log.
+				batch := r.store.Engine().NewWriteOnlyBatch()
+				// We know that all of the deletions from here forward will be to distinct keys.
+				writer := batch.Distinct()
+				start := engine.MakeMVCCMetadataKey(keys.RaftLogKey(r.RangeID, 0))
+				end := engine.MakeMVCCMetadataKey(
+					keys.RaftLogKey(r.RangeID, newTruncState.Index).PrefixEnd(),
+				)
+				iter := r.store.Engine().NewIterator(false /* prefix */)
+				// Clear the log entries. Intentionally don't use range deletion
+				// tombstones (ClearRange()) due to performance concerns connected
+				// to having many range deletion tombstones. There is a chance that
+				// ClearRange will perform well here because the tombstones could be
+				// "collapsed", but it is hardly worth the risk at this point.
+				if err := writer.ClearIterRange(iter, start, end); err != nil {
+					log.Errorf(ctx, "unable to clear truncated Raft entries for %+v: %s", newTruncState, err)
+				}
+				iter.Close()
+				writer.Close()
+
+				if err := batch.Commit(false); err != nil {
+					log.Errorf(ctx, "unable to clear truncated Raft entries for %+v: %s", newTruncState, err)
+				}
+				batch.Close()
+			}
+
+			// Clear any entries in the Raft log entry cache for this range up
+			// to and including the most recently truncated index.
+			r.store.raftEntryCache.clearTo(r.RangeID, newTruncState.Index+1)
+
+			// Truncate the sideloaded storage. Note that this is safe only if the new truncated state
+			// is durably on disk (i.e.) synced. This is true at the time of writing but unfortunately
+			// could rot.
+			{
+				log.Eventf(ctx, "truncating sideloaded storage up to (and including) index %d", newTruncState.Index)
+				if err := r.raftMu.sideloaded.TruncateTo(ctx, newTruncState.Index+1); err != nil {
+					// We don't *have* to remove these entries for correctness. Log a
+					// loud error, but keep humming along.
+					log.Errorf(ctx, "while removing sideloaded files during log truncation: %s", err)
+				}
+			}
+		}
+
+		if newThresh := rResult.State.GCThreshold; newThresh != nil {
+			if (*newThresh != hlc.Timestamp{}) {
+				r.mu.Lock()
+				r.mu.state.GCThreshold = newThresh
+				r.mu.Unlock()
+			}
+			rResult.State.GCThreshold = nil
+		}
+
+		if newThresh := rResult.State.TxnSpanGCThreshold; newThresh != nil {
+			if (*newThresh != hlc.Timestamp{}) {
+				r.mu.Lock()
+				r.mu.state.TxnSpanGCThreshold = newThresh
+				r.mu.Unlock()
+			}
+			rResult.State.TxnSpanGCThreshold = nil
+		}
+
+		// ReplicaState.Stats was previously non-nullable which caused nodes to
+		// send a zero-value MVCCStats structure. If the proposal was generated by
+		// an old node, we'll have decoded that zero-value structure setting
+		// ReplicaState.Stats to a non-nil value which would trigger the "unhandled
+		// field in ReplicatedEvalResult" assertion to fire if we didn't clear it.
+		if rResult.State.Stats != nil && (*rResult.State.Stats == enginepb.MVCCStats{}) {
+			rResult.State.Stats = nil
+		}
+
+		if (*rResult.State == storagebase.ReplicaState{}) {
+			rResult.State = nil
+		}
 	}
 
 	if change := rResult.ChangeReplicas; change != nil {
@@ -723,57 +877,15 @@ func (r *Replica) handleReplicatedEvalResult(
 		rResult.ChangeReplicas = nil
 	}
 
-	if newLease := rResult.State.Lease; newLease != nil {
-		rResult.State.Lease = nil // for assertion
-
-		r.mu.Lock()
-		replicaID := r.mu.replicaID
-		prevLease := *r.mu.state.Lease
-		r.mu.state.Lease = newLease
-		r.mu.Unlock()
-
-		r.leasePostApply(ctx, *newLease, replicaID, prevLease)
-	}
-
-	if newTruncState := rResult.State.TruncatedState; newTruncState != nil {
-		rResult.State.TruncatedState = nil // for assertion
-		r.mu.Lock()
-		r.mu.state.TruncatedState = newTruncState
-		r.mu.Unlock()
-		// Clear any entries in the Raft log entry cache for this range up
-		// to and including the most recently truncated index.
-		r.store.raftEntryCache.clearTo(r.RangeID, newTruncState.Index+1)
-		log.Eventf(ctx, "truncating sideloaded storage up to (and including) index %d", newTruncState.Index)
-		if err := r.raftMu.sideloaded.TruncateTo(ctx, newTruncState.Index+1); err != nil {
-			// We don't *have* to remove these entries for correctness. Log a
-			// loud error, but keep humming along.
-			log.Errorf(ctx, "while removing sideloaded files during log truncation: %s", err)
-		}
-	}
-
-	if newThresh := rResult.State.GCThreshold; newThresh != (hlc.Timestamp{}) {
-		r.mu.Lock()
-		r.mu.state.GCThreshold = newThresh
-		r.mu.Unlock()
-		rResult.State.GCThreshold = hlc.Timestamp{}
-	}
-
-	if newThresh := rResult.State.TxnSpanGCThreshold; newThresh != (hlc.Timestamp{}) {
-		r.mu.Lock()
-		r.mu.state.TxnSpanGCThreshold = newThresh
-		r.mu.Unlock()
-		rResult.State.TxnSpanGCThreshold = hlc.Timestamp{}
-	}
-
 	if rResult.ComputeChecksum != nil {
 		r.computeChecksumPostApply(ctx, *rResult.ComputeChecksum)
 		rResult.ComputeChecksum = nil
 	}
 
-	if rResult.RaftLogDelta != nil {
+	if rResult.RaftLogDelta != 0 {
 		r.mu.Lock()
-		r.mu.raftLogSize += *rResult.RaftLogDelta
-		r.mu.raftLogLastCheckSize += *rResult.RaftLogDelta
+		r.mu.raftLogSize += rResult.RaftLogDelta
+		r.mu.raftLogLastCheckSize += rResult.RaftLogDelta
 		// Ensure raftLog{,LastCheck}Size is not negative since it isn't persisted
 		// between server restarts.
 		if r.mu.raftLogSize < 0 {
@@ -783,7 +895,7 @@ func (r *Replica) handleReplicatedEvalResult(
 			r.mu.raftLogLastCheckSize = 0
 		}
 		r.mu.Unlock()
-		rResult.RaftLogDelta = nil
+		rResult.RaftLogDelta = 0
 	} else {
 		// Check for whether to queue the range for Raft log truncation if this is
 		// not a Raft log truncation command itself. We don't want to check the
@@ -809,9 +921,7 @@ func (r *Replica) handleReplicatedEvalResult(
 	return shouldAssert
 }
 
-func (r *Replica) handleLocalEvalResult(
-	ctx context.Context, lResult LocalEvalResult,
-) (shouldAssert bool) {
+func (r *Replica) handleLocalEvalResult(ctx context.Context, lResult LocalEvalResult) {
 	// Enqueue failed push transactions on the pushTxnQueue.
 	if !r.store.cfg.DontRetryPushTxnFailures {
 		if tpErr, ok := lResult.Err.GetDetail().(*roachpb.TransactionPushError); ok {
@@ -832,13 +942,12 @@ func (r *Replica) handleLocalEvalResult(
 	// ======================
 
 	// The caller is required to detach and handle intents.
+	if lResult.intentsAlways != nil {
+		log.Fatalf(ctx, "LocalEvalResult.intentsAlways should be nil: %+v", lResult.intentsAlways)
+	}
 	if lResult.intents != nil {
 		log.Fatalf(ctx, "LocalEvalResult.intents should be nil: %+v", lResult.intents)
 	}
-
-	// The above are present too often, so we assert only if there are
-	// "nontrivial" actions below.
-	shouldAssert = (lResult != LocalEvalResult{})
 
 	if lResult.gossipFirstRange {
 		// We need to run the gossip in an async task because gossiping requires
@@ -900,17 +1009,17 @@ func (r *Replica) handleLocalEvalResult(
 	if (lResult != LocalEvalResult{}) {
 		log.Fatalf(ctx, "unhandled field in LocalEvalResult: %s", pretty.Diff(lResult, LocalEvalResult{}))
 	}
-
-	return shouldAssert
 }
 
 func (r *Replica) handleEvalResultRaftMuLocked(
-	ctx context.Context, lResult *LocalEvalResult, rResult storagebase.ReplicatedEvalResult,
+	ctx context.Context,
+	lResult *LocalEvalResult,
+	rResult storagebase.ReplicatedEvalResult,
+	raftAppliedIndex, leaseAppliedIndex uint64,
 ) {
-	shouldAssert := r.handleReplicatedEvalResult(ctx, rResult)
+	shouldAssert := r.handleReplicatedEvalResult(ctx, rResult, raftAppliedIndex, leaseAppliedIndex)
 	if lResult != nil {
-		// Careful: `shouldAssert = f() || g()` will not run both if `f()` is true.
-		shouldAssert = r.handleLocalEvalResult(ctx, *lResult) || shouldAssert
+		r.handleLocalEvalResult(ctx, *lResult)
 	}
 	if shouldAssert {
 		// Assert that the on-disk state doesn't diverge from the in-memory

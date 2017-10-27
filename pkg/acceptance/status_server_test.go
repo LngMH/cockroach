@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package acceptance
 
@@ -108,7 +106,9 @@ func TestStatusServer(t *testing.T) {
 	s := log.Scope(t)
 	defer s.Close(t)
 
-	runTestOnConfigs(t, testStatusServerInner)
+	RunLocal(t, func(t *testing.T) {
+		runTestWithCluster(t, testStatusServerInner)
+	})
 }
 
 func testStatusServerInner(

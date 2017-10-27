@@ -11,26 +11,41 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
-#
-# Author: Andrew Bonventre (andybons@gmail.com)
-# Author: Shawn Morel (shawnmorel@gmail.com)
-# Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 # Variables to be overridden on the command line only, e.g.
 #
 #   make test PKG=./pkg/storage TESTFLAGS=--vmodule=raft=1
 #
 # Note that environment variable overrides are intentionally ignored.
-PKG          := ./pkg/...
+
+# Comments starting with a double-hash (##) are for self-documentation, see the
+# `help` target. They look a bit awkward in the variable declarations below
+# since any whitespace added would become part of the variable's default value.
+
+PKG          := ./pkg/...## Which package to run tests against, e.g. "./pkg/storage".
 TAGS         :=
-TESTS        := .
-BENCHES      :=
-FILES        :=
-TESTTIMEOUT  := 4m
-RACETIMEOUT  := 15m
-BENCHTIMEOUT := 5m
-TESTFLAGS    :=
-STRESSFLAGS  :=
+
+ifneq ($(findstring bench,$(MAKECMDGOALS)),)
+ifneq ($(TESTS),)
+$(error TESTS specified with "make bench"; did you mean BENCHES?)
+endif
+TESTS := -
+BENCHES := .## Benchmarks to run for use with `make bench`.
+else
+ifneq ($(BENCHES),)
+$(error BENCHES should only be specified for "make bench")
+endif
+TESTS := .## Tests to run for use with `make test`.
+BENCHES :=
+endif
+
+FILES        :=## Space delimited list of logic test files to run, for make testlogic.
+TESTTIMEOUT  := 4m## Test timeout to use for regular tests.
+RACETIMEOUT  := 25m## Test timeout to use for race tests.
+ACCEPTANCETIMEOUT := 30m## Test timeout to use for acceptance tests.
+BENCHTIMEOUT := 5m## Test timeout to use for benchmarks.
+TESTFLAGS    :=## Extra flags to pass to the go test runner, e.g. "-v --vmodule=raft=1"
+STRESSFLAGS  :=## Extra flags to pass to `stress` during `make stress`.
 DUPLFLAGS    := -t 100
 GOFLAGS      :=
 ARCHIVE      := cockroach.src.tgz
@@ -41,6 +56,19 @@ SUFFIX       :=
 INSTALL      := install
 prefix       := /usr/local
 bindir       := $(prefix)/bin
+
+REPO_ROOT := .
+MAKEFLAGS += $(shell $(REPO_ROOT)/build/jflag.sh)
+
+help: ## Print help for targets with comments.
+	@echo "Usage:"
+	@echo "  make [target...] [VAR=foo VAR2=bar...]"
+	@echo ""
+	@echo "Useful commands:"
+	@grep -Eh '^[a-zA-Z._-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(shell tput setaf 6 2>/dev/null)%-30s$(shell tput sgr0 2>/dev/null) %s\n", $$1, $$2}'
+	@echo ""
+	@echo "Useful variables:"
+	@grep -Eh '^[a-zA-Z._-]+ *:=.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":=.*?## "}; {printf "  $(shell tput setaf 6 2>/dev/null)%-30s$(shell tput sgr0 2>/dev/null) %s\n", $$1, $$2}'
 
 # Possible values:
 # <empty>: use the default toolchain
@@ -119,7 +147,6 @@ endif
 
 override LINKFLAGS += -X github.com/cockroachdb/cockroach/pkg/build.typ=$(BUILD_TYPE)
 
-REPO_ROOT := .
 include $(REPO_ROOT)/build/common.mk
 override TAGS += make $(NATIVE_SPECIFIER_TAG)
 
@@ -128,8 +155,12 @@ override TAGS += make $(NATIVE_SPECIFIER_TAG)
 # to the host machine's actual macOS version works around this. See:
 # https://github.com/jemalloc/jemalloc/issues/494.
 ifdef MACOS
-export MACOSX_DEPLOYMENT_TARGET ?= $(shell sw_vers -productVersion)
+export MACOSX_DEPLOYMENT_TARGET ?= $(shell sw_vers -productVersion | grep -oE '[0-9]+\.[0-9]+')
 endif
+
+# Some targets (protobuf) produce different results depending on the sort order;
+# set LC_COLLATE so this is consistent across systems.
+export LC_COLLATE=C
 
 XGO := $(strip $(if $(XGOOS),GOOS=$(XGOOS)) $(if $(XGOARCH),GOARCH=$(XGOARCH)) $(if $(XHOST_TRIPLE),CC=$(CC_PATH) CXX=$(CXX_PATH)) $(GO))
 
@@ -139,24 +170,32 @@ COCKROACH := ./cockroach$(SUFFIX)$(shell $(XGO) env GOEXE)
 all: $(COCKROACH)
 
 buildoss: BUILDTARGET = ./pkg/cmd/cockroach-oss
+buildoss: $(C_LIBS_OSS)
+
+$(COCKROACH) build go-install gotestdashi generate lint lintshort: $(C_LIBS_CCL)
 
 $(COCKROACH) build buildoss: BUILDMODE = build -i -o $(COCKROACH)
 
 # The build.utcTime format must remain in sync with TimeFormat in pkg/build/info.go.
-$(COCKROACH) build buildoss go-install: override LINKFLAGS += \
+$(COCKROACH) build buildoss go-install gotestdashi generate lint lintshort: $(CGO_FLAGS_FILES) $(BOOTSTRAP_TARGET) ui .buildinfo/tag .buildinfo/rev .buildinfo/basebranch
+$(COCKROACH) build buildoss go-install gotestdashi generate lint lintshort: override LINKFLAGS += \
 	-X "github.com/cockroachdb/cockroach/pkg/build.tag=$(shell cat .buildinfo/tag)" \
 	-X "github.com/cockroachdb/cockroach/pkg/build.utcTime=$(shell date -u '+%Y/%m/%d %H:%M:%S')" \
-	-X "github.com/cockroachdb/cockroach/pkg/build.rev=$(shell cat .buildinfo/rev)"
+	-X "github.com/cockroachdb/cockroach/pkg/build.rev=$(shell cat .buildinfo/rev)" \
+	-X "github.com/cockroachdb/cockroach/pkg/build.baseBranch=$(shell cat .buildinfo/basebranch)"
 
 # Note: We pass `-v` to `go build` and `go test -i` so that warnings
 # from the linker aren't suppressed. The usage of `-v` also shows when
 # dependencies are rebuilt which is useful when switching between
 # normal and race test builds.
 .PHONY: build buildoss install
-$(COCKROACH) build buildoss go-install: $(C_LIBS) $(CGO_FLAGS_FILES) $(BOOTSTRAP_TARGET) .buildinfo/tag .buildinfo/rev
+build: ## Build the CockroachDB binary.
+buildoss: ## Build the CockroachDB binary without any CCL-licensed code.
+$(COCKROACH) build buildoss go-install:
 	 $(XGO) $(BUILDMODE) -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(BUILDTARGET)
 
 .PHONY: install
+install: ## Install the CockroachDB binary.
 install: $(COCKROACH)
 	$(INSTALL) -d -m 755 $(DESTDIR)$(bindir)
 	$(INSTALL) -m 755 $(COCKROACH) $(DESTDIR)$(bindir)/cockroach
@@ -175,11 +214,12 @@ testbuild: gotestdashi
 	$(SHELL)
 
 .PHONY: gotestdashi
-gotestdashi: $(C_LIBS) $(CGO_FLAGS_FILES) $(BOOTSTRAP_TARGET)
+gotestdashi:
 	$(XGO) test -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -i $(PKG)
 
 testshort: override TESTFLAGS += -short
 
+testrace: ## Run tests with the Go race detector enabled.
 testrace: override GOFLAGS += -race
 testrace: export GORACE := halt_on_error=1
 testrace: TESTTIMEOUT := $(RACETIMEOUT)
@@ -194,8 +234,7 @@ bin/logictest.test: main.go $(shell $(FIND_RELEVANT) ! -name 'zcgo_flags.go' -na
 	$(MAKE) gotestdashi GOFLAGS='$(GOFLAGS)' TAGS='$(TAGS)' LINKFLAGS='$(LINKFLAGS)' PKG='$(PKG)'
 	$(XGO) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -c -o bin/logictest.test $(PKG)
 
-bench: BENCHES := .
-bench: TESTS := -
+bench: ## Run benchmarks.
 bench: TESTTIMEOUT := $(BENCHTIMEOUT)
 
 .PHONY: check test testshort testrace testlogic bench
@@ -204,6 +243,7 @@ check test testshort testrace bench: gotestdashi
 
 # Run make testlogic to run all of the logic tests. Specify test files to run
 # with make testlogic FILES="foo bar".
+testlogic: ## Run SQL Logic Tests.
 testlogic: TESTS := $(if $(FILES),TestLogic$$//^$(subst $(space),$$|^,$(FILES))$$,TestLogic)
 testlogic: TESTFLAGS := -test.v $(if $(FILES),-show-sql)
 testlogic: bin/logictest.test
@@ -230,8 +270,10 @@ stressrace: TESTTIMEOUT := $(RACETIMEOUT)
 # - PKG may not contain any tests! This is handled with an `if` statement that
 # checks for the presence of a test binary before running `stress` on it.
 .PHONY: stress stressrace
-stress stressrace: $(C_LIBS) $(CGO_FLAGS_FILES) $(BOOTSTRAP_TARGET)
-	$(GO) list -tags '$(TAGS)' -f '$(XGO) test -v $(GOFLAGS) -tags '\''$(TAGS)'\'' -ldflags '\''$(LINKFLAGS)'\'' -i -c {{.ImportPath}} -o '\''{{.Dir}}'\''/stress.test && (cd '\''{{.Dir}}'\'' && if [ -f stress.test ]; then COCKROACH_STRESS=true stress $(STRESSFLAGS) ./stress.test -test.run '\''$(TESTS)'\'' $(if $(BENCHES),-test.bench '\''$(BENCHES)'\'') -test.timeout $(TESTTIMEOUT) $(TESTFLAGS); fi)' $(PKG) | $(SHELL)
+stress: ## Run tests under stress.
+stressrace: ## Run tests under stress with the race detector enabled.
+stress stressrace: gotestdashi
+	$(GO) list -tags '$(TAGS)' -f '$(XGO) test -v $(GOFLAGS) -tags '\''$(TAGS)'\'' -ldflags '\''$(LINKFLAGS)'\'' -i -c {{.ImportPath}} -o '\''{{.Dir}}'\''/stress.test && (cd '\''{{.Dir}}'\'' && if [ -f stress.test ]; then stress $(STRESSFLAGS) ./stress.test -test.run '\''$(TESTS)'\'' $(if $(BENCHES),-test.bench '\''$(BENCHES)'\'') -test.timeout $(TESTTIMEOUT) $(TESTFLAGS); fi)' $(PKG) | $(SHELL)
 
 .PHONY: upload-coverage
 upload-coverage: $(BOOTSTRAP_TARGET)
@@ -240,7 +282,9 @@ upload-coverage: $(BOOTSTRAP_TARGET)
 	@build/upload-coverage.sh
 
 .PHONY: acceptance
-acceptance:
+acceptance: TESTTIMEOUT := $(ACCEPTANCETIMEOUT)
+acceptance: export TESTTIMEOUT := $(TESTTIMEOUT)
+acceptance: ## Run acceptance tests.
 	@pkg/acceptance/run.sh
 
 .PHONY: dupl
@@ -252,44 +296,55 @@ dupl: $(BOOTSTRAP_TARGET)
 	       -not -name 'embedded.go' \
 	       -not -name '*_string.go' \
 	       -not -name 'sql.go'      \
+	       -not -name 'irgen.go'    \
+	       -not -name '*.ir.go'     \
 	| dupl -files $(DUPLFLAGS)
 
-# All packages need to be installed before we can run (some) of the checks and
-# code generators reliably. More precisely, anything that uses x/tools/go/loader
-# is fragile (this includes stringer, vet and others). The blocking issue is
-# https://github.com/golang/go/issues/14120.
-
-# `go generate` uses stringer and so must depend on gotestdashi per the above
-# comment. See https://github.com/golang/go/issues/10249 for details.
 .PHONY: generate
-generate: gotestdashi
+generate: ## Regenerate generated code.
 	$(GO) generate $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
 
-# The style checks depend on `go vet` and so must depend on gotestdashi per the
-# above comment. See https://github.com/golang/go/issues/16086 for details.
 .PHONY: lint
 lint: override TAGS += lint
-lint: gotestdashi
+lint: ## Run all style checkers and linters.
 	$(XGO) test ./build -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run 'TestStyle/$(TESTS)'
 
 .PHONY: lintshort
 lintshort: override TAGS += lint
-lintshort: gotestdashi
+lintshort: ## Run a fast subset of the style checkers and linters.
 	$(XGO) test ./build -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -run 'TestStyle/$(TESTS)'
 
 .PHONY: clean
+clean: ## Remove build artifacts.
 clean: clean-c-deps
+	$(MAKE) -C $(ORG_ROOT) -f cockroach/build/protobuf.mk clean
 	$(GO) clean $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -i github.com/cockroachdb/...
 	$(FIND_RELEVANT) -type f \( -name 'zcgo_flags*.go' -o -name '*.test' \) -exec rm {} +
-	rm -f $(BOOTSTRAP_TARGET) $(ARCHIVE)
+	for f in cockroach*; do if [ -f "$$f" ]; then rm "$$f"; fi; done
+	rm -rf artifacts $(LOCAL_BIN) $(ARCHIVE)
+
+.PHONY: maintainer-clean
+maintainer-clean: ## Like clean, but also remove some auto-generated source code.
+maintainer-clean: clean
+	$(MAKE) -C $(UI_ROOT) maintainer-clean
+
+.PHONY: unsafe-clean
+unsafe-clean: ## Like maintainer-clean, but also remove ALL untracked/ignored files.
+unsafe-clean: maintainer-clean unsafe-clean-c-deps
+	git clean -dxf
 
 .PHONY: protobuf
-protobuf:
+protobuf: ## Regenerate generated code for protobuf definitions.
 	$(MAKE) -C $(ORG_ROOT) -f cockroach/build/protobuf.mk
+
+.PHONY: ui
+ui: libprotobuf
+	$(MAKE) -C $(UI_ROOT) generate
 
 # pre-push locally runs most of the checks CI will run. Notably, it doesn't run
 # the acceptance tests.
 .PHONY: pre-push
+pre-push: ## Run generate, lint, and test.
 pre-push: generate lint test
 	$(MAKE) -C $(REPO_ROOT)/pkg/ui lint test
 	! git status --porcelain | read || (git status; git --no-pager diff -a 1>&2; exit 1)
@@ -300,6 +355,7 @@ pre-push: generate lint test
 # $(ARCHIVE_BASE)/src/github.com/cockroachdb/cockroach to allow the extracted
 # archive to serve directly as a GOPATH root.
 .PHONY: archive
+archive: ## Build a source tarball from this repository.
 archive: $(ARCHIVE)
 
 $(ARCHIVE): $(ARCHIVE).tmp
@@ -309,16 +365,27 @@ $(ARCHIVE): $(ARCHIVE).tmp
 # instead of scripts/ls-files.sh once Git v2.11 is widely deployed.
 .INTERMEDIATE: $(ARCHIVE).tmp
 $(ARCHIVE).tmp: ARCHIVE_BASE = cockroach-$(shell cat .buildinfo/tag)
-$(ARCHIVE).tmp: .buildinfo/tag .buildinfo/rev
+$(ARCHIVE).tmp: .buildinfo/tag .buildinfo/rev .buildinfo/basebranch
 	scripts/ls-files.sh | $(TAR) -cf $@ -T - $(TAR_XFORM_FLAG),^,$(ARCHIVE_BASE)/src/github.com/cockroachdb/cockroach/, $^
+	$(TAR) -rf $@ pkg/ui/embedded.go
 	(cd build/archive/contents && $(TAR) -rf ../../../$@ $(TAR_XFORM_FLAG),^,$(ARCHIVE_BASE)/, *)
 
 .buildinfo:
 	@mkdir -p $@
 
+# Do not use plumbing commands, like git diff-index, in this target. Our build
+# process modifies files quickly enough that plumbing commands report false
+# positives on filesystems with only one second of resolution as a performance
+# optimization. Porcelain commands, like git diff, exist to detect and remove
+# these false positives.
+#
+# For details, see the "Possible timestamp problems with diff-files?" thread on
+# the Git mailing list (http://marc.info/?l=git&m=131687596307197).
 .buildinfo/tag: | .buildinfo
-	@{ git describe --tags --exact-match 2> /dev/null || git rev-parse --short HEAD; } | tr -d \\n > $@
-	@git diff-index --quiet HEAD || echo -dirty >> $@
+	@{ git describe --tags --dirty 2> /dev/null || git rev-parse --short HEAD; } | tr -d \\n > $@
+
+.buildinfo/basebranch: | .buildinfo
+	@git describe --tags --abbrev=0 | tr -d \\n > $@
 
 .buildinfo/rev: | .buildinfo
 	@git rev-parse HEAD > $@
@@ -328,4 +395,5 @@ ifneq ($(GIT_DIR),)
 # to keep it up-to-date.
 .buildinfo/tag: .ALWAYS_REBUILD
 .buildinfo/rev: .ALWAYS_REBUILD
+.buildinfo/basebranch: .ALWAYS_REBUILD
 endif

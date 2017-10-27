@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package acceptance
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/net/context"
@@ -62,6 +61,10 @@ func TestDockerCLI(t *testing.T) {
 	for _, p := range paths {
 		testFile := filepath.Base(p)
 		testPath := filepath.Join(containerPath, testFile)
+		if strings.Contains(testPath, "disabled") {
+			t.Logf("Skipping explicitly disabled test %s", testFile)
+			continue
+		}
 		t.Run(testFile, func(t *testing.T) {
 			log.Infof(ctx, "-- starting tests from: %s", testFile)
 

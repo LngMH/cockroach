@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@gmail.com)
 
 package sql_test
 
@@ -26,11 +24,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
 )
 
 func TestSplitAt(t *testing.T) {
@@ -77,7 +74,7 @@ func TestSplitAt(t *testing.T) {
 		},
 		{
 			in:    "ALTER TABLE d.t SPLIT AT VALUES ('c', 3)",
-			error: "SPLIT AT data column 1 (i) must be of type int, not type string",
+			error: "could not parse \"c\" as type int",
 		},
 		{
 			in:    "ALTER TABLE d.t SPLIT AT VALUES (i, s)",
@@ -135,9 +132,9 @@ func TestSplitAt(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			expect := roachpb.Key(keys.MakeRowSentinelKey(rng.StartKey))
+			expect := roachpb.Key(rng.StartKey)
 			if !expect.Equal(key) {
-				t.Fatalf("%s: expected range start %s, got %s", tt.in, pretty, expect)
+				t.Fatalf("%s: expected range start %s, got %s", tt.in, expect, pretty)
 			}
 		}
 	}
@@ -148,68 +145,114 @@ func TestScatter(t *testing.T) {
 	t.Skip("#14955")
 
 	const numHosts = 4
-	tc := serverutils.StartTestCluster(t, numHosts, base.TestClusterArgs{
-		// TODO(radu): this test should be reliable in automatic mode as well;
-		// remove this when that is the case (#15003).
-		ReplicationMode: base.ReplicationManual,
-	})
+	tc := serverutils.StartTestCluster(t, numHosts, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(context.TODO())
 
 	sqlutils.CreateTable(
 		t, tc.ServerConn(0), "t",
 		"k INT PRIMARY KEY, v INT",
-		100,
+		1000,
 		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(10)),
 	)
 
 	r := sqlutils.MakeSQLRunner(t, tc.ServerConn(0))
 
-	// Introduce 9 splits to get 10 ranges.
-	r.Exec("ALTER TABLE test.t SPLIT AT (SELECT i*10 FROM GENERATE_SERIES(1, 9) as g(i))")
+	// Introduce 99 splits to get 100 ranges.
+	r.Exec("ALTER TABLE test.t SPLIT AT (SELECT i*10 FROM generate_series(1, 99) AS g(i))")
 
-	// Scatter until each host has at least one leaseholder.
-	// The probability that a random distribution includes at most 3 hosts out of
-	// 4 is less than: 5 * (3/4)^10 = ~28%
-	// The probability of this happening (say) 20 times in a row is less than one
-	// in 100 billion.
-	testutils.SucceedsSoon(t, func() error {
-		r.Exec("ALTER TABLE test.t SCATTER")
-		rows := r.Query("SHOW TESTING_RANGES FROM TABLE test.t")
-		// See showRangesColumns for the schema.
-		if cols, err := rows.Columns(); err != nil {
+	// Ensure that scattering leaves each node with at least 20% of the leases.
+	r.Exec("ALTER TABLE test.t SCATTER")
+	rows := r.Query("SHOW TESTING_RANGES FROM TABLE test.t")
+	// See showRangesColumns for the schema.
+	if cols, err := rows.Columns(); err != nil {
+		t.Fatal(err)
+	} else if len(cols) != 5 {
+		t.Fatalf("expected 4 columns, got %#v", cols)
+	}
+	vals := []interface{}{
+		new(interface{}),
+		new(interface{}),
+		new(interface{}),
+		new(interface{}),
+		new(int),
+	}
+	leaseHolders := map[int]int{1: 0, 2: 0, 3: 0, 4: 0}
+	numRows := 0
+	for ; rows.Next(); numRows++ {
+		if err := rows.Scan(vals...); err != nil {
 			t.Fatal(err)
-		} else if len(cols) != 4 {
-			t.Fatalf("expected 4 columns, got %#v", cols)
 		}
-		vals := []interface{}{
-			new(interface{}),
-			new(interface{}),
-			new(interface{}),
-			new(int),
+		leaseHolder := *vals[4].(*int)
+		if leaseHolder < 1 || leaseHolder > numHosts {
+			t.Fatalf("invalid lease holder value: %d", leaseHolder)
 		}
-		var leaseHolders []int
-		seenHost := make([]bool, numHosts)
-		numRows := 0
-		for ; rows.Next(); numRows++ {
-			if err := rows.Scan(vals...); err != nil {
+		leaseHolders[leaseHolder]++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if numRows != 100 {
+		t.Fatalf("expected 100 ranges, got %d", numRows)
+	}
+	for i, count := range leaseHolders {
+		if count < 20 {
+			t.Errorf("less than 20 leaseholders on host %d (only %d)", i, count)
+		}
+	}
+}
+
+// TestScatterResponse ensures that ALTER TABLE... SCATTER includes one row of
+// output per range in the table. It does *not* test that scatter properly
+// distributes replicas and leases; see TestScatter for that.
+//
+// TODO(benesch): consider folding this test into TestScatter once TestScatter
+// is unskipped.
+func TestScatterResponse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+
+	sqlutils.CreateTable(
+		t, sqlDB, "t",
+		"k INT PRIMARY KEY, v INT",
+		1000,
+		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(10)),
+	)
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
+
+	r := sqlutils.MakeSQLRunner(t, sqlDB)
+	r.Exec("ALTER TABLE test.t SPLIT AT (SELECT i*10 FROM generate_series(1, 99) AS g(i))")
+	rows := r.Query("ALTER TABLE test.t SCATTER")
+
+	i := 0
+	for ; rows.Next(); i++ {
+		var actualKey []byte
+		var pretty string
+		if err := rows.Scan(&actualKey, &pretty); err != nil {
+			t.Fatal(err)
+		}
+		var expectedKey roachpb.Key
+		if i == 0 {
+			expectedKey = keys.MakeTablePrefix(uint32(tableDesc.ID))
+		} else {
+			var err error
+			expectedKey, err = sqlbase.MakePrimaryIndexKey(tableDesc, i*10)
+			if err != nil {
 				t.Fatal(err)
 			}
-			leaseHolder := *vals[3].(*int)
-			if leaseHolder < 1 || leaseHolder > numHosts {
-				t.Fatalf("invalid lease holder value: %d", leaseHolder)
-			}
-			leaseHolders = append(leaseHolders, leaseHolder)
-			seenHost[leaseHolder-1] = true
 		}
-		t.Logf("LeaseHolders: %v", leaseHolders)
-		if numRows != 10 {
-			t.Fatalf("expected 10 ranges, got %d", numRows)
+		if e, a := expectedKey, roachpb.Key(actualKey); !e.Equal(a) {
+			t.Errorf("%d: expected split key %s, but got %s", i, e, a)
 		}
-		for i, v := range seenHost {
-			if !v {
-				return errors.Errorf("no leaseholders on host %d", i+1)
-			}
+		if e, a := expectedKey.String(), pretty; e != a {
+			t.Errorf("%d: expected pretty split key %s, but got %s", i, e, a)
 		}
-		return nil
-	})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if e, a := 100, i; e != a {
+		t.Fatalf("expected %d rows, but got %d", e, a)
+	}
 }

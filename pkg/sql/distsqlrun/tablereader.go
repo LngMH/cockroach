@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
@@ -34,6 +32,8 @@ import (
 // desired column values to an output RowReceiver.
 // See docs/RFCS/distributed_sql.md
 type tableReader struct {
+	processorBase
+
 	flowCtx *FlowCtx
 
 	tableID   sqlbase.ID
@@ -41,11 +41,10 @@ type tableReader struct {
 	limitHint int64
 
 	fetcher sqlbase.RowFetcher
-
-	out procOutputHelper
+	alloc   sqlbase.DatumAlloc
 }
 
-var _ processor = &tableReader{}
+var _ Processor = &tableReader{}
 
 // newTableReader creates a tableReader.
 func newTableReader(
@@ -63,7 +62,7 @@ func newTableReader(
 	// overflows.
 	const overflowProtection = 1000000000
 	if post.Limit != 0 && post.Limit <= overflowProtection {
-		// In this case the procOutputHelper will tell us to stop once we emit
+		// In this case the ProcOutputHelper will tell us to stop once we emit
 		// enough rows.
 		tr.limitHint = int64(post.Limit)
 	} else if spec.LimitHint != 0 && spec.LimitHint <= overflowProtection {
@@ -96,13 +95,13 @@ func newTableReader(
 	for i := range types {
 		types[i] = spec.Table.Columns[i].Type
 	}
-	if err := tr.out.init(post, types, &flowCtx.evalCtx, output); err != nil {
+	if err := tr.out.Init(post, types, &flowCtx.EvalCtx, output); err != nil {
 		return nil, err
 	}
 
 	desc := spec.Table
 	if _, _, err := initRowFetcher(
-		&tr.fetcher, &desc, int(spec.IndexIdx), spec.Reverse, tr.out.neededColumns(),
+		&tr.fetcher, &desc, int(spec.IndexIdx), spec.Reverse, tr.out.neededColumns(), &tr.alloc,
 	); err != nil {
 		return nil, err
 	}
@@ -121,6 +120,7 @@ func initRowFetcher(
 	indexIdx int,
 	reverseScan bool,
 	valNeededForCol []bool,
+	alloc *sqlbase.DatumAlloc,
 ) (index *sqlbase.IndexDescriptor, isSecondaryIndex bool, err error) {
 	// indexIdx is 0 for the primary index, or 1 to <num-indexes> for a
 	// secondary index.
@@ -141,7 +141,7 @@ func initRowFetcher(
 	}
 	if err := fetcher.Init(
 		desc, colIdxMap, index, reverseScan, isSecondaryIndex,
-		desc.Columns, valNeededForCol, true, /* returnRangeInfo */
+		desc.Columns, valNeededForCol, true /* returnRangeInfo */, alloc,
 	); err != nil {
 		return nil, false, err
 	}
@@ -182,25 +182,28 @@ func (tr *tableReader) Run(ctx context.Context, wg *sync.WaitGroup) {
 	ctx, span := processorSpan(ctx, "table reader")
 	defer tracing.FinishSpan(span)
 
-	txn := tr.flowCtx.setupTxn()
+	txn := tr.flowCtx.txn
+	if txn == nil {
+		log.Fatalf(ctx, "joinReader outside of txn")
+	}
 
 	log.VEventf(ctx, 1, "starting")
 	if log.V(1) {
 		defer log.Infof(ctx, "exiting")
 	}
 
+	// TODO(radu,andrei,knz): set the traceKV flag when requested by the session.
 	if err := tr.fetcher.StartScan(
-		ctx, txn, tr.spans, true /* limit batches */, tr.limitHint,
+		ctx, txn, tr.spans, true /* limit batches */, tr.limitHint, false, /* traceKV */
 	); err != nil {
 		log.Errorf(ctx, "scan error: %s", err)
 		tr.out.output.Push(nil /* row */, ProducerMetadata{Err: err})
-		tr.out.close()
+		tr.out.Close()
 		return
 	}
 
 	for {
-		// TODO(radu,andrei,knz): set the traceKV flag when requested by the session.
-		fetcherRow, err := tr.fetcher.NextRow(ctx, false /* traceKV */)
+		fetcherRow, err := tr.fetcher.NextRow(ctx)
 		if err != nil || fetcherRow == nil {
 			if err != nil {
 				tr.out.output.Push(nil /* row */, ProducerMetadata{Err: err})
@@ -208,7 +211,7 @@ func (tr *tableReader) Run(ctx context.Context, wg *sync.WaitGroup) {
 			break
 		}
 		// Emit the row; stop if no more rows are needed.
-		consumerStatus, err := tr.out.emitRow(ctx, fetcherRow)
+		consumerStatus, err := tr.out.EmitRow(ctx, fetcherRow)
 		if err != nil || consumerStatus != NeedMoreRows {
 			if err != nil {
 				tr.out.output.Push(nil /* row */, ProducerMetadata{Err: err})
@@ -218,5 +221,5 @@ func (tr *tableReader) Run(ctx context.Context, wg *sync.WaitGroup) {
 	}
 	tr.sendMisplannedRangesMetadata(ctx)
 	sendTraceData(ctx, tr.out.output)
-	tr.out.close()
+	tr.out.Close()
 }

@@ -9,16 +9,28 @@ export BUILDER_HIDE_GOPATH_SRC=1
 
 build/teamcity-publish-s3-binaries.sh "$@"
 
-if [[ "$TC_BUILD_BRANCH" != *alpha* ]] && [ "$TEAMCITY_BUILDCONF_NAME" == 'Publish Releases' ]; then
-	image=docker.io/cockroachdb/cockroach
+# For final/production releases, build and publish a docker image.
+# According to semver rules, non-final releases can be distinguished
+# by the presence of a hyphen in the version number.
+if [[ "$TC_BUILD_BRANCH" != *-* ]] && [ "$TEAMCITY_BUILDCONF_NAME" == 'Publish Releases' ]; then
+  image=docker.io/cockroachdb/cockroach
 
-	cp cockroach-linux-2.6.32-gnu-amd64 build/deploy/cockroach
-	docker build --tag=$image:{latest,"$TC_BUILD_BRANCH"} build/deploy
+  cp cockroach-linux-2.6.32-gnu-amd64 build/deploy/cockroach
+  docker build --no-cache --tag=$image:{latest,"$TC_BUILD_BRANCH"} build/deploy
 
-	build/builder.sh make TYPE=release-linux-gnu testbuild TAGS=acceptance PKG=./pkg/acceptance
-	(cd pkg/acceptance && ./acceptance.test -i $image -b /cockroach/cockroach -nodes 3 -test.v -test.timeout -5m)
+  TYPE=release-$(go env GOOS)
+  case $TYPE in
+    *-linux)
+      TYPE+=-gnu
+      ;;
+  esac
 
-	sed "s/<EMAIL>/$DOCKER_EMAIL/;s/<AUTH>/$DOCKER_AUTH/" < build/.dockercfg.in > ~/.dockercfg
-	docker push "$image:latest"
-	docker push "$image:$TC_BUILD_BRANCH"
+  # For the acceptance tests that run without Docker.
+  ln -s cockroach-linux-2.6.32-gnu-amd64 cockroach
+  build/builder.sh make TYPE=$TYPE testbuild TAGS=acceptance PKG=./pkg/acceptance
+  (cd pkg/acceptance && ./acceptance.test -i $image -b /cockroach/cockroach -nodes 4 -test.v -test.timeout -5m)
+
+  sed "s/<EMAIL>/$DOCKER_EMAIL/;s/<AUTH>/$DOCKER_AUTH/" < build/.dockercfg.in > ~/.dockercfg
+  docker push "$image:latest"
+  docker push "$image:$TC_BUILD_BRANCH"
 fi

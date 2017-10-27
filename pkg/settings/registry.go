@@ -17,50 +17,33 @@ package settings
 import (
 	"fmt"
 	"sort"
-	"sync/atomic"
 )
 
-// registry contains all defined settings, their types and default values.
+// Registry contains all defined settings, their types and default values.
 //
-// Entries in registry should be accompanied by an exported, typesafe getter
-// that then wraps one of the private `getBool`, `getString`, etc helpers.
+// The registry does not store the current values of the settings; those are
+// stored separately in Values, allowing multiple independent instances
+// of each setting in the registry.
 //
-// Registry should never be mutated after init (except in tests), as it is read
-// concurrently by different callers.
-var registry = map[string]Setting{}
+// Registry should never be mutated after creation (except in tests), as it is
+// read concurrently by different callers.
+var Registry = make(map[string]Setting)
 
-// frozen becomes non-zero once the registry is "live".
-// This must be accessed atomically because test clusters spawn multiple
-// servers within the same process which all call Freeze() possibly
-// concurrently.
-var frozen int32
-
-// Freeze ensures that no new settings can be defined after the gossip worker
-// has started. See settingsworker.go.
-func Freeze() { atomic.StoreInt32(&frozen, 1) }
-
-func assertNotFrozen(key string) {
-	if atomic.LoadInt32(&frozen) > 0 {
-		panic(fmt.Sprintf("registration must occur before server start: %s", key))
-	}
-}
-
-// register adds a setting to the registry.
+// Register adds a setting to the registry.
 func register(key, desc string, s Setting) {
-	assertNotFrozen(key)
-	if _, ok := registry[key]; ok {
+	if _, ok := Registry[key]; ok {
 		panic(fmt.Sprintf("setting already defined: %s", key))
 	}
-	s.setToDefault()
 	s.setDescription(desc)
-	registry[key] = s
+	Registry[key] = s
+	s.setSlotIdx(len(Registry))
 }
 
 // Keys returns a sorted string array with all the known keys.
 func Keys() (res []string) {
-	res = make([]string, 0, len(registry))
-	for k := range registry {
-		if registry[k].Hidden() {
+	res = make([]string, 0, len(Registry))
+	for k := range Registry {
+		if Registry[k].Hidden() {
 			continue
 		}
 		res = append(res, k)
@@ -71,9 +54,6 @@ func Keys() (res []string) {
 
 // Lookup returns a Setting by name along with its description.
 func Lookup(name string) (Setting, bool) {
-	v, ok := registry[name]
-	if !ok {
-		return nil, false
-	}
-	return v, true
+	v, ok := Registry[name]
+	return v, ok
 }

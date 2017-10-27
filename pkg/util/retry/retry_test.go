@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package retry
 
@@ -20,6 +18,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
 )
 
 func TestRetryExceedsMaxBackoff(t *testing.T) {
@@ -141,7 +141,7 @@ func TestRetryWithMaxAttempts(t *testing.T) {
 		return expectedErr
 	}
 
-	actualErr := WithMaxAttempts(nil, opts, maxAttempts, errFn)
+	actualErr := WithMaxAttempts(context.TODO(), opts, maxAttempts, errFn)
 	if actualErr != expectedErr {
 		t.Fatalf("expected err %v, got %v", expectedErr, actualErr)
 	}

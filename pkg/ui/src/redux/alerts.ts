@@ -11,7 +11,7 @@ import { ThunkAction } from "redux-thunk";
 
 import { LocalSetting } from "./localsettings";
 import {
-  saveUIData, VERSION_DISMISSED_KEY, loadUIData, isInFlight, UIDataSet,
+  saveUIData, VERSION_DISMISSED_KEY, loadUIData, isInFlight, UIDataState,
 } from "./uiData";
 import { refreshCluster, refreshNodes, refreshVersion, refreshHealth } from "./apiReducers";
 import { nodeStatusesSelector } from "./nodes";
@@ -139,6 +139,9 @@ export const newVersionNotificationSelector = createSelector(
       level: AlertLevel.NOTIFICATION,
       title: "New Version Available",
       text: "A new version of CockroachDB is available.",
+      // Note that this explicitly does not use util/docs to create the link,
+      // since we want to link to the updated version, not the version currently
+      // running on the cluster.
       link: "https://www.cockroachlabs.com/docs/stable/install-cockroachdb.html",
       dismiss: (dispatch) => {
         const dismissedAt = moment();
@@ -234,7 +237,7 @@ export function alertDataSync(store: Store<AdminUIState>) {
 
   // Memoizers to prevent unnecessary dispatches of alertDataSync if store
   // hasn't changed in an interesting way.
-  let lastUIData: UIDataSet;
+  let lastUIData: UIDataState;
 
   return () => {
     const state: AdminUIState = store.getState();

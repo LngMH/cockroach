@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt.r.tracy@gmail.com)
 
 package ts
 
@@ -24,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 )
 
@@ -126,7 +125,7 @@ func prettyPrintKey(key roachpb.Key) string {
 		return encoding.PrettyPrintValue(key, "/")
 	}
 	return fmt.Sprintf("/%s/%s/%s/%s", name, source, resolution,
-		time.Unix(0, timestamp).UTC().Format(time.RFC3339Nano))
+		timeutil.Unix(0, timestamp).Format(time.RFC3339Nano))
 }
 
 func init() {

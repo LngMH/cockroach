@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package sqlutil
 
@@ -40,4 +38,11 @@ type InternalExecutor interface {
 	QueryRowInTransaction(
 		ctx context.Context, opName string, txn *client.Txn, statement string, qargs ...interface{},
 	) (parser.Datums, error)
+
+	// QueryRowsInTransaction executes the supplied SQL statement as part of the
+	// supplied transaction and returns the resulting rows. Statements are currently
+	// executed as the root user.
+	QueryRowsInTransaction(
+		ctx context.Context, opName string, txn *client.Txn, statement string, qargs ...interface{},
+	) ([]parser.Datums, error)
 }

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
@@ -34,18 +32,21 @@ import (
 const joinReaderBatchSize = 100
 
 type joinReader struct {
+	processorBase
+
 	flowCtx *FlowCtx
 
 	desc  sqlbase.TableDescriptor
 	index *sqlbase.IndexDescriptor
 
 	fetcher sqlbase.RowFetcher
+	alloc   sqlbase.DatumAlloc
 
-	input RowSource
-	out   procOutputHelper
+	input      RowSource
+	inputTypes []sqlbase.ColumnType
 }
 
-var _ processor = &joinReader{}
+var _ Processor = &joinReader{}
 
 func newJoinReader(
 	flowCtx *FlowCtx,
@@ -60,9 +61,10 @@ func newJoinReader(
 	}
 
 	jr := &joinReader{
-		flowCtx: flowCtx,
-		desc:    spec.Table,
-		input:   input,
+		flowCtx:    flowCtx,
+		desc:       spec.Table,
+		input:      input,
+		inputTypes: input.Types(),
 	}
 
 	types := make([]sqlbase.ColumnType, len(spec.Table.Columns))
@@ -70,17 +72,20 @@ func newJoinReader(
 		types[i] = spec.Table.Columns[i].Type
 	}
 
-	if err := jr.out.init(post, types, &flowCtx.evalCtx, output); err != nil {
+	if err := jr.out.Init(post, types, &flowCtx.EvalCtx, output); err != nil {
 		return nil, err
 	}
 
 	var err error
 	jr.index, _, err = initRowFetcher(
-		&jr.fetcher, &jr.desc, int(spec.IndexIdx), false /* reverse */, jr.out.neededColumns(),
+		&jr.fetcher, &jr.desc, int(spec.IndexIdx), false, /* reverse */
+		jr.out.neededColumns(), &jr.alloc,
 	)
 	if err != nil {
 		return nil, err
 	}
+
+	// TODO(radu): verify the input types match the index key types
 
 	return jr, nil
 }
@@ -93,9 +98,12 @@ func (jr *joinReader) generateKey(
 		return nil, errors.Errorf("joinReader input has %d columns, expected at least %d",
 			len(row), len(jr.desc.PrimaryIndex.ColumnIDs))
 	}
+	// There may be extra values on the row, e.g. to allow an ordered synchronizer
+	// to interleave multiple input streams.
 	row = row[:len(index.ColumnIDs)]
+	types := jr.inputTypes[:len(index.ColumnIDs)]
 
-	return sqlbase.MakeKeyFromEncDatums(row, &jr.desc, index, primaryKeyPrefix, alloc)
+	return sqlbase.MakeKeyFromEncDatums(types, row, &jr.desc, index, primaryKeyPrefix, alloc)
 }
 
 // mainLoop runs the mainLoop and returns any error.
@@ -110,7 +118,10 @@ func (jr *joinReader) mainLoop(ctx context.Context) error {
 	var alloc sqlbase.DatumAlloc
 	spans := make(roachpb.Spans, 0, joinReaderBatchSize)
 
-	txn := jr.flowCtx.setupTxn()
+	txn := jr.flowCtx.txn
+	if txn == nil {
+		log.Fatalf(ctx, "joinReader outside of txn")
+	}
 
 	log.VEventf(ctx, 1, "starting")
 	if log.V(1) {
@@ -136,7 +147,7 @@ func (jr *joinReader) mainLoop(ctx context.Context) error {
 				if len(spans) == 0 {
 					// No fetching needed since we have collected no spans and
 					// the input has signalled that no more records are coming.
-					jr.out.close()
+					jr.out.Close()
 					return nil
 				}
 				break
@@ -153,7 +164,8 @@ func (jr *joinReader) mainLoop(ctx context.Context) error {
 			})
 		}
 
-		err := jr.fetcher.StartScan(ctx, txn, spans, false /* no batch limits */, 0)
+		// TODO(radu,andrei,knz): set the traceKV flag when requested by the session.
+		err := jr.fetcher.StartScan(ctx, txn, spans, false /* no batch limits */, 0, false /* traceKV */)
 		if err != nil {
 			log.Errorf(ctx, "scan error: %s", err)
 			return err
@@ -163,8 +175,7 @@ func (jr *joinReader) mainLoop(ctx context.Context) error {
 		// the next batch. We could start the next batch early while we are
 		// outputting rows.
 		for {
-			// TODO(radu,andrei,knz): set the traceKV flag when requested by the session.
-			fetcherRow, err := jr.fetcher.NextRow(ctx, false /* traceKV */)
+			fetcherRow, err := jr.fetcher.NextRow(ctx)
 			if err != nil {
 				return err
 			}
@@ -182,7 +193,7 @@ func (jr *joinReader) mainLoop(ctx context.Context) error {
 		if len(spans) != joinReaderBatchSize {
 			// This was the last batch.
 			sendTraceData(ctx, jr.out.output)
-			jr.out.close()
+			jr.out.Close()
 			return nil
 		}
 	}

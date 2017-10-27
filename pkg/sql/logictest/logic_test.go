@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package logictest
 
@@ -43,15 +41,19 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -244,10 +246,15 @@ type testClusterConfig struct {
 	useFakeSpanResolver bool
 	// if non-empty, overrides the default distsql mode.
 	overrideDistSQLMode string
+	// if set, queries using distSQL processors that can fall back to disk do
+	// so immediately, using only their disk-based implementation.
+	distSQLUseDisk bool
 	// if set, any logic statement expected to succeed and parallelizable
 	// using RETURNING NOTHING syntax will be parallelized transparently.
 	// See logicStatement.parallelizeStmts.
-	parallelStmts bool
+	parallelStmts    bool
+	bootstrapVersion *cluster.ClusterVersion
+	serverVersion    *roachpb.Version
 }
 
 // logicTestConfigs contains all possible cluster configs. A test file can
@@ -258,9 +265,19 @@ type testClusterConfig struct {
 // via -config).
 var logicTestConfigs = []testClusterConfig{
 	{name: "default", numNodes: 1, overrideDistSQLMode: "Off"},
+	{name: "default-v1.1@v1.0", numNodes: 1, overrideDistSQLMode: "Off",
+		bootstrapVersion: &cluster.ClusterVersion{
+			UseVersion:     cluster.VersionByKey(cluster.VersionBase),
+			MinimumVersion: cluster.VersionByKey(cluster.VersionBase),
+		},
+		serverVersion: &roachpb.Version{Major: 1, Minor: 1},
+	},
 	{name: "parallel-stmts", numNodes: 1, parallelStmts: true, overrideDistSQLMode: "Off"},
 	{name: "distsql", numNodes: 3, useFakeSpanResolver: true, overrideDistSQLMode: "On"},
+	{name: "distsql-disk", numNodes: 3, useFakeSpanResolver: true, overrideDistSQLMode: "On", distSQLUseDisk: true},
 	{name: "5node", numNodes: 5, overrideDistSQLMode: "Off"},
+	{name: "5node-distsql", numNodes: 5, overrideDistSQLMode: "On"},
+	{name: "5node-distsql-disk", numNodes: 5, overrideDistSQLMode: "On", distSQLUseDisk: true},
 }
 
 // An index in the above slice.
@@ -639,9 +656,7 @@ func (t *logicTest) setUser(user string) func() {
 	return cleanupFunc
 }
 
-func (t *logicTest) setup(
-	numNodes int, useFakeSpanResolver bool, distSQLOverride *settings.EnumSetting,
-) {
+func (t *logicTest) setup(cfg testClusterConfig) {
 	// TODO(pmattis): Add a flag to make it easy to run the tests against a local
 	// MySQL or Postgres instance.
 	// TODO(andrei): if createTestServerParams() is used here, the command filter
@@ -657,7 +672,9 @@ func (t *logicTest) setup(
 				SQLExecutor: &sql.ExecutorTestingKnobs{
 					WaitForGossipUpdate:   true,
 					CheckStmtStringChange: true,
-					OverrideDistSQLMode:   distSQLOverride,
+				},
+				Store: &storage.StoreTestingKnobs{
+					BootstrapVersion: cfg.bootstrapVersion,
 				},
 			},
 		},
@@ -665,10 +682,57 @@ func (t *logicTest) setup(
 		// matter where the data really is.
 		ReplicationMode: base.ReplicationManual,
 	}
-	t.cluster = serverutils.StartTestCluster(t.t, numNodes, params)
-	if useFakeSpanResolver {
+	if cfg.distSQLUseDisk {
+		params.ServerArgs.Knobs.DistSQL = &distsqlrun.TestingKnobs{
+			MemoryLimitBytes: 1,
+		}
+	}
+
+	if cfg.serverVersion != nil {
+		// If we want to run a specific server version, we assume that it
+		// supports at least the bootstrap version.
+		paramsPerNode := map[int]base.TestServerArgs{}
+		minVersion := *cfg.serverVersion
+		if cfg.bootstrapVersion != nil {
+			minVersion = cfg.bootstrapVersion.MinimumVersion
+		}
+		for i := 0; i < cfg.numNodes; i++ {
+			nodeParams := params.ServerArgs
+			nodeParams.Settings = cluster.MakeClusterSettings(minVersion, *cfg.serverVersion)
+			paramsPerNode[i] = nodeParams
+		}
+		params.ServerArgsPerNode = paramsPerNode
+	}
+
+	t.cluster = serverutils.StartTestCluster(t.t, cfg.numNodes, params)
+	if cfg.useFakeSpanResolver {
 		fakeResolver := distsqlutils.FakeResolverForTestCluster(t.cluster)
 		t.cluster.Server(t.nodeIdx).SetDistSQLSpanResolver(fakeResolver)
+	}
+
+	if cfg.overrideDistSQLMode != "" {
+		if _, err := t.cluster.ServerConn(0).Exec(
+			"SET CLUSTER SETTING sql.defaults.distsql = $1::string", cfg.overrideDistSQLMode,
+		); err != nil {
+			t.Fatal(err)
+		}
+		wantedMode := sql.DistSQLExecModeFromString(cfg.overrideDistSQLMode) // off => 0, etc
+		// Wait until all servers are aware of the setting.
+		testutils.SucceedsSoon(t.t, func() error {
+			for i := 0; i < t.cluster.NumServers(); i++ {
+				var m sql.DistSQLExecMode
+				err := t.cluster.ServerConn(i % t.cluster.NumServers()).QueryRow(
+					"SHOW CLUSTER SETTING sql.defaults.distsql",
+				).Scan(&m)
+				if err != nil {
+					t.Fatal(errors.Wrapf(err, "%d", i))
+				}
+				if m != wantedMode {
+					return errors.Errorf("node %d is still waiting for update of DistSQLMode to %s (have %s)", i, wantedMode, m)
+				}
+			}
+			return nil
+		})
 	}
 
 	// db may change over the lifetime of this function, with intermediate
@@ -754,9 +818,9 @@ func (t *logicTest) processTestFile(path string, config testClusterConfig) error
 	defer t.traceStop()
 
 	if *showSQL {
-		t.outf("--- queries start here")
+		t.outf("--- queries start here (file: %s)", path)
 	}
-	defer t.printCompletion(path)
+	defer t.printCompletion(path, config)
 
 	t.lastProgress = timeutil.Now()
 
@@ -1023,7 +1087,7 @@ func (t *logicTest) processTestFile(path string, config testClusterConfig) error
 			switch fields[1] {
 			case "":
 				return errors.New("skipif command requires a non-blank argument")
-			case "mysql":
+			case "mysql", "mssql":
 			case "postgresql", "cockroachdb":
 				s.skip = true
 				continue
@@ -1040,6 +1104,9 @@ func (t *logicTest) processTestFile(path string, config testClusterConfig) error
 				return errors.New("onlyif command requires a non-blank argument")
 			case "cockroachdb":
 			case "mysql":
+				s.skip = true
+				continue
+			case "mssql":
 				s.skip = true
 				continue
 			default:
@@ -1287,6 +1354,10 @@ func (t *logicTest) execQuery(query logicQuery) error {
 						val = str
 					}
 				}
+				// Empty strings are rendered as "·" (middle dot)
+				if val == "" {
+					val = "·"
+				}
 				// We split string results on whitespace and append a separate result
 				// for each string. A bit unusual, but otherwise we can't match strings
 				// containing whitespace.
@@ -1366,7 +1437,7 @@ func (t *logicTest) execQuery(query logicQuery) error {
 		var buf bytes.Buffer
 		tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
 
-		fmt.Fprintf(&buf, "%s: \nexpected:\n", query.pos)
+		fmt.Fprintf(&buf, "%s: %s\nexpected:\n", query.pos, query.sql)
 		for _, expectedResultRaw := range query.expectedResultsRaw {
 			fmt.Fprintf(tw, "    %s\n", expectedResultRaw)
 		}
@@ -1428,11 +1499,20 @@ func (t *logicTest) runFile(path string, config testClusterConfig) {
 	}
 }
 
+var skipLogicTests = envutil.EnvOrDefaultBool("COCKROACH_LOGIC_TESTS_SKIP", false)
+var logicTestsConfigExclude = envutil.EnvOrDefaultString("COCKROACH_LOGIC_TESTS_SKIP_CONFIG", "")
+var logicTestsConfigFilter = envutil.EnvOrDefaultString("COCKROACH_LOGIC_TESTS_CONFIG", "")
+
 func TestLogic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	if testutils.Stress() {
+	if testutils.NightlyStress() {
+		// See https://github.com/cockroachdb/cockroach/pull/10966.
 		t.Skip()
+	}
+
+	if skipLogicTests {
+		t.Skip("COCKROACH_LOGIC_TESTS_SKIP")
 	}
 
 	// run the logic tests indicated by the bigtest and logictestdata flags.
@@ -1457,18 +1537,18 @@ func TestLogic(t *testing.T) {
 			logicTestPath + "/test/index/in/*/*.test",
 			logicTestPath + "/test/index/orderby/*/*.test",
 			logicTestPath + "/test/index/orderby_nosort/*/*.test",
+			logicTestPath + "/test/index/view/*/*.test",
 
-			// TODO(pmattis): We don't support aggregate functions.
+			// TODO(pmattis): Incompatibilities in numeric types.
+			// For instance, we type SUM(int) as a decimal since all of our ints are
+			// int64.
 			// logicTestPath + "/test/random/expr/*.test",
 
-			// TODO(pmattis): We don't support tables without primary keys.
+			// TODO(pmattis): We don't support correlated subqueries.
 			// logicTestPath + "/test/select*.test",
 
-			// TODO(pmattis): We don't support views.
-			// logicTestPath + "/test/index/view/*/*.test",
-
-			// TODO(pmattis): We don't support joins.
-			// [uses joins] logicTestPath + "/test/index/random/*/*.test",
+			// TODO(pmattis): We don't support unary + on strings.
+			// logicTestPath + "/test/index/random/*/*.test",
 			// [uses joins] logicTestPath + "/test/random/aggregates/*.test",
 			// [uses joins] logicTestPath + "/test/random/groupby/*.test",
 			// [uses joins] logicTestPath + "/test/random/select/*.test",
@@ -1489,10 +1569,6 @@ func TestLogic(t *testing.T) {
 	if len(paths) == 0 {
 		t.Fatalf("No testfiles found (globs: %v)", globs)
 	}
-
-	// We want to collect SQL per-statement statistics in tests,
-	// regardless of what the environment / config says.
-	defer settings.TestingSetBool(&sql.StmtStatsEnable, true)()
 
 	// mu protects the following vars, which all get updated from within the
 	// possibly parallel subtests.
@@ -1528,6 +1604,12 @@ func TestLogic(t *testing.T) {
 		}
 		// Top-level test: one per test configuration.
 		t.Run(cfg.name, func(t *testing.T) {
+			if logicTestsConfigExclude != "" && cfg.name == logicTestsConfigExclude {
+				t.Skip("config excluded via env var")
+			}
+			if logicTestsConfigFilter != "" && cfg.name != logicTestsConfigFilter {
+				t.Skip("config does not match env var")
+			}
 			for _, path := range paths {
 				path := path // Rebind range variable.
 				// Inner test: one per file path.
@@ -1550,12 +1632,7 @@ func TestLogic(t *testing.T) {
 					if *printErrorSummary {
 						defer lt.printErrorSummary()
 					}
-					var distSQLOverrideEnum *settings.EnumSetting
-					if cfg.overrideDistSQLMode != "" {
-						distSQLOverrideEnum = &settings.EnumSetting{}
-						settings.TestingSetEnum(&distSQLOverrideEnum, int64(sql.DistSQLExecModeFromString(cfg.overrideDistSQLMode)))
-					}
-					lt.setup(cfg.numNodes, cfg.useFakeSpanResolver, distSQLOverrideEnum)
+					lt.setup(cfg)
 					lt.runFile(path, cfg)
 
 					progress.Lock()
@@ -1751,11 +1828,11 @@ func (t *logicTest) finishOne(msg string) {
 
 // printCompletion reports on the completion of all tests in a given
 // input file.
-func (t *logicTest) printCompletion(path string) {
+func (t *logicTest) printCompletion(path string, config testClusterConfig) {
 	unsupportedMsg := ""
 	if t.unsupported > 0 {
 		unsupportedMsg = fmt.Sprintf(", ignored %d unsupported queries", t.unsupported)
 	}
-	t.outf("--- done: %s: %d tests, %d failures%s", path, t.progress, t.failures,
-		unsupportedMsg)
+	t.outf("--- done: %s with config %s: %d tests, %d failures%s", path, config.name,
+		t.progress, t.failures, unsupportedMsg)
 }

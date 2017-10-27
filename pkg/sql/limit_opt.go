@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
@@ -34,7 +32,7 @@ import (
 //
 // The action of calling this method triggers limit-based query plan
 // optimizations, e.g. in expandSelectNode(). The primary user is
-// limitNode.Start(ctx) after it has fully evaluated the limit and
+// limitNode.Start(params) after it has fully evaluated the limit and
 // offset expressions. EXPLAIN also does this, see expandPlan() for
 // explainPlanNode.
 //
@@ -96,7 +94,7 @@ func applyLimit(plan planNode, numRows int64, soft bool) {
 		if n.needOnlyOneRow {
 			// We have a single MIN/MAX function and the underlying plan's
 			// ordering matches the function. We only need to retrieve one row.
-			applyLimit(n.plan, 1, false /* !soft */)
+			applyLimit(n.plan, 1, false /* soft */)
 		} else {
 			setUnlimited(n.plan)
 		}
@@ -149,8 +147,6 @@ func applyLimit(plan planNode, numRows int64, soft bool) {
 		if n.sourcePlan != nil {
 			applyLimit(n.sourcePlan, numRows, soft)
 		}
-	case *createViewNode:
-		setUnlimited(n.sourcePlan)
 	case *explainDistSQLNode:
 		setUnlimited(n.plan)
 	case *traceNode:
@@ -168,18 +164,27 @@ func applyLimit(plan planNode, numRows int64, soft bool) {
 
 	case *valuesNode:
 	case *alterTableNode:
+	case *cancelQueryNode:
+	case *scrubNode:
+	case *controlJobNode:
 	case *copyNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
 	case *createUserNode:
+	case *createViewNode:
 	case *dropDatabaseNode:
 	case *dropIndexNode:
 	case *dropTableNode:
 	case *dropViewNode:
 	case *dropUserNode:
-	case *emptyNode:
+	case *zeroNode:
+	case *unaryNode:
 	case *hookFnNode:
 	case *valueGenerator:
+	case *setNode:
+	case *setClusterSettingNode:
+	case *setZoneConfigNode:
+	case *showZoneConfigNode:
 	case *showRangesNode:
 	case *showFingerprintsNode:
 	case *scatterNode:

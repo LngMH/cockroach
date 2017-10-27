@@ -11,18 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Jiang-Ming Yang (jiangming.yang@gmail.com)
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package enginepb
 
 // Short returns a prefix of the transaction's ID.
 func (t TxnMeta) Short() string {
-	if id := t.ID; id != nil {
-		return id.Short()
-	}
-	return "<nil>"
+	return t.ID.Short()
 }
 
 // Total returns the range size as the sum of the key and value

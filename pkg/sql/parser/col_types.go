@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
@@ -23,7 +21,6 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/pkg/errors"
 )
 
 // CastTargetType represents a type that is a valid cast target.
@@ -49,7 +46,9 @@ func (*DateColType) columnType()           {}
 func (*TimestampColType) columnType()      {}
 func (*TimestampTZColType) columnType()    {}
 func (*IntervalColType) columnType()       {}
+func (*JSONColType) columnType()           {}
 func (*UUIDColType) columnType()           {}
+func (*IPAddrColType) columnType()         {}
 func (*StringColType) columnType()         {}
 func (*NameColType) columnType()           {}
 func (*BytesColType) columnType()          {}
@@ -67,7 +66,9 @@ func (*DateColType) castTargetType()           {}
 func (*TimestampColType) castTargetType()      {}
 func (*TimestampTZColType) castTargetType()    {}
 func (*IntervalColType) castTargetType()       {}
+func (*JSONColType) castTargetType()           {}
 func (*UUIDColType) castTargetType()           {}
+func (*IPAddrColType) castTargetType()         {}
 func (*StringColType) castTargetType()         {}
 func (*NameColType) castTargetType()           {}
 func (*BytesColType) castTargetType()          {}
@@ -108,7 +109,10 @@ var (
 	intColTypeBigSerial   = &IntColType{Name: "BIGSERIAL"}
 )
 
-var errBitLengthNotPositive = errors.New("length for type bit must be at least 1")
+var (
+	errBitLengthNotPositive = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "length for type bit must be at least 1")
+	errScaleOutOfRange      = pgerror.NewError(pgerror.CodeNumericValueOutOfRangeError, "scale out of range")
+)
 
 func newIntBitType(width int) (*IntColType, error) {
 	if width < 1 {
@@ -207,7 +211,7 @@ func LimitDecimalWidth(d *apd.Decimal, precision, scale int) error {
 	}
 	// Use +1 here because it is inverted later.
 	if scale < math.MinInt32+1 || scale > math.MaxInt32 {
-		return errors.New("scale out of range")
+		return errScaleOutOfRange
 	}
 	if scale > precision {
 		return pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError, "scale (%d) must be between 0 and precision (%d)", scale, precision)
@@ -297,6 +301,21 @@ func (node *UUIDColType) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("UUID")
 }
 
+// Pre-allocated immutable ip column types.
+var (
+	ipnetColTypeINet = &IPAddrColType{Name: "INET"}
+)
+
+// IPAddrColType represents an INET or CIDR type.
+type IPAddrColType struct {
+	Name string
+}
+
+// Format implements the NodeFormatter interface.
+func (node *IPAddrColType) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteString(node.Name)
+}
+
 // Pre-allocated immutable string column types.
 var (
 	stringColTypeChar    = &StringColType{Name: "CHAR"}
@@ -376,17 +395,17 @@ type ArrayColType struct {
 // Format implements the NodeFormatter interface.
 func (node *ArrayColType) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString(node.Name)
+	if collation, ok := node.ParamType.(*CollatedStringColType); ok {
+		buf.WriteString(" COLLATE ")
+		encodeSQLIdent(buf, collation.Locale, f)
+	}
 }
 
 func arrayOf(colType ColumnType, boundsExprs Exprs) (ColumnType, error) {
-	switch colType {
-	case intColTypeInt:
-		return &ArrayColType{Name: "INT[]", ParamType: intColTypeInt, BoundsExprs: boundsExprs}, nil
-	case stringColTypeString:
-		return &ArrayColType{Name: "STRING[]", ParamType: stringColTypeString, BoundsExprs: boundsExprs}, nil
-	default:
-		return nil, errors.Errorf("cannot make array for column type %s", colType)
+	if !canBeInArrayColType(colType) {
+		return nil, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "arrays of %s not allowed", colType)
 	}
+	return &ArrayColType{Name: colType.String() + "[]", ParamType: colType, BoundsExprs: boundsExprs}, nil
 }
 
 // VectorColType is the base for VECTOR column types, which are Postgres's
@@ -407,6 +426,20 @@ var int2vectorColType = &VectorColType{
 	Name:      "INT2VECTOR",
 	ParamType: intColTypeInt,
 }
+
+// JSONColType represents the JSON column type.
+type JSONColType struct {
+	Name string
+}
+
+// Format implements the NodeFormatter interface.
+func (node *JSONColType) Format(buf *bytes.Buffer, _ FmtFlags) {
+	buf.WriteString(node.Name)
+}
+
+// Pre-allocated immutable JSON column type.
+var jsonColType = &JSONColType{Name: "JSON"}
+var jsonbColType = &JSONColType{Name: "JSONB"}
 
 // Pre-allocated immutable postgres oid column types.
 var (
@@ -480,7 +513,9 @@ func (node *DateColType) String() string           { return AsString(node) }
 func (node *TimestampColType) String() string      { return AsString(node) }
 func (node *TimestampTZColType) String() string    { return AsString(node) }
 func (node *IntervalColType) String() string       { return AsString(node) }
+func (node *JSONColType) String() string           { return AsString(node) }
 func (node *UUIDColType) String() string           { return AsString(node) }
+func (node *IPAddrColType) String() string         { return AsString(node) }
 func (node *StringColType) String() string         { return AsString(node) }
 func (node *NameColType) String() string           { return AsString(node) }
 func (node *BytesColType) String() string          { return AsString(node) }
@@ -508,8 +543,12 @@ func DatumTypeToColumnType(t Type) (ColumnType, error) {
 		return timestampTzColTypeTimestampWithTZ, nil
 	case TypeInterval:
 		return intervalColTypeInterval, nil
+	case TypeJSON:
+		return jsonColType, nil
 	case TypeUUID:
 		return uuidColTypeUUID, nil
+	case TypeINet:
+		return ipnetColTypeINet, nil
 	case TypeDate:
 		return dateColTypeDate, nil
 	case TypeString:
@@ -540,7 +579,8 @@ func DatumTypeToColumnType(t Type) (ColumnType, error) {
 		return DatumTypeToColumnType(typ.Type)
 	}
 
-	return nil, errors.Errorf("value type %s cannot be used for table columns", t)
+	return nil, pgerror.NewErrorf(pgerror.CodeInvalidTableDefinitionError,
+		"value type %s cannot be used for table columns", t)
 }
 
 // CastTargetToDatumType produces a Type equivalent to the given
@@ -569,8 +609,12 @@ func CastTargetToDatumType(t CastTargetType) Type {
 		return TypeTimestampTZ
 	case *IntervalColType:
 		return TypeInterval
+	case *JSONColType:
+		return TypeJSON
 	case *UUIDColType:
 		return TypeUUID
+	case *IPAddrColType:
+		return TypeINet
 	case *CollatedStringColType:
 		return TCollatedString{Locale: ct.Locale}
 	case *ArrayColType:
@@ -580,6 +624,6 @@ func CastTargetToDatumType(t CastTargetType) Type {
 	case *OidColType:
 		return oidColTypeToType(ct)
 	default:
-		panic(errors.Errorf("unexpected CastTarget %T", t))
+		panic(fmt.Sprintf("unexpected CastTarget %T", t))
 	}
 }

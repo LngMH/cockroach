@@ -11,21 +11,18 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
-// Author: Cuong Do (cdo@cockroachlabs.com)
 
 package server
 
 import (
 	"bytes"
 	"fmt"
+	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -43,12 +40,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
+	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -70,7 +69,7 @@ var errAdminAPIError = grpc.Errorf(codes.Internal, "An internal server error "+
 // the cockroach cluster.
 type adminServer struct {
 	server     *Server
-	memMonitor mon.MemoryMonitor
+	memMonitor mon.BytesMonitor
 	memMetrics *sql.MemoryMetrics
 }
 
@@ -86,7 +85,12 @@ func newAdminServer(s *Server) *adminServer {
 	// TODO(knz): We do not limit memory usage by admin operations
 	// yet. Is this wise?
 	server.memMonitor = mon.MakeUnlimitedMonitor(
-		context.Background(), "admin", nil, nil, noteworthyAdminMemoryUsageBytes,
+		context.Background(),
+		"admin",
+		mon.MemoryResource,
+		nil,
+		nil,
+		noteworthyAdminMemoryUsageBytes,
 	)
 	return server
 }
@@ -109,7 +113,7 @@ func (s *adminServer) RegisterGateway(
 //
 // TODO(cdo): Make this work when we have an authentication scheme for the
 // API.
-func (s *adminServer) getUser(_ proto.Message) string {
+func (s *adminServer) getUser(_ protoutil.Message) string {
 	return security.RootUser
 }
 
@@ -134,34 +138,11 @@ func (s *adminServer) serverErrors(errors []error) error {
 	return errAdminAPIError
 }
 
-// checkQueryResults performs basic tests on the provided query results and returns
-// the first error that was found.
-func (s *adminServer) checkQueryResults(results []sql.Result, numResults int) error {
-	if a, e := len(results), numResults; a != e {
-		return errors.Errorf("# of results %d != expected %d", a, e)
-	}
-
-	for _, result := range results {
-		if result.Err != nil {
-			return errors.Errorf("%s", result.Err)
-		}
-	}
-
-	return nil
-}
-
-// firstNotFoundError returns the first table/database not found error in the
-// provided results.
-func (s *adminServer) firstNotFoundError(results []sql.Result) error {
-	for _, res := range results {
-		// TODO(cdo): Replace this crude suffix-matching with something more structured once we have
-		// more structured errors.
-		if res.Err != nil && strings.HasSuffix(res.Err.Error(), "does not exist") {
-			return res.Err
-		}
-	}
-
-	return nil
+// isNotFoundError returns true if err is a table/database not found error.
+func (s *adminServer) isNotFoundError(err error) bool {
+	// TODO(cdo): Replace this crude suffix-matching with something more structured once we have
+	// more structured errors.
+	return err != nil && strings.HasSuffix(err.Error(), "does not exist")
 }
 
 // NewContextAndSessionForRPC creates a context and SQL session to be used for
@@ -183,11 +164,11 @@ func (s *adminServer) Databases(
 	args := sql.SessionArgs{User: s.getUser(req)}
 	ctx, session := s.NewContextAndSessionForRPC(ctx, args)
 	defer session.Finish(s.server.sqlExecutor)
-	r := s.server.sqlExecutor.ExecuteStatements(session, "SHOW DATABASES;", nil)
-	defer r.Close(ctx)
-	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+	r, err := s.server.sqlExecutor.ExecuteStatementsBuffered(session, "SHOW DATABASES;", nil, 1)
+	if err != nil {
 		return nil, s.serverError(err)
 	}
+	defer r.Close(ctx)
 
 	var resp serverpb.DatabasesResponse
 	for i, nRows := 0, r.ResultList[0].Rows.Len(); i < nRows; i++ {
@@ -224,14 +205,14 @@ func (s *adminServer) DatabaseDetails(
 	//
 	// TODO(cdo): Use placeholders when they're supported by SHOW.
 	query := fmt.Sprintf("SHOW GRANTS ON DATABASE %s; SHOW TABLES FROM %s;", escDBName, escDBName)
-	r := s.server.sqlExecutor.ExecuteStatements(session, query, nil)
-	defer r.Close(ctx)
-	if err := s.firstNotFoundError(r.ResultList); err != nil {
+	r, err := s.server.sqlExecutor.ExecuteStatementsBuffered(session, query, nil, 2)
+	if s.isNotFoundError(err) {
 		return nil, grpc.Errorf(codes.NotFound, "%s", err)
 	}
-	if err := s.checkQueryResults(r.ResultList, 2); err != nil {
+	if err != nil {
 		return nil, s.serverError(err)
 	}
+	defer r.Close(ctx)
 
 	// Marshal grants.
 	var resp serverpb.DatabaseDetailsResponse
@@ -322,16 +303,16 @@ func (s *adminServer) TableDetails(
 	// grammar to allow that.
 	escTableName := parser.Name(req.Table).String()
 	escQualTable := fmt.Sprintf("%s.%s", escDBName, escTableName)
-	query := fmt.Sprintf("SHOW COLUMNS FROM %s; SHOW INDEX FROM %s; SHOW GRANTS ON TABLE %s; SHOW CREATE TABLE %s;",
-		escQualTable, escQualTable, escQualTable, escQualTable)
-	r := s.server.sqlExecutor.ExecuteStatements(session, query, nil)
-	defer r.Close(ctx)
-	if err := s.firstNotFoundError(r.ResultList); err != nil {
+	query := fmt.Sprintf("SHOW COLUMNS FROM %[1]s; SHOW INDEX FROM %[1]s; SHOW GRANTS ON TABLE %[1]s; SHOW CREATE TABLE %[1]s;",
+		escQualTable)
+	r, err := s.server.sqlExecutor.ExecuteStatementsBuffered(session, query, nil, 4)
+	if s.isNotFoundError(err) {
 		return nil, grpc.Errorf(codes.NotFound, "%s", err)
 	}
-	if err := s.checkQueryResults(r.ResultList, 4); err != nil {
-		return nil, err
+	if err != nil {
+		return nil, s.serverError(err)
 	}
+	defer r.Close(ctx)
 
 	var resp serverpb.TableDetailsResponse
 
@@ -660,11 +641,11 @@ func (s *adminServer) Users(
 	ctx, session := s.NewContextAndSessionForRPC(ctx, args)
 	defer session.Finish(s.server.sqlExecutor)
 	query := "SELECT username FROM system.users"
-	r := s.server.sqlExecutor.ExecuteStatements(session, query, nil)
-	defer r.Close(ctx)
-	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+	r, err := s.server.sqlExecutor.ExecuteStatementsBuffered(session, query, nil, 1)
+	if err != nil {
 		return nil, s.serverError(err)
 	}
+	defer r.Close(ctx)
 
 	var resp serverpb.UsersResponse
 	for i, nRows := 0, r.ResultList[0].Rows.Len(); i < nRows; i++ {
@@ -693,14 +674,14 @@ func (s *adminServer) Events(
 
 	// Execute the query.
 	q := makeSQLQuery()
-	q.Append("SELECT timestamp, eventType, targetID, reportingID, info, uniqueID ")
+	q.Append(`SELECT timestamp, "eventType", "targetID", "reportingID", info, "uniqueID" `)
 	q.Append("FROM system.eventlog ")
 	q.Append("WHERE true ") // This simplifies the WHERE clause logic below.
 	if len(req.Type) > 0 {
-		q.Append("AND eventType = $ ", parser.NewDString(req.Type))
+		q.Append(`AND "eventType" = $ `, parser.NewDString(req.Type))
 	}
 	if req.TargetId > 0 {
-		q.Append("AND targetID = $ ", parser.NewDInt(parser.DInt(req.TargetId)))
+		q.Append(`AND "targetID" = $ `, parser.NewDInt(parser.DInt(req.TargetId)))
 	}
 	q.Append("ORDER BY timestamp DESC ")
 	if limit > 0 {
@@ -709,11 +690,11 @@ func (s *adminServer) Events(
 	if len(q.Errors()) > 0 {
 		return nil, s.serverErrors(q.Errors())
 	}
-	r := s.server.sqlExecutor.ExecuteStatements(session, q.String(), q.QueryArguments())
-	defer r.Close(ctx)
-	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+	r, err := s.server.sqlExecutor.ExecuteStatementsBuffered(session, q.String(), q.QueryArguments(), 1)
+	if err != nil {
 		return nil, s.serverError(err)
 	}
+	defer r.Close(ctx)
 
 	// Marshal response.
 	var resp serverpb.EventsResponse
@@ -737,6 +718,12 @@ func (s *adminServer) Events(
 		}
 		if err := scanner.ScanIndex(row, 4, &event.Info); err != nil {
 			return nil, err
+		}
+		if event.EventType == string(sql.EventLogSetClusterSetting) {
+			if s.getUser(req) != security.RootUser {
+				// TODO(dt): unpack and selectively redact the setting value.
+				event.Info = ""
+			}
 		}
 		if err := scanner.ScanIndex(row, 5, &event.UniqueID); err != nil {
 			return nil, err
@@ -762,22 +749,24 @@ func (s *adminServer) RangeLog(
 
 	// Execute the query.
 	q := makeSQLQuery()
-	q.Append("SELECT timestamp, rangeID, storeID, eventType, otherRangeID, info ")
+	q.Append(`SELECT timestamp, "rangeID", "storeID", "eventType", "otherRangeID", info `)
 	q.Append("FROM system.rangelog ")
-	rangeID := parser.NewDInt(parser.DInt(req.RangeId))
-	q.Append("WHERE rangeID = $ OR otherRangeID = $", rangeID, rangeID)
-	q.Append("ORDER BY timestamp DESC ")
+	if req.RangeId > 0 {
+		rangeID := parser.NewDInt(parser.DInt(req.RangeId))
+		q.Append(`WHERE "rangeID" = $ OR "otherRangeID" = $`, rangeID, rangeID)
+	}
 	if limit > 0 {
+		q.Append("ORDER BY timestamp desc ")
 		q.Append("LIMIT $", parser.NewDInt(parser.DInt(limit)))
 	}
 	if len(q.Errors()) > 0 {
 		return nil, s.serverErrors(q.Errors())
 	}
-	r := s.server.sqlExecutor.ExecuteStatements(session, q.String(), q.QueryArguments())
-	defer r.Close(ctx)
-	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+	r, err := s.server.sqlExecutor.ExecuteStatementsBuffered(session, q.String(), q.QueryArguments(), 1)
+	if err != nil {
 		return nil, s.serverError(err)
 	}
+	defer r.Close(ctx)
 
 	// Marshal response.
 	var resp serverpb.RangeLogResponse
@@ -820,6 +809,8 @@ func (s *adminServer) RangeLog(
 			}
 			event.OtherRangeID = roachpb.RangeID(otherRangeID)
 		}
+
+		var prettyInfo serverpb.RangeLogResponse_PrettyInfo
 		if row[5].String() != "NULL" {
 			var info string
 			if err := scanner.ScanIndex(row, 5, &info); err != nil {
@@ -828,9 +819,26 @@ func (s *adminServer) RangeLog(
 			if err := json.Unmarshal([]byte(info), &event.Info); err != nil {
 				return nil, errors.Wrap(err, fmt.Sprintf("info didn't parse correctly: %s", info))
 			}
+			if event.Info.NewDesc != nil {
+				prettyInfo.NewDesc = event.Info.NewDesc.String()
+			}
+			if event.Info.UpdatedDesc != nil {
+				prettyInfo.UpdatedDesc = event.Info.UpdatedDesc.String()
+			}
+			if event.Info.AddedReplica != nil {
+				prettyInfo.AddedReplica = event.Info.AddedReplica.String()
+			}
+			if event.Info.RemovedReplica != nil {
+				prettyInfo.RemovedReplica = event.Info.RemovedReplica.String()
+			}
+			prettyInfo.Reason = string(event.Info.Reason)
+			prettyInfo.Details = event.Info.Details
 		}
 
-		resp.Events = append(resp.Events, event)
+		resp.Events = append(resp.Events, serverpb.RangeLogResponse_Event{
+			Event:      event,
+			PrettyInfo: prettyInfo,
+		})
 	}
 	return &resp, nil
 }
@@ -846,7 +854,7 @@ func (s *adminServer) getUIData(
 
 	// Query database.
 	query := makeSQLQuery()
-	query.Append("SELECT key, value, lastUpdated FROM system.ui WHERE key IN (")
+	query.Append(`SELECT key, value, "lastUpdated" FROM system.ui WHERE key IN (`)
 	for i, key := range keys {
 		if i != 0 {
 			query.Append(",")
@@ -857,11 +865,11 @@ func (s *adminServer) getUIData(
 	if err := query.Errors(); err != nil {
 		return nil, s.serverErrorf("error constructing query: %v", err)
 	}
-	r := s.server.sqlExecutor.ExecuteStatements(session, query.String(), query.QueryArguments())
-	defer r.Close(ctx)
-	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+	r, err := s.server.sqlExecutor.ExecuteStatementsBuffered(session, query.String(), query.QueryArguments(), 1)
+	if err != nil {
 		return nil, s.serverError(err)
 	}
+	defer r.Close(ctx)
 
 	// Marshal results.
 	resp := serverpb.GetUIDataResponse{KeyValues: make(map[string]serverpb.GetUIDataResponse_Value)}
@@ -904,15 +912,15 @@ func (s *adminServer) SetUIData(
 	for key, val := range req.KeyValues {
 		// Do an upsert of the key. We update each key in a separate transaction to
 		// avoid long-running transactions and possible deadlocks.
-		query := "UPSERT INTO system.ui (key, value, lastUpdated) VALUES ($1, $2, NOW())"
+		query := `UPSERT INTO system.ui (key, value, "lastUpdated") VALUES ($1, $2, NOW())`
 		qargs := parser.MakePlaceholderInfo()
 		qargs.SetValue(`1`, parser.NewDString(key))
 		qargs.SetValue(`2`, parser.NewDBytes(parser.DBytes(val)))
-		r := s.server.sqlExecutor.ExecuteStatements(session, query, &qargs)
-		defer r.Close(ctx)
-		if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+		r, err := s.server.sqlExecutor.ExecuteStatementsBuffered(session, query, &qargs, 1)
+		if err != nil {
 			return nil, s.serverError(err)
 		}
+		defer r.Close(ctx)
 		if a, e := r.ResultList[0].RowsAffected, 1; a != e {
 			return nil, s.serverErrorf("rows affected %d != expected %d", a, e)
 		}
@@ -963,7 +971,7 @@ func (s *adminServer) Settings(
 		}
 		resp.KeyValues[k] = serverpb.SettingsResponse_Value{
 			Type:        v.Typ(),
-			Value:       v.String(),
+			Value:       v.String(&s.server.st.SV),
 			Description: v.Description(),
 		}
 	}
@@ -979,7 +987,23 @@ func (s *adminServer) Cluster(
 	if clusterID == (uuid.UUID{}) {
 		return nil, grpc.Errorf(codes.Unavailable, "cluster ID not yet available")
 	}
-	return &serverpb.ClusterResponse{ClusterID: clusterID.String()}, nil
+
+	// Check if enterprise features are enabled.  We currently test for the
+	// feature "BACKUP", although enterprise licenses do not yet distinguish
+	// between different features.
+	enterpriseEnabled := false
+	organization := sql.ClusterOrganization.Get(&s.server.st.SV)
+	if err := LicenseCheckFn(
+		s.server.st, clusterID, organization, "BACKUP",
+	); err == nil {
+		enterpriseEnabled = true
+	}
+
+	return &serverpb.ClusterResponse{
+		ClusterID:         clusterID.String(),
+		ReportingEnabled:  log.DiagnosticsReportingEnabled.Get(&s.server.st.SV),
+		EnterpriseEnabled: enterpriseEnabled,
+	}, nil
 }
 
 // Health returns liveness for the node target of the request.
@@ -1005,6 +1029,64 @@ func (s *adminServer) Liveness(
 	}, nil
 }
 
+func (s *adminServer) Jobs(
+	ctx context.Context, req *serverpb.JobsRequest,
+) (*serverpb.JobsResponse, error) {
+	args := sql.SessionArgs{User: s.getUser(req)}
+	ctx, session := s.NewContextAndSessionForRPC(ctx, args)
+	defer session.Finish(s.server.sqlExecutor)
+
+	q := makeSQLQuery()
+	q.Append(`
+      SELECT id, type, description, username, descriptor_ids, status,
+             created, started, finished, modified, fraction_completed, error
+        FROM crdb_internal.jobs
+       WHERE true
+	`)
+	if req.Status != "" {
+		q.Append(" AND status = $", parser.NewDString(req.Status))
+	}
+	if req.Type != jobs.TypeUnspecified {
+		q.Append(" AND type = $", parser.NewDString(req.Type.String()))
+	}
+	q.Append("ORDER BY created DESC")
+	if req.Limit > 0 {
+		q.Append(" LIMIT $", parser.NewDInt(parser.DInt(req.Limit)))
+	}
+	r, err := s.server.sqlExecutor.ExecuteStatementsBuffered(session, q.String(), q.QueryArguments(), 1)
+	if err != nil {
+		return nil, s.serverError(err)
+	}
+	defer r.Close(ctx)
+
+	scanner := makeResultScanner(r.ResultList[0].Columns)
+	resp := serverpb.JobsResponse{
+		Jobs: make([]serverpb.JobsResponse_Job, r.ResultList[0].Rows.Len()),
+	}
+	for i := 0; i < len(resp.Jobs); i++ {
+		job := &resp.Jobs[i]
+		if err := scanner.ScanAll(
+			r.ResultList[0].Rows.At(i),
+			&job.ID,
+			&job.Type,
+			&job.Description,
+			&job.Username,
+			&job.DescriptorIDs,
+			&job.Status,
+			&job.Created,
+			&job.Started,
+			&job.Finished,
+			&job.Modified,
+			&job.FractionCompleted,
+			&job.Error,
+		); err != nil {
+			return nil, s.serverError(err)
+		}
+	}
+
+	return &resp, nil
+}
+
 // QueryPlan returns a JSON representation of a distsql physical query
 // plan.
 func (s *adminServer) QueryPlan(
@@ -1025,13 +1107,13 @@ func (s *adminServer) QueryPlan(
 	}
 
 	explain := fmt.Sprintf(
-		"SELECT JSON FROM [EXPLAIN (distsql) %s]",
+		"SELECT \"JSON\" FROM [EXPLAIN (distsql) %s]",
 		strings.Trim(req.Query, ";"))
-	r := s.server.sqlExecutor.ExecuteStatements(session, explain, nil)
-	defer r.Close(ctx)
-	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+	r, err := s.server.sqlExecutor.ExecuteStatementsBuffered(session, explain, nil, 1)
+	if err != nil {
 		return nil, s.serverError(err)
 	}
+	defer r.Close(ctx)
 
 	row := r.ResultList[0].Rows.At(0)
 	dbDatum, ok := parser.AsDString(row[0])
@@ -1080,7 +1162,12 @@ func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_Dr
 	s.server.grpc.Stop()
 
 	ctx := stream.Context()
-	go s.server.stopper.Stop(ctx)
+	go func() {
+		// The explicit closure here allows callers.Lookup() to return something
+		// sensible referring to this file (otherwise it ends up in runtime
+		// internals).
+		s.server.stopper.Stop(ctx)
+	}()
 
 	select {
 	case <-s.server.stopper.IsStopped():
@@ -1088,6 +1175,90 @@ func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_Dr
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// DecommissionStatus returns the DecommissionStatus for all or the given nodes.
+func (s *adminServer) DecommissionStatus(
+	ctx context.Context, req *serverpb.DecommissionStatusRequest,
+) (*serverpb.DecommissionStatusResponse, error) {
+	// Get the number of replicas on each node. We *may* not need all of them,
+	// but that would be more complicated than seems worth it right now.
+	ns, err := s.server.status.Nodes(ctx, &serverpb.NodesRequest{})
+	if err != nil {
+		return nil, errors.Wrap(err, "loading node statuses")
+	}
+
+	nodeIDs := req.NodeIDs
+	// If no nodeIDs given, use all nodes.
+	if len(nodeIDs) == 0 {
+		for _, status := range ns.Nodes {
+			nodeIDs = append(nodeIDs, status.Desc.NodeID)
+		}
+	}
+
+	// Compute the replica counts for the target nodes only. This map doubles as
+	// a lookup table to check whether we care about a given node.
+	replicaCounts := make(map[roachpb.NodeID]int64)
+	for _, nodeID := range nodeIDs {
+		replicaCounts[nodeID] = math.MaxInt64
+	}
+
+	for _, nodeStatus := range ns.Nodes {
+		nodeID := nodeStatus.Desc.NodeID
+		if _, ok := replicaCounts[nodeID]; !ok {
+			continue // not interested in this node
+		}
+		var replicas float64
+		for _, storeStatus := range nodeStatus.StoreStatuses {
+			replicas += storeStatus.Metrics["replicas"]
+		}
+		replicaCounts[nodeID] = int64(replicas)
+	}
+
+	var res serverpb.DecommissionStatusResponse
+
+	for nodeID := range replicaCounts {
+		l, err := s.server.nodeLiveness.GetLiveness(nodeID)
+		if err != nil {
+			return nil, errors.Wrapf(err, "unable to get liveness for %d", nodeID)
+		}
+		nodeResp := serverpb.DecommissionStatusResponse_Status{
+			NodeID:          l.NodeID,
+			ReplicaCount:    replicaCounts[l.NodeID],
+			Decommissioning: l.Decommissioning,
+			Draining:        l.Draining,
+		}
+		if l.IsLive(s.server.clock.Now(), s.server.clock.MaxOffset()) {
+			nodeResp.IsLive = true
+		}
+
+		res.Status = append(res.Status, nodeResp)
+	}
+
+	sort.Slice(res.Status, func(i, j int) bool {
+		return res.Status[i].NodeID < res.Status[j].NodeID
+	})
+
+	return &res, nil
+}
+
+// Decommission sets the decommission flag to the specified value on the specified node(s).
+func (s *adminServer) Decommission(
+	ctx context.Context, req *serverpb.DecommissionRequest,
+) (*serverpb.DecommissionStatusResponse, error) {
+	nodeIDs := req.NodeIDs
+	if nodeIDs == nil {
+		// If no NodeIDs are specified, decommission the current node. This is
+		// used by `quit --decommission`.
+		nodeIDs = []roachpb.NodeID{s.server.NodeID()}
+	}
+
+	// Mark the target nodes as decommissioning. They'll find out as they
+	// heartbeat their liveness.
+	if err := s.server.Decommission(ctx, req.Decommissioning, nodeIDs); err != nil {
+		return nil, err
+	}
+	return s.DecommissionStatus(ctx, &serverpb.DecommissionStatusRequest{NodeIDs: nodeIDs})
 }
 
 // sqlQuery allows you to incrementally build a SQL query that uses
@@ -1194,11 +1365,12 @@ func (rs resultScanner) IsNull(row parser.Datums, col string) (bool, error) {
 func (rs resultScanner) ScanIndex(row parser.Datums, index int, dst interface{}) error {
 	src := row[index]
 
+	if dst == nil {
+		return errors.Errorf("nil destination pointer passed in")
+	}
+
 	switch d := dst.(type) {
 	case *string:
-		if dst == nil {
-			return errors.Errorf("nil destination pointer passed in")
-		}
 		s, ok := parser.AsDString(src)
 		if !ok {
 			return errors.Errorf("source type assertion failed")
@@ -1206,39 +1378,60 @@ func (rs resultScanner) ScanIndex(row parser.Datums, index int, dst interface{})
 		*d = string(s)
 
 	case *bool:
-		if dst == nil {
-			return errors.Errorf("nil destination pointer passed in")
-		}
 		s, ok := src.(*parser.DBool)
 		if !ok {
 			return errors.Errorf("source type assertion failed")
 		}
 		*d = bool(*s)
 
-	case *int64:
-		if dst == nil {
-			return errors.Errorf("nil destination pointer passed in")
+	case *float32:
+		s, ok := src.(*parser.DFloat)
+		if !ok {
+			return errors.Errorf("source type assertion failed")
 		}
+		*d = float32(*s)
+
+	case *int64:
 		s, ok := parser.AsDInt(src)
 		if !ok {
 			return errors.Errorf("source type assertion failed")
 		}
 		*d = int64(s)
 
-	case *time.Time:
-		if dst == nil {
-			return errors.Errorf("nil destination pointer passed in")
+	case *[]sqlbase.ID:
+		s, ok := parser.AsDArray(src)
+		if !ok {
+			return errors.Errorf("source type assertion failed")
 		}
+		for i := 0; i < s.Len(); i++ {
+			id, ok := parser.AsDInt(s.Array[i])
+			if !ok {
+				return errors.Errorf("source type assertion failed on index %d", i)
+			}
+			*d = append(*d, sqlbase.ID(id))
+		}
+
+	case *time.Time:
 		s, ok := src.(*parser.DTimestamp)
 		if !ok {
 			return errors.Errorf("source type assertion failed")
 		}
 		*d = s.Time
 
-	case *[]byte:
-		if dst == nil {
-			return errors.Errorf("nil destination pointer passed in")
+	// Passing a **time.Time instead of a *time.Time means the source is allowed
+	// to be NULL, in which case nil is stored into *src.
+	case **time.Time:
+		s, ok := src.(*parser.DTimestamp)
+		if !ok {
+			if src != parser.DNull {
+				return errors.Errorf("source type assertion failed")
+			}
+			*d = nil
+			return nil
 		}
+		*d = &s.Time
+
+	case *[]byte:
 		s, ok := src.(*parser.DBytes)
 		if !ok {
 			return errors.Errorf("source type assertion failed")
@@ -1250,6 +1443,20 @@ func (rs resultScanner) ScanIndex(row parser.Datums, index int, dst interface{})
 		return errors.Errorf("unimplemented type for scanCol: %T", dst)
 	}
 
+	return nil
+}
+
+// ScanAll scans all the columns from the given row, in order, into dsts.
+func (rs resultScanner) ScanAll(row parser.Datums, dsts ...interface{}) error {
+	if len(row) != len(dsts) {
+		return fmt.Errorf(
+			"ScanAll: row has %d columns but %d dests provided", len(row), len(dsts))
+	}
+	for i := 0; i < len(row); i++ {
+		if err := rs.ScanIndex(row, i, dsts[i]); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1280,11 +1487,11 @@ func (s *adminServer) queryZone(
 	const query = `SELECT config FROM system.zones WHERE id = $1`
 	params := parser.MakePlaceholderInfo()
 	params.SetValue(`1`, parser.NewDInt(parser.DInt(id)))
-	r := s.server.sqlExecutor.ExecuteStatements(session, query, &params)
-	defer r.Close(ctx)
-	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+	r, err := s.server.sqlExecutor.ExecuteStatementsBuffered(session, query, &params, 1)
+	if err != nil {
 		return config.ZoneConfig{}, false, err
 	}
+	defer r.Close(ctx)
 
 	result := r.ResultList[0]
 	if result.Rows.Len() == 0 {
@@ -1293,13 +1500,13 @@ func (s *adminServer) queryZone(
 
 	var zoneBytes []byte
 	scanner := resultScanner{}
-	err := scanner.ScanIndex(result.Rows.At(0), 0, &zoneBytes)
+	err = scanner.ScanIndex(result.Rows.At(0), 0, &zoneBytes)
 	if err != nil {
 		return config.ZoneConfig{}, false, err
 	}
 
 	var zone config.ZoneConfig
-	if err := zone.Unmarshal(zoneBytes); err != nil {
+	if err := protoutil.Unmarshal(zoneBytes, &zone); err != nil {
 		return config.ZoneConfig{}, false, err
 	}
 	return zone, true, nil
@@ -1325,15 +1532,15 @@ func (s *adminServer) queryZonePath(
 func (s *adminServer) queryNamespaceID(
 	ctx context.Context, session *sql.Session, parentID sqlbase.ID, name string,
 ) (sqlbase.ID, error) {
-	const query = `SELECT id FROM system.namespace WHERE parentID = $1 AND name = $2`
+	const query = `SELECT id FROM system.namespace WHERE "parentID" = $1 AND name = $2`
 	params := parser.MakePlaceholderInfo()
 	params.SetValue(`1`, parser.NewDInt(parser.DInt(parentID)))
-	params.SetValue(`2`, parser.NewDString(parser.ReNormalizeName(name)))
-	r := s.server.sqlExecutor.ExecuteStatements(session, query, &params)
-	defer r.Close(ctx)
-	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+	params.SetValue(`2`, parser.NewDString(name))
+	r, err := s.server.sqlExecutor.ExecuteStatementsBuffered(session, query, &params, 1)
+	if err != nil {
 		return 0, err
 	}
+	defer r.Close(ctx)
 
 	result := r.ResultList[0]
 	if result.Rows.Len() == 0 {
@@ -1342,7 +1549,7 @@ func (s *adminServer) queryNamespaceID(
 
 	var id int64
 	scanner := resultScanner{}
-	err := scanner.ScanIndex(result.Rows.At(0), 0, &id)
+	err = scanner.ScanIndex(result.Rows.At(0), 0, &id)
 	if err != nil {
 		return 0, err
 	}

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
@@ -50,6 +48,8 @@ func TestParseColumnType(t *testing.T) {
 		{"NUMERIC", &DecimalColType{Name: "NUMERIC"}},
 		{"NUMERIC(8)", &DecimalColType{Name: "NUMERIC", Prec: 8}},
 		{"NUMERIC(9,10)", &DecimalColType{Name: "NUMERIC", Prec: 9, Scale: 10}},
+		{"UUID", &UUIDColType{}},
+		{"INET", &IPAddrColType{Name: "INET"}},
 		{"DATE", &DateColType{}},
 		{"TIMESTAMP", &TimestampColType{}},
 		{"TIMESTAMP WITH TIME ZONE", &TimestampTZColType{}},

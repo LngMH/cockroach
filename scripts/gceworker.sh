@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-export CLOUDSDK_CORE_PROJECT=${CLOUDSDK_CORE_PROJECT-${GOOGLE_PROJECT-cockroach-$(id -un)}}
+export CLOUDSDK_CORE_PROJECT=${CLOUDSDK_CORE_PROJECT-${GCEWORKER_PROJECT-cockroach-workers}}
 export CLOUDSDK_COMPUTE_ZONE=${GCEWORKER_ZONE-${CLOUDSDK_COMPUTE_ZONE-us-east1-b}}
-NAME=${GCEWORKER_NAME-gceworker}
+NAME=${GCEWORKER_NAME-gceworker-$(id -un)}
 
 case ${1-} in
     create)
@@ -14,7 +14,7 @@ case ${1-} in
            --network "default" \
            --maintenance-policy "MIGRATE" \
            --image-project "ubuntu-os-cloud" \
-           --image "ubuntu-1604-xenial-v20170113" \
+           --image-family "ubuntu-1604-lts" \
            --boot-disk-size "100" \
            --boot-disk-type "pd-ssd" \
            --boot-disk-device-name "${NAME}"

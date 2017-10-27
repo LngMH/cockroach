@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package gossip
 
@@ -74,6 +72,10 @@ const (
 	// The value if a config.SystemConfig which holds all key/value
 	// pairs in the system DB span.
 	KeySystemConfig = "system-db"
+
+	// KeyDistSQLNodeVersionKeyPrefix is key prefix for each node's DistSQL
+	// version.
+	KeyDistSQLNodeVersionKeyPrefix = "distsql-version"
 )
 
 // MakeKey creates a canonical key under which to gossip a piece of
@@ -129,4 +131,9 @@ func MakeStoreKey(storeID roachpb.StoreID) string {
 // MakeDeadReplicasKey returns the dead replicas gossip key for the given store.
 func MakeDeadReplicasKey(storeID roachpb.StoreID) string {
 	return MakeKey(KeyDeadReplicasPrefix, storeID.String())
+}
+
+// MakeDistSQLNodeVersionKey returns the gossip key for the given store.
+func MakeDistSQLNodeVersionKey(nodeID roachpb.NodeID) string {
+	return MakeKey(KeyDistSQLNodeVersionKeyPrefix, nodeID.String())
 }

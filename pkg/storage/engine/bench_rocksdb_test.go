@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package engine
 
@@ -21,13 +19,17 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
 func setupMVCCRocksDB(b testing.TB, dir string) Engine {
 	rocksdb, err := NewRocksDB(
-		RocksDBConfig{Dir: dir},
+		RocksDBConfig{
+			Settings: cluster.MakeTestingClusterSettings(),
+			Dir:      dir,
+		},
 		RocksDBCache{},
 	)
 	if err != nil {
@@ -74,6 +76,14 @@ func BenchmarkMVCCComputeStats_RocksDB(b *testing.B) {
 	for _, valueSize := range []int{8, 32, 256} {
 		b.Run(fmt.Sprintf("valueSize=%d", valueSize), func(b *testing.B) {
 			runMVCCComputeStats(setupMVCCRocksDB, valueSize, b)
+		})
+	}
+}
+
+func BenchmarkMVCCFindSplitKey_RocksDB(b *testing.B) {
+	for _, valueSize := range []int{32} {
+		b.Run(fmt.Sprintf("valueSize=%d", valueSize), func(b *testing.B) {
+			runMVCCFindSplitKey(setupMVCCRocksDB, valueSize, b)
 		})
 	}
 }

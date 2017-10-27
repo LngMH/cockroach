@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
@@ -41,7 +39,7 @@ func TestNormalizeTableName(t *testing.T) {
 		{`foo`, ``, ``, `no database specified`},
 		{`foo@bar`, ``, ``, `syntax error`},
 		{`test.*`, ``, ``, `invalid table name: "test\.\*"`},
-		{`p."".bar`, ``, ``, `empty database name: "p.\\"\\".bar"`},
+		{`p."".bar`, ``, ``, `empty database name: "p\.\.bar"`},
 	}
 
 	for _, tc := range testCases {

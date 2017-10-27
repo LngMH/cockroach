@@ -54,11 +54,11 @@ func (e *EnumSetting) ParseEnum(raw string) (int64, bool) {
 	return v, ok
 }
 
-func (e *EnumSetting) set(k int64) error {
+func (e *EnumSetting) set(sv *Values, k int64) error {
 	if _, ok := e.enumValues[k]; !ok {
 		return errors.Errorf("unrecognized value %d", k)
 	}
-	return e.IntSetting.set(k)
+	return e.IntSetting.set(sv, k)
 }
 
 func enumValuesToDesc(enumValues map[int64]string) string {
@@ -103,25 +103,7 @@ func RegisterEnumSetting(
 		IntSetting: IntSetting{defaultValue: i},
 		enumValues: enumValuesLower,
 	}
+
 	register(key, fmt.Sprintf("%s %s", desc, enumValuesToDesc(enumValues)), setting)
 	return setting
-}
-
-// TestingSetEnum returns a mock, unregistered enum setting for testing. See
-// TestingSetBool for more details.
-func TestingSetEnum(s **EnumSetting, i int64) func() {
-	saved := *s
-	*s = &EnumSetting{
-		IntSetting: IntSetting{v: i},
-		enumValues: saved.enumValues,
-	}
-	return func() {
-		*s = saved
-	}
-}
-
-// OnChange registers a callback to be called when the setting changes.
-func (e *EnumSetting) OnChange(fn func()) *EnumSetting {
-	e.setOnChange(fn)
-	return e
 }

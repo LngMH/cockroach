@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
@@ -122,11 +120,11 @@ func TestTableReader(t *testing.T) {
 		evalCtx := parser.MakeTestingEvalContext()
 		defer evalCtx.Stop(context.Background())
 		flowCtx := FlowCtx{
-			evalCtx:  evalCtx,
-			txnProto: &roachpb.Transaction{},
+			EvalCtx:  evalCtx,
+			Settings: s.ClusterSettings(),
 			// Pass a DB without a TxnCoordSender.
-			remoteTxnDB: client.NewDB(s.DistSender(), s.Clock()),
-			nodeID:      s.NodeID(),
+			txn:    client.NewTxn(client.NewDB(s.DistSender(), s.Clock()), s.NodeID()),
+			nodeID: s.NodeID(),
 		}
 
 		out := &RowBuffer{}
@@ -151,7 +149,7 @@ func TestTableReader(t *testing.T) {
 			res = append(res, row)
 		}
 
-		if result := res.String(); result != c.expected {
+		if result := res.String(tr.OutputTypes()); result != c.expected {
 			t.Errorf("invalid results: %s, expected %s'", result, c.expected)
 		}
 	}
@@ -189,12 +187,13 @@ ALTER TABLE t TESTING_RELOCATE VALUES (ARRAY[2], 1), (ARRAY[1], 2), (ARRAY[3], 3
 
 	evalCtx := parser.MakeTestingEvalContext()
 	defer evalCtx.Stop(context.Background())
+	nodeID := tc.Server(0).NodeID()
 	flowCtx := FlowCtx{
-		evalCtx:  evalCtx,
-		txnProto: &roachpb.Transaction{},
+		EvalCtx:  evalCtx,
+		Settings: tc.Server(0).ClusterSettings(),
 		// Pass a DB without a TxnCoordSender.
-		remoteTxnDB: client.NewDB(tc.Server(0).DistSender(), tc.Server(0).Clock()),
-		nodeID:      tc.Server(0).NodeID(),
+		txn:    client.NewTxn(client.NewDB(tc.Server(0).DistSender(), tc.Server(0).Clock()), nodeID),
+		nodeID: nodeID,
 	}
 	spec := TableReaderSpec{
 		Spans: []TableReaderSpan{{Span: td.PrimaryIndexSpan()}},
@@ -228,7 +227,7 @@ ALTER TABLE t TESTING_RELOCATE VALUES (ARRAY[2], 1), (ARRAY[1], 2), (ARRAY[3], 3
 		res = append(res, row)
 	}
 	if len(res) != 3 {
-		t.Fatalf("expected 3 rows, got: %s", res)
+		t.Fatalf("expected 3 rows, got: %d", len(res))
 	}
 	if len(metas) != 1 {
 		t.Fatalf("expected one meta with misplanned ranges, got: %+v", metas)

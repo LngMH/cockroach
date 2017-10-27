@@ -18,6 +18,7 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -51,7 +52,10 @@ func loadTestData(
 	}
 
 	eng, err := engine.NewRocksDB(
-		engine.RocksDBConfig{Dir: dir},
+		engine.RocksDBConfig{
+			Settings: cluster.MakeTestingClusterSettings(),
+			Dir:      dir,
+		},
 		engine.RocksDBCache{},
 	)
 	if err != nil {
@@ -84,7 +88,7 @@ func loadTestData(
 		if scaled := len(keys) / numBatches; (i % scaled) == 0 {
 			if i > 0 {
 				log.Infof(ctx, "committing (%d/~%d)", i/scaled, numBatches)
-				if err := batch.Commit(false /* !sync */); err != nil {
+				if err := batch.Commit(false /* sync */); err != nil {
 					return nil, err
 				}
 				batch.Close()
@@ -102,7 +106,7 @@ func loadTestData(
 			return nil, err
 		}
 	}
-	if err := batch.Commit(false /* !sync */); err != nil {
+	if err := batch.Commit(false /* sync */); err != nil {
 		return nil, err
 	}
 	batch.Close()

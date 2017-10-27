@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package protoutil
 
@@ -42,6 +40,15 @@ func init() {
 	types.known = make(map[typeKey]reflect.Type)
 }
 
+func uncloneable(pb Message) (reflect.Type, bool) {
+	for _, verbotenKind := range verbotenKinds {
+		if t := typeIsOrContainsVerboten(reflect.TypeOf(pb), verbotenKind); t != nil {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
 // Clone uses proto.Clone to return a deep copy of pb. It panics if pb
 // recursively contains any instances of types which are known to be
 // unsupported by proto.Clone.
@@ -55,14 +62,11 @@ func init() {
 //
 // The concrete case against which this is currently guarding may be resolved
 // upstream, see https://github.com/gogo/protobuf/issues/147.
-func Clone(pb proto.Message) proto.Message {
-	for _, verbotenKind := range verbotenKinds {
-		if t := typeIsOrContainsVerboten(reflect.TypeOf(pb), verbotenKind); t != nil {
-			panic(fmt.Sprintf("attempt to clone %T, which contains uncloneable field of type %s", pb, t))
-		}
+func Clone(pb Message) Message {
+	if t, ok := uncloneable(pb); ok {
+		panic(fmt.Sprintf("attempt to clone %T, which contains uncloneable field of type %s", pb, t))
 	}
-
-	return proto.Clone(pb)
+	return proto.Clone(pb).(Message)
 }
 
 func typeIsOrContainsVerboten(t reflect.Type, verboten reflect.Kind) reflect.Type {
@@ -76,6 +80,10 @@ func typeIsOrContainsVerbotenLocked(t reflect.Type, verboten reflect.Kind) refle
 	key := typeKey{t, verboten}
 	knownTypeIsOrContainsVerboten, ok := types.known[key]
 	if !ok {
+		// To prevent infinite recursion on recursive proto types, put a
+		// placeholder in here and immediately overwite it after
+		// typeIsOrContainsVerbotenImpl returns.
+		types.known[key] = nil
 		knownTypeIsOrContainsVerboten = typeIsOrContainsVerbotenImpl(t, verboten)
 		types.known[key] = knownTypeIsOrContainsVerboten
 	}

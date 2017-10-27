@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package cliflags
 
@@ -94,11 +92,36 @@ accept requests.`,
 	SQLMem = FlagInfo{
 		Name: "max-sql-memory",
 		Description: `
-Total size in bytes available for use to store temporary data for SQL
-clients, including prepared queries and intermediate data rows during
-query execution. Size suffixes are supported (e.g. 1GB and 1GiB). If
-left unspecified, defaults to 25% of the physical memory, or 512MB if
-the memory size cannot be determined.`,
+Maximum memory capacity available to store temporary data for SQL clients,
+including prepared queries and intermediate data rows during query execution.
+Accepts numbers interpreted as bytes, size suffixes (e.g. 1GB and 1GiB) or a
+percentage of physical memory (e.g. 25%).
+If left unspecified, defaults to 128MiB.
+`,
+	}
+
+	SQLTempStorage = FlagInfo{
+		Name: "max-disk-temp-storage",
+		Description: `
+Maximum storage capacity available to store temporary disk-based data for SQL
+queries that exceed the memory budget (e.g. join, sorts, etc are sometimes able
+to spill intermediate results to disk).
+Accepts numbers interpreted as bytes, size suffixes (e.g. 32GB and 32GiB) or a
+percentage of disk size (e.g. 10%).
+If left unspecified, defaults to 32GiB.
+
+The location of the temporary files is within the first store dir (see --store).
+If expressed as a percentage, --max-disk-temp-storage is interpreted relative to
+the size of the storage device on which the first store is placed. The temp
+space usage is never counted towards any store usage (although it does share the
+device with the first store) so, when configuring this, make sure that the size
+of this temp storage plus the size of the first store don't exceed the capacity
+of the storage device.
+If the first store is an in-memory one (i.e. type=mem), then this temporary "disk"
+data is also kept in-memory. A percentage value is interpreted as a percentage
+of the available internal memory. If not specified, the default shifts to 100MiB
+when the first store is in-memory.
+`,
 	}
 
 	Cache = FlagInfo{
@@ -106,8 +129,8 @@ the memory size cannot be determined.`,
 		Description: `
 Total size in bytes for caches, shared evenly if there are multiple
 storage devices. Size suffixes are supported (e.g. 1GB and 1GiB).
-If left unspecified, defaults to 25% of the physical memory, or
-512MB if the memory size cannot be determined.`,
+If left unspecified, defaults to 128MiB. A percentage of physical memory
+can also be specified (e.g. 25%).`,
 	}
 
 	ClientHost = FlagInfo{
@@ -155,12 +178,28 @@ with a non-zero status code and further statements are not executed. The
 results of each SQL statement are printed on the standard output.`,
 	}
 
+	EchoSQL = FlagInfo{
+		Name: "echo-sql",
+		Description: `
+Reveal the SQL statements sent implicitly by the command-line utility.`,
+	}
+
+	UnsafeUpdates = FlagInfo{
+		Name: "unsafe-updates",
+		Description: `
+Allow SQL statements that may have undesired side effects. For example
+a DELETE or UPDATE without a WHERE clause. By default, such statements
+are rejected to prevent accidents. This can also be overridden in a
+session with SET sql_safe_updates = FALSE.`,
+	}
+
 	TableDisplayFormat = FlagInfo{
 		Name: "format",
 		Description: `
 Selects how to display table rows in results. Possible values: tsv,
-csv, pretty, records, sql, html. If left unspecified, defaults to tsv
-for non-interactive sessions and pretty for interactive sessions.`,
+csv, pretty, records, sql, raw, html. If left unspecified, defaults to
+tsv for non-interactive sessions and pretty for interactive
+sessions.`,
 	}
 
 	Join = FlagInfo{
@@ -397,9 +436,9 @@ for example:
 <PRE>
 
   --store=path=/mnt/ssd01,size=10000000000     -> 10000000000 bytes
-  --store-path=/mnt/ssd01,size=20GB            -> 20000000000 bytes
-  --store-path=/mnt/ssd01,size=20GiB           -> 21474836480 bytes
-  --store-path=/mnt/ssd01,size=0.02TiB         -> 21474836480 bytes
+  --store=path=/mnt/ssd01,size=20GB            -> 20000000000 bytes
+  --store=path=/mnt/ssd01,size=20GiB           -> 21474836480 bytes
+  --store=path=/mnt/ssd01,size=0.02TiB         -> 21474836480 bytes
   --store=path=/mnt/ssd01,size=20%             -> 20% of available space
   --store=path=/mnt/ssd01,size=0.2             -> 20% of available space
   --store=path=/mnt/ssd01,size=.2              -> 20% of available space
@@ -418,6 +457,24 @@ memory that the store may consume, for example:
 Commas are forbidden in all values, since they are used to separate fields.
 Also, if you use equal signs in the file path to a store, you must use the
 "path" field label.`,
+	}
+
+	TempDir = FlagInfo{
+		Name: "temp-dir",
+		Description: `
+The parent directory path where a temporary subdirectory will be created to be used for temporary files.
+This path must exist or the node will not start.
+The temporary subdirectory is used primarily as working memory for distributed computations
+and CSV importing.
+For example, the following will generate an arbitrary, temporary subdirectory
+"/mnt/ssd01/temp/cockroach-temp<NUMBER>":
+<PRE>
+
+  --temp-dir=/mnt/ssd01/temp
+
+</PRE>
+If this flag is unspecified, the temporary subdirectory will be located under
+the root of the first store.`,
 	}
 
 	URL = FlagInfo{
@@ -479,5 +536,53 @@ If specified, takes priority over host/port flags.`,
 		Description: `
 If specified, print the system config contents. Beware that the output will be
 long and not particularly human-readable.`,
+	}
+
+	Decommission = FlagInfo{
+		Name: "decommission",
+		Description: `
+If specified, decommissions the node and waits for it to rebalance before
+shutting down the node.`,
+	}
+
+	Wait = FlagInfo{
+		Name: "wait",
+		Description: `
+Specifies when to return after having marked the targets as decommissioning.
+Takes any of the following values:
+<PRE>
+
+  - all:  waits until all target nodes' replica counts have dropped to zero.
+    This is the default. Use this unless you are targeting down nodes. In the presence
+    of down nodes, this will likely wait forever.
+  - live: waits until all live target nodes' replica counts have dropped to zero.
+    Use this when targeting down nodes only. When the process returns, manually verify
+    that the cluster is fully replicated before proceeding with node removal.
+  - none: marks the targets as decommissioning, but does not wait for the process to complete.
+    Use when polling manually from an external system.
+
+</PRE>`,
+	}
+
+	NodeRanges = FlagInfo{
+		Name:        "ranges",
+		Description: `Show node details for ranges and replicas.`,
+	}
+
+	NodeStats = FlagInfo{
+		Name:        "stats",
+		Description: `Show node disk usage details.`,
+	}
+
+	NodeAll = FlagInfo{
+		Name: "all", Description: `Show all node details.
+When no node ID is specified, also lists all nodes that have been decommissioned
+in the history of the cluster.`,
+	}
+
+	NodeDecommission = FlagInfo{
+		Name: "decommission", Description: `Show node decommissioning details.
+When no node ID is specified, also lists all nodes that have been decommissioned
+in the history of the cluster.`,
 	}
 )

@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
+// checkHelper validates check constraints on rows, on INSERT and UPDATE.
 type checkHelper struct {
 	exprs        []parser.TypedExpr
 	cols         []sqlbase.ColumnDescriptor
@@ -125,7 +126,8 @@ func (c *checkHelper) check(ctx *parser.EvalContext) error {
 			return err
 		} else if !res && d != parser.DNull {
 			// Failed to satisfy CHECK constraint.
-			return fmt.Errorf("failed to satisfy CHECK constraint (%s)", expr)
+			return pgerror.NewErrorf(pgerror.CodeCheckViolationError,
+				"failed to satisfy CHECK constraint (%s)", expr)
 		}
 	}
 	return nil
@@ -162,7 +164,10 @@ func (p *planner) validateCheckExpr(
 	if err := p.startPlan(ctx, rows); err != nil {
 		return err
 	}
-	next, err := rows.Next(ctx)
+	next, err := rows.Next(runParams{
+		ctx: ctx,
+		p:   p,
+	})
 	if err != nil {
 		return err
 	}

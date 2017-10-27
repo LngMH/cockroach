@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package gossip
 
@@ -38,7 +36,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -346,7 +346,7 @@ func TestGossipNoForwardSelf(t *testing.T) {
 	}
 
 	for _, peer := range peers {
-		c := newClient(log.AmbientContext{}, local.GetNodeAddr(), makeMetrics())
+		c := newClient(log.AmbientContext{Tracer: tracing.NewTracer()}, local.GetNodeAddr(), makeMetrics())
 
 		testutils.SucceedsSoon(t, func() error {
 			conn, err := peer.rpcContext.GRPCDial(c.addr.String(), grpc.WithBlock())
@@ -382,7 +382,7 @@ func TestGossipNoForwardSelf(t *testing.T) {
 
 		for {
 			localAddr := local.GetNodeAddr()
-			c := newClient(log.AmbientContext{}, localAddr, makeMetrics())
+			c := newClient(log.AmbientContext{Tracer: tracing.NewTracer()}, localAddr, makeMetrics())
 			peer.mu.Lock()
 			c.startLocked(peer, disconnectedCh, peer.rpcContext, stopper, peer.rpcContext.NewBreaker())
 			peer.mu.Unlock()
@@ -422,7 +422,7 @@ func TestGossipCullNetwork(t *testing.T) {
 
 	const slowGossipDuration = time.Minute
 
-	if err := util.RetryForDuration(slowGossipDuration, func() error {
+	if err := retry.ForDuration(slowGossipDuration, func() error {
 		if peers := len(local.Outgoing()); peers != minPeers {
 			return errors.Errorf("%d of %d peers connected", peers, minPeers)
 		}
@@ -433,7 +433,7 @@ func TestGossipCullNetwork(t *testing.T) {
 
 	local.manage()
 
-	if err := util.RetryForDuration(slowGossipDuration, func() error {
+	if err := retry.ForDuration(slowGossipDuration, func() error {
 		// Verify that a client is closed within the cull interval.
 		if peers := len(local.Outgoing()); peers != minPeers-1 {
 			return errors.Errorf("%d of %d peers connected", peers, minPeers-1)
@@ -548,26 +548,12 @@ func TestGossipJoinTwoClusters(t *testing.T) {
 		}()
 		rpcCtx := newInsecureRPCContext(stopper)
 		server := rpc.NewServer(rpcCtx)
-		ln, err := netutil.ListenAndServeGRPC(stopper, server, util.IsolatedTestAddr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		addrs = append(addrs, ln.Addr())
 
-		var resolvers []resolver.Resolver
-		// Only third node has resolvers.
 		switch i {
 		case 0, 1:
 			clusterIDs = append(clusterIDs, uuid.MakeV4())
 		case 2:
 			clusterIDs = append(clusterIDs, clusterIDs[0])
-			for j := 0; j < 2; j++ {
-				resolver, err := resolver.NewResolver(addrs[j].String())
-				if err != nil {
-					t.Fatal(err)
-				}
-				resolvers = append(resolvers, resolver)
-			}
 		}
 
 		// node ID must be non-zero
@@ -578,6 +564,25 @@ func TestGossipJoinTwoClusters(t *testing.T) {
 		gnode.SetStallInterval(interval)
 		gnode.SetBootstrapInterval(interval)
 		gnode.SetClusterID(clusterIDs[i])
+
+		ln, err := netutil.ListenAndServeGRPC(stopper, server, util.IsolatedTestAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addrs = append(addrs, ln.Addr())
+
+		// Only the third node has resolvers.
+		var resolvers []resolver.Resolver
+		switch i {
+		case 2:
+			for j := 0; j < 2; j++ {
+				resolver, err := resolver.NewResolver(addrs[j].String())
+				if err != nil {
+					t.Fatal(err)
+				}
+				resolvers = append(resolvers, resolver)
+			}
+		}
 		gnode.Start(ln.Addr(), resolvers)
 	}
 

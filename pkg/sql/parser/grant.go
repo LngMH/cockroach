@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 // This code was derived from https://github.com/youtube/vitess.
 //
@@ -50,6 +48,28 @@ func (tl TargetList) Format(buf *bytes.Buffer, f FmtFlags) {
 	} else {
 		FormatNode(buf, f, tl.Tables)
 	}
+}
+
+// NormalizeTablesWithDatabase normalizes all patterns and qualifies TableNames
+// with the provided db name if non-empty.
+func (tl TargetList) NormalizeTablesWithDatabase(db string) error {
+	for i, pattern := range tl.Tables {
+		var err error
+		pattern, err = pattern.NormalizeTablePattern()
+		if err != nil {
+			return err
+		}
+
+		if db != "" {
+			if p, ok := pattern.(DatabaseQualifiable); ok {
+				if err := p.QualifyWithDatabase(db); err != nil {
+					return err
+				}
+			}
+		}
+		tl.Tables[i] = pattern
+	}
+	return nil
 }
 
 // Format implements the NodeFormatter interface.

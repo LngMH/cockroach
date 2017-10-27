@@ -11,23 +11,31 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
+	"sync"
+
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
+var deleteNodePool = sync.Pool{
+	New: func() interface{} {
+		return &deleteNode{}
+	},
+}
+
 type deleteNode struct {
 	editNodeBase
 	n *parser.Delete
+	p *planner
 
 	tw tableDeleter
 
@@ -46,6 +54,10 @@ type deleteNode struct {
 func (p *planner) Delete(
 	ctx context.Context, n *parser.Delete, desiredTypes []parser.Type,
 ) (planNode, error) {
+	if n.Where == nil && p.session.SafeUpdates {
+		return nil, pgerror.NewDangerousStatementErrorf("DELETE without WHERE clause")
+	}
+
 	tn, err := p.getAliasedTableName(n.Table)
 	if err != nil {
 		return nil, err
@@ -67,11 +79,12 @@ func (p *planner) Delete(
 	if err := p.fillFKTableMap(ctx, fkTables); err != nil {
 		return nil, err
 	}
-	rd, err := sqlbase.MakeRowDeleter(p.txn, en.tableDesc, fkTables, requestedCols, sqlbase.CheckFKs)
+	rd, err := sqlbase.MakeRowDeleter(p.txn, en.tableDesc, fkTables, requestedCols,
+		sqlbase.CheckFKs, &p.alloc)
 	if err != nil {
 		return nil, err
 	}
-	tw := tableDeleter{rd: rd, autoCommit: p.autoCommit}
+	tw := tableDeleter{rd: rd, autoCommit: p.autoCommit, alloc: &p.alloc}
 
 	// TODO(knz): Until we split the creation of the node from Start()
 	// for the SelectClause too, we cannot cache this. This is because
@@ -82,27 +95,29 @@ func (p *planner) Delete(
 		Exprs: sqlbase.ColumnsSelectors(rd.FetchCols),
 		From:  &parser.From{Tables: []parser.TableExpr{n.Table}},
 		Where: n.Where,
-	}, nil, nil, nil, publicAndNonPublicColumns)
+	}, nil, n.Limit, nil, publicAndNonPublicColumns)
 	if err != nil {
 		return nil, err
 	}
 
-	dn := &deleteNode{
+	dn := deleteNodePool.Get().(*deleteNode)
+	*dn = deleteNode{
 		n:            n,
+		p:            p,
 		editNodeBase: en,
 		tw:           tw,
 	}
 
 	if err := dn.run.initEditNode(
-		ctx, &dn.editNodeBase, rows, &dn.tw, n.Returning, desiredTypes); err != nil {
+		ctx, &dn.editNodeBase, rows, &dn.tw, tn, n.Returning, desiredTypes); err != nil {
 		return nil, err
 	}
 
 	return dn, nil
 }
 
-func (d *deleteNode) Start(ctx context.Context) error {
-	if err := d.run.startEditNode(ctx, &d.editNodeBase); err != nil {
+func (d *deleteNode) Start(params runParams) error {
+	if err := d.run.startEditNode(params, &d.editNodeBase); err != nil {
 		return err
 	}
 
@@ -114,9 +129,9 @@ func (d *deleteNode) Start(ctx context.Context) error {
 	if sel, ok := maybeScan.(*renderNode); ok {
 		maybeScan = sel.source.plan
 	}
-	if scan, ok := maybeScan.(*scanNode); ok && canDeleteWithoutScan(ctx, d.n, scan, &d.tw) {
+	if scan, ok := maybeScan.(*scanNode); ok && canDeleteWithoutScan(params.ctx, d.n, scan, &d.tw) {
 		d.run.fastPath = true
-		err := d.fastDelete(ctx, scan)
+		err := d.fastDelete(params.ctx, scan)
 		return err
 	}
 
@@ -125,6 +140,9 @@ func (d *deleteNode) Start(ctx context.Context) error {
 
 func (d *deleteNode) Close(ctx context.Context) {
 	d.run.rows.Close(ctx)
+	d.tw.close(ctx)
+	*d = deleteNode{}
+	deleteNodePool.Put(d)
 }
 
 func (d *deleteNode) FastPathResults() (int, bool) {
@@ -134,21 +152,24 @@ func (d *deleteNode) FastPathResults() (int, bool) {
 	return 0, false
 }
 
-func (d *deleteNode) Next(ctx context.Context) (bool, error) {
+func (d *deleteNode) Next(params runParams) (bool, error) {
 	traceKV := d.p.session.Tracing.KVTracingEnabled()
 
-	next, err := d.run.rows.Next(ctx)
+	next, err := d.run.rows.Next(params)
 	if !next {
 		if err == nil {
+			if err := params.p.cancelChecker.Check(); err != nil {
+				return false, err
+			}
 			// We're done. Finish the batch.
-			err = d.tw.finalize(ctx, traceKV)
+			_, err = d.tw.finalize(params.ctx, traceKV)
 		}
 		return false, err
 	}
 
 	rowVals := d.run.rows.Values()
 
-	_, err = d.tw.row(ctx, rowVals, traceKV)
+	_, err = d.tw.row(params.ctx, rowVals, traceKV)
 	if err != nil {
 		return false, err
 	}
@@ -195,6 +216,9 @@ func (d *deleteNode) fastDelete(ctx context.Context, scan *scanNode) error {
 	}
 
 	if err := d.tw.init(d.p.txn); err != nil {
+		return err
+	}
+	if err := d.p.cancelChecker.Check(); err != nil {
 		return err
 	}
 	rowCount, err := d.tw.fastDelete(ctx, scan, d.p.session.Tracing.KVTracingEnabled())

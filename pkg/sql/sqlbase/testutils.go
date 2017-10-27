@@ -11,10 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
-// Author: Radu Berinde (radu@cockroachlabs.com)
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package sqlbase
 
@@ -22,7 +18,6 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
-	"time"
 	"unicode"
 
 	"golang.org/x/net/context"
@@ -31,7 +26,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -67,11 +64,11 @@ func GetTableDescriptor(kvDB *client.DB, database string, table string) *TableDe
 }
 
 // RandDatum generates a random Datum of the given type.
-// If null is true, the datum can be DNull.
+// If nullOk is true, the datum can be DNull.
 // Note that if typ.SemanticType is ColumnType_NULL, the datum will always be DNull,
 // regardless of the null flag.
-func RandDatum(rng *rand.Rand, typ ColumnType, null bool) parser.Datum {
-	if null && rng.Intn(10) == 0 {
+func RandDatum(rng *rand.Rand, typ ColumnType, nullOk bool) parser.Datum {
+	if nullOk && rng.Intn(10) == 0 {
 		return parser.DNull
 	}
 	switch typ.SemanticType {
@@ -89,7 +86,7 @@ func RandDatum(rng *rand.Rand, typ ColumnType, null bool) parser.Datum {
 	case ColumnType_DATE:
 		return parser.NewDDate(parser.DDate(rng.Intn(10000)))
 	case ColumnType_TIMESTAMP:
-		return &parser.DTimestamp{Time: time.Unix(rng.Int63n(1000000), rng.Int63n(1000000))}
+		return &parser.DTimestamp{Time: timeutil.Unix(rng.Int63n(1000000), rng.Int63n(1000000))}
 	case ColumnType_INTERVAL:
 		sign := 1 - rng.Int63n(2)*2
 		return &parser.DInterval{Duration: duration.Duration{
@@ -99,6 +96,9 @@ func RandDatum(rng *rand.Rand, typ ColumnType, null bool) parser.Datum {
 		}}
 	case ColumnType_UUID:
 		return parser.NewDUuid(parser.DUuid{UUID: uuid.MakeV4()})
+	case ColumnType_INET:
+		ipAddr := ipaddr.RandIPAddr(rng)
+		return parser.NewDIPAddr(parser.DIPAddr{IPAddr: ipAddr})
 	case ColumnType_STRING:
 		// Generate a random ASCII string.
 		p := make([]byte, rng.Intn(10))
@@ -111,7 +111,7 @@ func RandDatum(rng *rand.Rand, typ ColumnType, null bool) parser.Datum {
 		_, _ = rng.Read(p)
 		return parser.NewDBytes(parser.DBytes(p))
 	case ColumnType_TIMESTAMPTZ:
-		return &parser.DTimestampTZ{Time: time.Unix(rng.Int63n(1000000), rng.Int63n(1000000))}
+		return &parser.DTimestampTZ{Time: timeutil.Unix(rng.Int63n(1000000), rng.Int63n(1000000))}
 	case ColumnType_COLLATEDSTRING:
 		if typ.Locale == nil {
 			panic("locale is required for COLLATEDSTRING")
@@ -141,8 +141,10 @@ func RandDatum(rng *rand.Rand, typ ColumnType, null bool) parser.Datum {
 		return parser.NewDOid(parser.DInt(rng.Int63()))
 	case ColumnType_NULL:
 		return parser.DNull
-	case ColumnType_INT_ARRAY, ColumnType_INT2VECTOR:
-		// TODO(cuongdo): we don't support for persistence of arrays or vectors yet
+	case ColumnType_ARRAY:
+		// TODO(justin)
+		return parser.DNull
+	case ColumnType_INT2VECTOR:
 		return parser.DNull
 	default:
 		panic(fmt.Sprintf("invalid type %s", typ.String()))
@@ -165,13 +167,30 @@ func RandCollationLocale(rng *rand.Rand) *string {
 	return &collationLocales[rng.Intn(len(collationLocales))]
 }
 
-// RandColumnType returns a random ColumnType_SemanticType value.
+// RandColumnType returns a random ColumnType value.
 func RandColumnType(rng *rand.Rand) ColumnType {
 	typ := ColumnType{SemanticType: columnSemanticTypes[rng.Intn(len(columnSemanticTypes))]}
 	if typ.SemanticType == ColumnType_COLLATEDSTRING {
 		typ.Locale = RandCollationLocale(rng)
 	}
+	if typ.SemanticType == ColumnType_ARRAY {
+		typ.ArrayContents = &columnSemanticTypes[rng.Intn(len(columnSemanticTypes))]
+		if *typ.ArrayContents == ColumnType_COLLATEDSTRING {
+			// TODO(justin): change this when collated arrays are supported.
+			s := ColumnType_STRING
+			typ.ArrayContents = &s
+		}
+	}
 	return typ
+}
+
+// RandColumnTypes returns a slice of numCols random ColumnType value.
+func RandColumnTypes(rng *rand.Rand, numCols int) []ColumnType {
+	types := make([]ColumnType, numCols)
+	for i := range types {
+		types[i] = RandColumnType(rng)
+	}
+	return types
 }
 
 // RandDatumEncoding returns a random DatumEncoding value.
@@ -180,29 +199,57 @@ func RandDatumEncoding(rng *rand.Rand) DatumEncoding {
 }
 
 // RandEncDatum generates a random EncDatum (of a random type).
-func RandEncDatum(rng *rand.Rand) EncDatum {
+func RandEncDatum(rng *rand.Rand) (EncDatum, ColumnType) {
 	typ := RandColumnType(rng)
-	datum := RandDatum(rng, typ, true)
-	return DatumToEncDatum(typ, datum)
+	datum := RandDatum(rng, typ, true /* nullOk */)
+	return DatumToEncDatum(typ, datum), typ
 }
 
 // RandEncDatumSlice generates a slice of random EncDatum values of the same random
 // type.
-func RandEncDatumSlice(rng *rand.Rand, numVals int) []EncDatum {
+func RandEncDatumSlice(rng *rand.Rand, numVals int) ([]EncDatum, ColumnType) {
 	typ := RandColumnType(rng)
 	vals := make([]EncDatum, numVals)
 	for i := range vals {
 		vals[i] = DatumToEncDatum(typ, RandDatum(rng, typ, true))
 	}
-	return vals
+	return vals, typ
 }
 
 // RandEncDatumSlices generates EncDatum slices, each slice with values of the same
 // random type.
-func RandEncDatumSlices(rng *rand.Rand, numSets, numValsPerSet int) [][]EncDatum {
+func RandEncDatumSlices(rng *rand.Rand, numSets, numValsPerSet int) ([][]EncDatum, []ColumnType) {
 	vals := make([][]EncDatum, numSets)
+	types := make([]ColumnType, numSets)
 	for i := range vals {
-		vals[i] = RandEncDatumSlice(rng, numValsPerSet)
+		vals[i], types[i] = RandEncDatumSlice(rng, numValsPerSet)
+	}
+	return vals, types
+}
+
+// RandEncDatumRowOfTypes generates a slice of random EncDatum values for the
+// corresponding type in types.
+func RandEncDatumRowOfTypes(rng *rand.Rand, types []ColumnType) EncDatumRow {
+	vals := make([]EncDatum, len(types))
+	for i, typ := range types {
+		vals[i] = DatumToEncDatum(typ, RandDatum(rng, typ, true))
+	}
+	return vals
+}
+
+// RandEncDatumRows generates EncDatumRows where all rows follow the same random
+// []ColumnType structure.
+func RandEncDatumRows(rng *rand.Rand, numRows, numCols int) (EncDatumRows, []ColumnType) {
+	types := RandColumnTypes(rng, numCols)
+	return RandEncDatumRowsOfTypes(rng, numRows, types), types
+}
+
+// RandEncDatumRowsOfTypes generates EncDatumRows, each row with values of the
+// corresponding type in types.
+func RandEncDatumRowsOfTypes(rng *rand.Rand, numRows int, types []ColumnType) EncDatumRows {
+	vals := make(EncDatumRows, numRows)
+	for i := range vals {
+		vals[i] = RandEncDatumRowOfTypes(rng, types)
 	}
 	return vals
 }

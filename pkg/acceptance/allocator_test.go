@@ -14,56 +14,14 @@
 
 package acceptance
 
-// All tests in this file are remote tests that use Terrafarm to manage
-// and run tests against dedicated test clusters.
-//
-// Required setup:
-// 1. Have an Azure account.
-// 2. Passphrase-less SSH key in ~/.ssh/{azure,azure.pub}.
-// 3. Set the ARM_SUBSCRIPTION_ID, ARM_CLIENT_ID, ARM_CLIENT_SECRET, and
-//    ARM_TENANT_ID variables as documented here:
-//    https://www.terraform.io/docs/providers/azurerm/#argument-reference
-//
-// Example use:
-//
-// make test \
-//	 TESTTIMEOUT=48h \
-//	 PKG=./pkg/acceptance \
-//	 TESTS='^TestRebalance_3To5Small$$' \
-//	 TESTFLAGS='-v -remote -key-name azure -cwd terraform/azure -tf.keep-cluster=failed'
-//
-// Things to note:
-// - You must use an SSH key without a passphrase. This is a Terraform
-//   requirement.
-// - If you want to manually fiddle with a test cluster, start the test with
-//   `-tf.keep-cluster=failed". After the cluster has been created, press
-//   Control-C and the cluster will remain up.
-// - These tests rely on a specific Terraform config that's specified using the
-//   -cwd test flag.
-// - You *must* set the TESTTIMEOUT high enough for any of these tests to
-//   finish. To be really safe, specify a timeout of at least 24 hours.
-// - There are various flags that start with `tf.` that control the
-//   of Terrafarm and allocator tests, respectively. For example, you can add
-//   "-tf.cockroach-binary" to TESTFLAGS to specify a custom Linux CockroachDB
-//   binary. If omitted, your test will use the latest CircleCI Linux build.
-//   Note that the location has to be specified relative to the terraform
-//   working directory, so typically `-tf.cockroach-binary=../../cockroach`.
-//   This must be a linux binary; on a mac you must build with
-//   `build/builder.sh make build`.
-//
-// Troubleshooting:
-// - The minimum recommended version of Terraform is 0.7.2. If you see strange
-//   Terraform errors, upgrade your install of Terraform. Terraform 0.8.x or
-//   later might not work because of breaking changes to Terraform.
-// - Adding `-tf.keep-cluster=always` to your TESTFLAGS allows the cluster to
-//   stay around after the test completes.
+// Running these tests is best done using build/teamcity-nightly-
+// acceptance.sh. See instructions therein.
 
 import (
 	gosql "database/sql"
 	"fmt"
 	"math"
 	"net/http"
-	"strconv"
 	"testing"
 	"time"
 
@@ -85,16 +43,17 @@ import (
 )
 
 const (
-	archivedStoreURL = "gs://cockroach-test/allocatortest"
-	StableInterval   = 3 * time.Minute
-	adminPort        = base.DefaultHTTPPort
+	StableInterval = 3 * time.Minute
+	adminPort      = base.DefaultHTTPPort
 )
 
+// Paths to cloud storage blobs that contain stores with pre-generated data.
+// Please keep /docs/cloud-resources.md up-to-date if you change these.
 const (
-	urlStore1s = archivedStoreURL + "/1node-10g-262ranges"
-	urlStore1m = archivedStoreURL + "/1node-2065replicas-108G"
-	urlStore3s = archivedStoreURL + "/3nodes-10g-262ranges"
-	urlStore6m = archivedStoreURL + "/6nodes-1038replicas-56G"
+	fixtureStore1s = "store-dumps/1node-17gb-841ranges"
+	fixtureStore1m = "store-dumps/1node-113gb-9595ranges"
+	fixtureStore3s = "store-dumps/3nodes-17gb-841ranges"
+	fixtureStore6m = "store-dumps/6nodes-67gb-9588ranges"
 )
 
 type allocatorTest struct {
@@ -102,19 +61,18 @@ type allocatorTest struct {
 	StartNodes int
 	// EndNodes is the final number of nodes this cluster will have.
 	EndNodes int
-	// StoreURL is the Google Cloud Storage URL from which the test will download
-	// stores.
-	StoreURL string
+	// StoreFixture is the prefix of the store dump blobs that the test will
+	// download from cloud storage. For example, "store-dumps/foo" indicates that
+	// stores are available at "store-dumps/foo/storeN.tgz".
+	StoreFixture string
 	// Prefix is the prefix that will be prepended to all resources created by
 	// Terraform.
 	Prefix string
-	// CockroachDiskSizeGB is the size, in gigabytes, of the disks allocated
-	// for CockroachDB nodes. Leaving this as 0 accepts the default in the
-	// Terraform configs. This must be in GB, because Terraform only accepts
-	// disk size for GCE in GB.
-	CockroachDiskSizeGB int
 	// Run some schema changes during the rebalancing.
 	RunSchemaChanges bool
+
+	// start load time.
+	startLoad time.Time
 
 	f *terrafarm.Farmer
 }
@@ -131,21 +89,22 @@ func (at *allocatorTest) Cleanup(t *testing.T) {
 func (at *allocatorTest) Run(ctx context.Context, t *testing.T) {
 	at.f = MakeFarmer(t, at.Prefix, stopper)
 
-	if at.CockroachDiskSizeGB != 0 {
-		at.f.AddVars["cockroach_disk_size"] = strconv.Itoa(at.CockroachDiskSizeGB)
-	}
-
 	log.Infof(ctx, "creating cluster with %d node(s)", at.StartNodes)
 	if err := at.f.Resize(at.StartNodes); err != nil {
 		t.Fatal(err)
 	}
-	CheckGossip(ctx, t, at.f, longWaitTime, HasPeers(at.StartNodes))
+	if err := CheckGossip(ctx, at.f, waitTime, HasPeers(at.StartNodes)); err != nil {
+		t.Fatal(err)
+	}
 	at.f.Assert(ctx, t)
 	log.Info(ctx, "initial cluster is up")
 
-	// We must stop the cluster because a) `nodectl` pokes at the data directory
-	// and, more importantly, b) we don't want the cluster above and the cluster
-	// below to ever talk to each other (see #7224).
+	// We must stop the cluster because:
+	//
+	// We're about to overwrite data directories.
+	//
+	// We don't want the cluster above and the cluster below to ever talk to
+	// each other (see #7224).
 	log.Info(ctx, "stopping cluster")
 	for i := 0; i < at.f.NumNodes(); i++ {
 		if err := at.f.Kill(ctx, i); err != nil {
@@ -153,11 +112,16 @@ func (at *allocatorTest) Run(ctx context.Context, t *testing.T) {
 		}
 	}
 
-	log.Info(ctx, "downloading archived stores from Google Cloud Storage in parallel")
+	storeURL := FixtureURL(at.StoreFixture)
+	log.Infof(ctx, "downloading archived stores from %s in parallel", storeURL)
 	errors := make(chan error, at.f.NumNodes())
 	for i := 0; i < at.f.NumNodes(); i++ {
 		go func(nodeNum int) {
-			errors <- at.f.Exec(nodeNum, "./nodectl download "+at.StoreURL)
+			errors <- at.f.Exec(nodeNum,
+				fmt.Sprintf("find %[1]s -type f -delete && curl -sfSL %s/store%d.tgz | tar -C %[1]s -zx",
+					"/mnt/data0", storeURL, nodeNum+1,
+				),
+			)
 		}(i)
 	}
 	for i := 0; i < at.f.NumNodes(); i++ {
@@ -167,10 +131,19 @@ func (at *allocatorTest) Run(ctx context.Context, t *testing.T) {
 	}
 
 	log.Info(ctx, "restarting cluster with archived store(s)")
+	// Ensure all nodes get --join flags on restart.
+	at.f.SkipClusterInit = true
+	ch := make(chan error)
 	for i := 0; i < at.f.NumNodes(); i++ {
-		if err := at.f.Restart(ctx, i); err != nil {
-			t.Fatalf("error restarting node %d: %s", i, err)
+		go func(i int) { ch <- at.f.Restart(ctx, i) }(i)
+	}
+	for i := 0; i < at.f.NumNodes(); i++ {
+		if err := <-ch; err != nil {
+			t.Errorf("error restarting node %d: %s", i, err)
 		}
+	}
+	if t.Failed() {
+		t.FailNow()
 	}
 	at.f.Assert(ctx, t)
 
@@ -179,27 +152,84 @@ func (at *allocatorTest) Run(ctx context.Context, t *testing.T) {
 		t.Fatal(err)
 	}
 
-	CheckGossip(ctx, t, at.f, longWaitTime, HasPeers(at.EndNodes))
+	if err := CheckGossip(ctx, at.f, waitTime, HasPeers(at.EndNodes)); err != nil {
+		t.Fatal(err)
+	}
 	at.f.Assert(ctx, t)
 
 	log.Infof(ctx, "starting load on cluster")
-	if err := at.f.StartLoad(ctx, "block_writer", *flagCLTWriters); err != nil {
+	at.startLoad = timeutil.Now()
+	if err := at.f.StartLoad(ctx, "block_writer"); err != nil {
 		t.Fatal(err)
 	}
-	if err := at.f.StartLoad(ctx, "photos", *flagCLTWriters); err != nil {
+	if err := at.f.StartLoad(ctx, "photos"); err != nil {
 		t.Fatal(err)
 	}
 
-	if at.RunSchemaChanges {
-		log.Info(ctx, "running schema changes while cluster is rebalancing")
-		if err := at.runSchemaChanges(ctx, t); err != nil {
+	// Rebalancing is tested in all the rebalancing tests. Speed up the
+	// execution of the schema change test by not waiting for rebalancing.
+	if !at.RunSchemaChanges {
+		log.Info(ctx, "waiting for rebalance to finish")
+		if err := at.WaitForRebalance(ctx, t); err != nil {
 			t.Fatal(err)
 		}
-	}
+	} else {
+		log.Info(ctx, "running schema changes while cluster is rebalancing")
+		{
+			// These schema changes are over a table that is not actively
+			// being updated.
+			log.Info(ctx, "running schema changes over tpch.customer")
+			schemaChanges := []string{
+				"ALTER TABLE tpch.customer ADD COLUMN newcol INT DEFAULT 23456",
+				"CREATE INDEX foo ON tpch.customer (c_name)",
+			}
+			if err := at.runSchemaChanges(ctx, t, schemaChanges); err != nil {
+				t.Fatal(err)
+			}
 
-	log.Info(ctx, "waiting for rebalance to finish")
-	if err := at.WaitForRebalance(ctx, t); err != nil {
-		t.Fatal(err)
+			// All these return the same result.
+			validationQueries := []string{
+				"SELECT COUNT(*) FROM tpch.customer AS OF SYSTEM TIME %s",
+				"SELECT COUNT(newcol) FROM tpch.customer AS OF SYSTEM TIME %s",
+				"SELECT COUNT(c_name) FROM tpch.customer@foo AS OF SYSTEM TIME %s",
+			}
+			if err := at.runValidationQueries(ctx, t, validationQueries, nil); err != nil {
+				t.Error(err)
+			}
+		}
+
+		{
+			// These schema changes are run later because the above schema
+			// changes run for a decent amount of time giving datablocks.blocks
+			// an opportunity to get populate through the load generator. These
+			// schema changes are acting upon a decent sized table that is also
+			// being updated.
+			log.Info(ctx, "running schema changes over datablocks.blocks")
+			schemaChanges := []string{
+				"ALTER TABLE datablocks.blocks ADD COLUMN created_at TIMESTAMP DEFAULT now()",
+				"CREATE INDEX foo ON datablocks.blocks (block_id, created_at)",
+			}
+			if err := at.runSchemaChanges(ctx, t, schemaChanges); err != nil {
+				t.Fatal(err)
+			}
+
+			// All these return the same result.
+			validationQueries := []string{
+				"SELECT COUNT(*) FROM datablocks.blocks AS OF SYSTEM TIME %s",
+				"SELECT COUNT(created_at) FROM datablocks.blocks AS OF SYSTEM TIME %s",
+				"SELECT COUNT(block_id) FROM datablocks.blocks@foo AS OF SYSTEM TIME %s",
+			}
+			// Queries to hone in on index validation problems.
+			indexValidationQueries := []string{
+				"SELECT COUNT(created_at) FROM datablocks.blocks@primary AS OF SYSTEM TIME %s WHERE created_at > $1 AND created_at <= $2",
+				"SELECT COUNT(block_id) FROM datablocks.blocks@foo AS OF SYSTEM TIME %s WHERE created_at > $1 AND created_at <= $2",
+			}
+			if err := at.runValidationQueries(
+				ctx, t, validationQueries, indexValidationQueries,
+			); err != nil {
+				t.Error(err)
+			}
+		}
 	}
 
 	at.f.Assert(ctx, t)
@@ -213,7 +243,9 @@ func (at *allocatorTest) RunAndCleanup(ctx context.Context, t *testing.T) {
 	at.Run(ctx, t)
 }
 
-func (at *allocatorTest) runSchemaChanges(ctx context.Context, t *testing.T) error {
+func (at *allocatorTest) runSchemaChanges(
+	ctx context.Context, t *testing.T, schemaChanges []string,
+) error {
 	db, err := gosql.Open("postgres", at.f.PGUrl(ctx, 0))
 	if err != nil {
 		return err
@@ -222,42 +254,33 @@ func (at *allocatorTest) runSchemaChanges(ctx context.Context, t *testing.T) err
 		_ = db.Close()
 	}()
 
-	const tableName = "datablocks.blocks"
-	schemaChanges := []string{
-		"ALTER TABLE %s ADD COLUMN newcol DECIMAL DEFAULT (DECIMAL '1.4')",
-		"CREATE INDEX foo ON %s (block_id)",
-	}
-
-	errChan := make(chan error)
-	for i := range schemaChanges {
-		go func(i int) {
-			start := timeutil.Now()
-			cmd := fmt.Sprintf(schemaChanges[i], tableName)
-			log.Infof(ctx, "starting schema change: %s", cmd)
-			if _, err := db.Exec(cmd); err != nil {
-				errChan <- errors.Errorf("hit schema change error: %s, for %s, in %s", err, cmd, timeutil.Since(start))
-				return
-			}
-			log.Infof(ctx, "completed schema change: %s, in %s", cmd, timeutil.Since(start))
-			errChan <- nil
-			// TODO(vivek): Monitor progress of schema changes and log progress.
-		}(i)
-	}
-
-	for range schemaChanges {
-		if err := <-errChan; err != nil {
-			t.Fatal(err)
+	for _, cmd := range schemaChanges {
+		start := timeutil.Now()
+		log.Infof(ctx, "starting schema change: %s", cmd)
+		if _, err := db.Exec(cmd); err != nil {
+			t.Fatalf("hit schema change error: %s, for %s, in %s", err, cmd, timeutil.Since(start))
 		}
+		log.Infof(ctx, "completed schema change: %s, in %s", cmd, timeutil.Since(start))
+		// TODO(vivek): Monitor progress of schema changes and log progress.
 	}
 
-	log.Info(ctx, "validate applied schema changes")
-	if err := at.ValidateSchemaChanges(ctx, t); err != nil {
-		t.Fatal(err)
-	}
 	return nil
 }
 
-func (at *allocatorTest) ValidateSchemaChanges(ctx context.Context, t *testing.T) error {
+// The validationQueries all return the same result.
+func (at *allocatorTest) runValidationQueries(
+	ctx context.Context, t *testing.T, validationQueries []string, indexValidationQueries []string,
+) error {
+	// Sleep for a bit before validating the schema changes to
+	// accommodate for time differences between nodes. Some of the
+	// schema change backfill transactions might use a timestamp a bit
+	// into the future. This is not a problem normally because a read
+	// of schema data written into the impending future gets pushed,
+	// but the reads being done here are at a specific timestamp through
+	// AS OF SYSTEM TIME.
+	time.Sleep(5 * time.Second)
+	log.Info(ctx, "run validation queries")
+
 	db, err := gosql.Open("postgres", at.f.PGUrl(ctx, 0))
 	if err != nil {
 		return err
@@ -266,32 +289,107 @@ func (at *allocatorTest) ValidateSchemaChanges(ctx context.Context, t *testing.T
 		_ = db.Close()
 	}()
 
-	const tableName = "datablocks.blocks"
-	var now string
-	if err := db.QueryRow("SELECT cluster_logical_timestamp()").Scan(&now); err != nil {
+	var nowString string
+	if err := db.QueryRow("SELECT cluster_logical_timestamp()").Scan(&nowString); err != nil {
 		t.Fatal(err)
 	}
-	var eCount int64
-	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s AS OF SYSTEM TIME %s`, tableName, now)
-	if err := db.QueryRow(q).Scan(&eCount); err != nil {
-		return err
+	var nowInNanos int64
+	if _, err := fmt.Sscanf(nowString, "%d", &nowInNanos); err != nil {
+		t.Fatal(err)
 	}
-	log.Infof(ctx, "%s: %d rows", q, eCount)
+	now := timeutil.Unix(0, nowInNanos)
 
 	// Validate the different schema changes
-	validationQueries := []string{
-		"SELECT COUNT(newcol) FROM %s AS OF SYSTEM TIME %s",
-		"SELECT COUNT(block_id) FROM %s@foo AS OF SYSTEM TIME %s",
-	}
+	var eCount int64
 	for i := range validationQueries {
 		var count int64
-		q := fmt.Sprintf(validationQueries[i], tableName, now)
+		q := fmt.Sprintf(validationQueries[i], nowString)
 		if err := db.QueryRow(q).Scan(&count); err != nil {
 			return err
 		}
 		log.Infof(ctx, "query: %s, found %d rows", q, count)
-		if count != eCount {
-			t.Fatalf("%s: %d rows found, expected %d rows", q, count, eCount)
+		if count == 0 {
+			t.Fatalf("%s: %d rows found", q, count)
+		}
+		if eCount == 0 {
+			eCount = count
+			// Investigate index creation problems. Always run this so we know
+			// it works.
+			if indexValidationQueries != nil {
+				sp := timeSpan{start: at.startLoad, end: now}
+				if err := at.findIndexProblem(ctx, db, sp, nowString, indexValidationQueries); err != nil {
+					t.Error(err)
+				}
+			}
+		} else if count != eCount {
+			t.Errorf("%s: %d rows found, expected %d rows", q, count, eCount)
+		}
+	}
+	return nil
+}
+
+type timeSpan struct {
+	start, end time.Time
+}
+
+// Check index inconsistencies over the timeSpan and return true when
+// problems are seen.
+func (at *allocatorTest) checkIndexOverTimeSpan(
+	ctx context.Context, db *gosql.DB, s timeSpan, nowString string, indexValidationQueries []string,
+) (bool, error) {
+	var eCount int64
+	q := fmt.Sprintf(indexValidationQueries[0], nowString)
+	if err := db.QueryRow(q, s.start, s.end).Scan(&eCount); err != nil {
+		return false, err
+	}
+	var count int64
+	q = fmt.Sprintf(indexValidationQueries[1], nowString)
+	if err := db.QueryRow(q, s.start, s.end).Scan(&count); err != nil {
+		return false, err
+	}
+	log.Infof(ctx, "counts seen %d, %d, over [%s, %s]", count, eCount, s.start, s.end)
+	return count != eCount, nil
+}
+
+// Keep splitting the span of time passed and log where index
+// inconsistencies are seen.
+func (at *allocatorTest) findIndexProblem(
+	ctx context.Context, db *gosql.DB, s timeSpan, nowString string, indexValidationQueries []string,
+) error {
+	spans := []timeSpan{s}
+	// process all the outstanding time spans.
+	for len(spans) > 0 {
+		s := spans[0]
+		spans = spans[1:]
+		// split span into two time ranges.
+		leftSpan, rightSpan := s, s
+		d := s.end.Sub(s.start) / 2
+		if d < 50*time.Millisecond {
+			log.Infof(ctx, "problem seen over [%s, %s]", s.start, s.end)
+			continue
+		}
+		m := s.start.Add(d)
+		leftSpan.end = m
+		rightSpan.start = m
+
+		leftState, err := at.checkIndexOverTimeSpan(
+			ctx, db, leftSpan, nowString, indexValidationQueries)
+		if err != nil {
+			return err
+		}
+		rightState, err := at.checkIndexOverTimeSpan(
+			ctx, db, rightSpan, nowString, indexValidationQueries)
+		if err != nil {
+			return err
+		}
+		if leftState {
+			spans = append(spans, leftSpan)
+		}
+		if rightState {
+			spans = append(spans, rightSpan)
+		}
+		if !(leftState || rightState) {
+			log.Infof(ctx, "no problem seen over [%s, %s]", s.start, s.end)
 		}
 	}
 	return nil
@@ -308,7 +406,7 @@ func (at *allocatorTest) stdDev() (float64, error) {
 	var replicaCounts stats.Float64Data
 	for _, node := range nodesResp.Nodes {
 		for _, ss := range node.StoreStatuses {
-			replicaCounts = append(replicaCounts, float64(ss.Metrics["replicas"]))
+			replicaCounts = append(replicaCounts, ss.Metrics["replicas"])
 		}
 	}
 	stdDev, err := stats.StdDevP(replicaCounts)
@@ -327,7 +425,7 @@ func (at *allocatorTest) printRebalanceStats(db *gosql.DB, host string) error {
 	{
 		var rebalanceIntervalStr string
 		if err := db.QueryRow(
-			`SELECT (SELECT MAX(timestamp) FROM rangelog) - (SELECT MAX(timestamp) FROM eventlog WHERE eventType=$1)`,
+			`SELECT (SELECT MAX(timestamp) FROM rangelog) - (SELECT MAX(timestamp) FROM eventlog WHERE "eventType"=$1)`,
 			sql.EventLogNodeJoin,
 		).Scan(&rebalanceIntervalStr); err != nil {
 			return err
@@ -377,7 +475,7 @@ func (s replicationStats) String() string {
 		s.EventType, s.RangeID, s.StoreID, s.ElapsedSinceLastEvent)
 }
 
-// checkAllocatorStable returns the duration of stability (i.e. no replication
+// allocatorStats returns the duration of stability (i.e. no replication
 // changes) and the standard deviation in replica counts. Only unrecoverable
 // errors are returned.
 func (at *allocatorTest) allocatorStats(db *gosql.DB) (s replicationStats, err error) {
@@ -393,8 +491,8 @@ func (at *allocatorTest) allocatorStats(db *gosql.DB) (s replicationStats, err e
 		storage.RangeLogEventType_remove.String(),
 	}
 
-	q := `SELECT NOW()-timestamp, rangeID, storeID, eventType FROM rangelog WHERE ` +
-		`timestamp=(SELECT MAX(timestamp) FROM rangelog WHERE eventType IN ($1, $2, $3))`
+	q := `SELECT NOW()-timestamp, "rangeID", "storeID", "eventType" FROM rangelog WHERE ` +
+		`timestamp=(SELECT MAX(timestamp) FROM rangelog WHERE "eventType" IN ($1, $2, $3))`
 
 	var elapsedStr string
 
@@ -484,10 +582,10 @@ func (at *allocatorTest) WaitForRebalance(ctx context.Context, t *testing.T) err
 func TestUpreplicate_1To3Small(t *testing.T) {
 	ctx := context.Background()
 	at := allocatorTest{
-		StartNodes: 1,
-		EndNodes:   3,
-		StoreURL:   urlStore1s,
-		Prefix:     "uprep-1to3s",
+		StartNodes:   1,
+		EndNodes:     3,
+		StoreFixture: fixtureStore1s,
+		Prefix:       "uprep-1to3s",
 	}
 	at.RunAndCleanup(ctx, t)
 }
@@ -500,7 +598,7 @@ func TestRebalance_3To5Small_WithSchemaChanges(t *testing.T) {
 	at := allocatorTest{
 		StartNodes:       3,
 		EndNodes:         5,
-		StoreURL:         urlStore3s,
+		StoreFixture:     fixtureStore3s,
 		Prefix:           "rebal-3to5s",
 		RunSchemaChanges: true,
 	}
@@ -512,10 +610,10 @@ func TestRebalance_3To5Small_WithSchemaChanges(t *testing.T) {
 func TestRebalance_3To5Small(t *testing.T) {
 	ctx := context.Background()
 	at := allocatorTest{
-		StartNodes: 3,
-		EndNodes:   5,
-		StoreURL:   urlStore3s,
-		Prefix:     "rebal-3to5s",
+		StartNodes:   3,
+		EndNodes:     5,
+		StoreFixture: fixtureStore3s,
+		Prefix:       "rebal-3to5s",
 	}
 	at.RunAndCleanup(ctx, t)
 }
@@ -525,11 +623,10 @@ func TestRebalance_3To5Small(t *testing.T) {
 func TestUpreplicate_1To3Medium(t *testing.T) {
 	ctx := context.Background()
 	at := allocatorTest{
-		StartNodes:          1,
-		EndNodes:            3,
-		StoreURL:            urlStore1m,
-		Prefix:              "uprep-1to3m",
-		CockroachDiskSizeGB: 250, // GB
+		StartNodes:   1,
+		EndNodes:     3,
+		StoreFixture: fixtureStore1m,
+		Prefix:       "uprep-1to3m",
 	}
 	at.RunAndCleanup(ctx, t)
 }
@@ -540,11 +637,10 @@ func TestUpreplicate_1To3Medium(t *testing.T) {
 func TestUpreplicate_1To6Medium(t *testing.T) {
 	ctx := context.Background()
 	at := allocatorTest{
-		StartNodes:          1,
-		EndNodes:            6,
-		StoreURL:            urlStore1m,
-		Prefix:              "uprep-1to6m",
-		CockroachDiskSizeGB: 250, // GB
+		StartNodes:   1,
+		EndNodes:     6,
+		StoreFixture: fixtureStore1m,
+		Prefix:       "uprep-1to6m",
 	}
 	at.RunAndCleanup(ctx, t)
 }
@@ -555,12 +651,24 @@ func TestUpreplicate_1To6Medium(t *testing.T) {
 func TestSteady_6Medium(t *testing.T) {
 	ctx := context.Background()
 	at := allocatorTest{
-		StartNodes:          6,
-		EndNodes:            6,
-		StoreURL:            urlStore6m,
-		Prefix:              "steady-6m",
-		CockroachDiskSizeGB: 250, // GB
-		RunSchemaChanges:    true,
+		StartNodes:       6,
+		EndNodes:         6,
+		StoreFixture:     fixtureStore6m,
+		Prefix:           "steady-6m",
+		RunSchemaChanges: true,
+	}
+	at.RunAndCleanup(ctx, t)
+}
+
+// TestSteady_3Small tests schema changes against a 3-node cluster.
+func TestSteady_3Small(t *testing.T) {
+	ctx := context.Background()
+	at := allocatorTest{
+		StartNodes:       3,
+		EndNodes:         3,
+		StoreFixture:     fixtureStore3s,
+		Prefix:           "steady-3s",
+		RunSchemaChanges: true,
 	}
 	at.RunAndCleanup(ctx, t)
 }

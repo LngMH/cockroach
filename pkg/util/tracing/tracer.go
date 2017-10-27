@@ -11,10 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package tracing
 
@@ -34,7 +30,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
@@ -63,7 +59,23 @@ const (
 var enableNetTrace = settings.RegisterBoolSetting(
 	"trace.debug.enable",
 	"if set, traces for recent requests can be seen in the /debug page",
-	false,
+	// This setting defaults to true, but there is a sql migration that sets it
+	// to false. The effect is that we have tracing when the server starts and
+	// gets stuck there, without paying the overhead of having it on all the
+	// time (unless that's how the operator explicitly configures the cluster).
+	true,
+)
+
+var lightstepToken = settings.RegisterStringSetting(
+	"trace.lightstep.token",
+	"if set, traces go to Lightstep using this token",
+	envutil.EnvOrDefaultString("COCKROACH_TEST_LIGHTSTEP_TOKEN", ""),
+)
+
+var zipkinCollector = settings.RegisterStringSetting(
+	"trace.zipkin.collector",
+	"if set, traces go to the given Zipkin instance (example: '127.0.0.1:9411'); ignored if trace.lightstep.token is set.",
+	envutil.EnvOrDefaultString("COCKROACH_TEST_ZIPKIN_COLLECTOR", ""),
 )
 
 // Tracer is our own custom implementation of opentracing.Tracer. It supports:
@@ -95,25 +107,55 @@ type Tracer struct {
 	// have the option of passing the Recordable option to their constructor.
 	forceRealSpans bool
 
+	// True if tracing to the debug/requests endpoint. Accessed via t.useNetTrace().
+	_useNetTrace int32 // updated atomically
+
 	// Pointer to shadowTracer, if using one.
 	shadowTracer unsafe.Pointer
 }
 
 var _ opentracing.Tracer = &Tracer{}
 
-// NewTracer creates a Tracer. The cluster settings control whether
-// we trace to net/trace and/or lightstep.
+// NewTracer creates a Tracer. It initially tries to run with minimal overhead
+// and collects essentially nothing; use Configure() to enable various tracing
+// backends.
 func NewTracer() *Tracer {
 	t := &Tracer{}
 	t.noopSpan.tracer = t
-	updateShadowTracer(t)
-	tracerRegistry.Add(t)
 	return t
+}
+
+// Configure sets up the Tracer according to the cluster settings (and keeps
+// it updated if they change).
+func (t *Tracer) Configure(sv *settings.Values) {
+	reconfigure := func() {
+		if lsToken := lightstepToken.Get(sv); lsToken != "" {
+			t.setShadowTracer(createLightStepTracer(lsToken))
+		} else if zipkinAddr := zipkinCollector.Get(sv); zipkinAddr != "" {
+			t.setShadowTracer(createZipkinTracer(zipkinAddr))
+		} else {
+			t.setShadowTracer(nil, nil)
+		}
+		var nt int32
+		if enableNetTrace.Get(sv) {
+			nt = 1
+		}
+		atomic.StoreInt32(&t._useNetTrace, nt)
+	}
+
+	reconfigure()
+
+	enableNetTrace.SetOnChange(sv, reconfigure)
+	lightstepToken.SetOnChange(sv, reconfigure)
+	zipkinCollector.SetOnChange(sv, reconfigure)
+}
+
+func (t *Tracer) useNetTrace() bool {
+	return atomic.LoadInt32(&t._useNetTrace) != 0
 }
 
 // Close cleans up any resources associated with a Tracer.
 func (t *Tracer) Close() {
-	tracerRegistry.Remove(t)
 	// Clean up any shadow tracer.
 	t.setShadowTracer(nil, nil)
 }
@@ -163,16 +205,15 @@ func (t *Tracer) StartSpan(
 	// case) with a noop context, return a noop span now.
 	if len(opts) == 1 {
 		if o, ok := opts[0].(opentracing.SpanReference); ok {
-			if _, noopCtx := o.ReferencedContext.(noopSpanContext); noopCtx {
+			if IsNoopContext(o.ReferencedContext) {
 				return &t.noopSpan
 			}
 		}
 	}
 
-	netTrace := enableNetTrace.Get()
 	shadowTr := t.getShadowTracer()
 
-	if len(opts) == 0 && !netTrace && shadowTr == nil && !t.forceRealSpans {
+	if len(opts) == 0 && !t.useNetTrace() && shadowTr == nil && !t.forceRealSpans {
 		return &t.noopSpan
 	}
 
@@ -198,7 +239,7 @@ func (t *Tracer) StartSpan(
 		if r.ReferencedContext == nil {
 			continue
 		}
-		if _, noopCtx := r.ReferencedContext.(noopSpanContext); noopCtx {
+		if IsNoopContext(r.ReferencedContext) {
 			continue
 		}
 		hasParent = true
@@ -224,7 +265,7 @@ func (t *Tracer) StartSpan(
 	// If tracing is disabled, the Recordable option wasn't passed, and we're not
 	// part of a recording or snowball trace, avoid overhead and return a noop
 	// span.
-	if !recordable && recordingGroup == nil && shadowTr == nil && !netTrace && !t.forceRealSpans {
+	if !recordable && recordingGroup == nil && shadowTr == nil && !t.useNetTrace() && !t.forceRealSpans {
 		return &t.noopSpan
 	}
 
@@ -237,10 +278,6 @@ func (t *Tracer) StartSpan(
 		s.startTime = time.Now()
 	}
 	s.mu.duration = -1
-
-	for k, v := range sso.Tags {
-		s.SetTag(k, v)
-	}
 
 	if !hasParent {
 		// No parent Span; allocate new trace id.
@@ -263,7 +300,7 @@ func (t *Tracer) StartSpan(
 		s.enableRecording(recordingGroup, recordingType)
 	}
 
-	if netTrace {
+	if t.useNetTrace() {
 		s.netTr = trace.New("tracing", operationName)
 		s.netTr.SetMaxEvents(maxLogsPerSpan)
 	}
@@ -279,11 +316,14 @@ func (t *Tracer) StartSpan(
 		}
 	}
 
-	if netTrace || shadowTr != nil {
-		// Copy baggage items to tags so they show up in the shadow tracer UI or x/net/trace.
-		for k, v := range s.mu.Baggage {
-			s.SetTag(k, v)
-		}
+	for k, v := range sso.Tags {
+		s.SetTag(k, v)
+	}
+
+	// Copy baggage items to tags so they show up in the shadow tracer UI,
+	// x/net/trace, or recordings.
+	for k, v := range s.mu.Baggage {
+		s.SetTag(k, v)
 	}
 
 	return s
@@ -373,7 +413,7 @@ func (fn textMapWriterFn) Set(key, val string) {
 func (t *Tracer) Inject(
 	osc opentracing.SpanContext, format interface{}, carrier interface{},
 ) error {
-	if _, noopCtx := osc.(noopSpanContext); noopCtx {
+	if IsNoopContext(osc) {
 		// Fast path when tracing is disabled. Extract will accept an empty map as a
 		// noop context.
 		return nil
@@ -549,7 +589,7 @@ func ChildSpan(ctx context.Context, opName string) (context.Context, opentracing
 		ns := &tr.(*Tracer).noopSpan
 		return opentracing.ContextWithSpan(ctx, ns), ns
 	}
-	newSpan := StartChildSpan(opName, span, false /* !separateRecording */)
+	newSpan := StartChildSpan(opName, span, false /* separateRecording */)
 	return opentracing.ContextWithSpan(ctx, newSpan), newSpan
 }
 
@@ -669,39 +709,27 @@ func matchesWithoutFileLine(msg string, expected string) bool {
 	return len(groups) == 3 && fmt.Sprintf("event: %s", groups[2]) == expected
 }
 
-// The tracer registry keeps track of active Tracer instances; it is used to
-// update the shadow tracer in those instances when the relevant settings
-// change. It is needed because the cluster settings are singleton globals.
-type tracerRegistryImpl struct {
-	syncutil.Mutex
-	tracers []*Tracer
-}
+// ContextWithRecordingSpan returns a context with an embedded trace span which
+// returns its contents when getRecording is called and must be stopped by
+// calling the cancel method when done with the context. Note that to convert
+// the recorded spans into text, you can use FormatRecordedSpans.
+func ContextWithRecordingSpan(
+	ctx context.Context, opName string,
+) (retCtx context.Context, getRecording func() []RecordedSpan, cancel func()) {
+	tr := NewTracer()
+	sp := tr.StartSpan(opName, Recordable)
+	StartRecording(sp, SingleNodeRecording)
+	ctx, cancelCtx := context.WithCancel(ctx)
+	ctx = opentracing.ContextWithSpan(ctx, sp)
 
-var tracerRegistry tracerRegistryImpl
-
-func (tr *tracerRegistryImpl) Add(t *Tracer) {
-	tr.Lock()
-	tr.tracers = append(tr.tracers, t)
-	tr.Unlock()
-}
-
-func (tr *tracerRegistryImpl) Remove(t *Tracer) {
-	tr.Lock()
-	defer tr.Unlock()
-
-	for i := range tr.tracers {
-		if tr.tracers[i] == t {
-			tr.tracers = tr.tracers[:i+copy(tr.tracers[i:], tr.tracers[i+1:])]
-			return
-		}
+	getRecording = func() []RecordedSpan {
+		return GetRecording(sp)
 	}
-	panic("removing unknown tracer")
-}
-
-func (tr *tracerRegistryImpl) ForEach(fn func(t *Tracer)) {
-	tr.Lock()
-	defer tr.Unlock()
-	for _, t := range tr.tracers {
-		fn(t)
+	cancel = func() {
+		cancelCtx()
+		StopRecording(sp)
+		sp.Finish()
+		tr.Close()
 	}
+	return ctx, getRecording, cancel
 }

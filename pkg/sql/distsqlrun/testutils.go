@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Alfonso Subiotto Marqués (alfonso@cockroachlabs.com)
 
 package distsqlrun
 
@@ -32,10 +30,13 @@ type RepeatableRowSource struct {
 var _ RowSource = &RepeatableRowSource{}
 
 // NewRepeatableRowSource creates a RepeatableRowSource with the given schema
-// and rows.
+// and rows. types is optional if at least one row is provided.
 func NewRepeatableRowSource(
 	types []sqlbase.ColumnType, rows sqlbase.EncDatumRows,
 ) *RepeatableRowSource {
+	if types == nil {
+		panic("types required")
+	}
 	return &RepeatableRowSource{rows: rows, types: types}
 }
 

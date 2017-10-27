@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package protoutil_test
 
@@ -35,7 +33,7 @@ import (
 
 func TestCloneProto(t *testing.T) {
 	testCases := []struct {
-		pb          proto.Message
+		pb          protoutil.Message
 		shouldPanic bool
 	}{
 		// Uncloneable types (all contain UUID fields).
@@ -43,6 +41,7 @@ func TestCloneProto(t *testing.T) {
 		{&enginepb.TxnMeta{}, true},
 		{&roachpb.Transaction{}, true},
 		{&roachpb.Error{}, true},
+		{&protoutil.RecursiveAndUncloneable{}, true},
 
 		// Cloneable types. This includes all types for which a
 		// protoutil.Clone call exists in the codebase as of 2016-11-21.
@@ -54,9 +53,10 @@ func TestCloneProto(t *testing.T) {
 		{&roachpb.Value{}, false},
 		{&storagebase.ReplicaState{}, false},
 		{&roachpb.RangeDescriptor{}, false},
+		{&sqlbase.PartitioningDescriptor{}, false},
 	}
 	for _, tc := range testCases {
-		var clone proto.Message
+		var clone protoutil.Message
 		var panicObj interface{}
 		func() {
 			defer func() {

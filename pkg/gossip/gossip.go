@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 /*
 Each node attempts to contact peer nodes to gather all Infos in
@@ -153,6 +151,22 @@ var (
 		defaultGossipStoresInterval)
 )
 
+// KeyNotPresentError is returned by gossip when queried for a key that doesn't
+// exist of has expired.
+type KeyNotPresentError struct {
+	key string
+}
+
+// Error implements the error interface.
+func (err KeyNotPresentError) Error() string {
+	return fmt.Sprintf("KeyNotPresentError: gossip key %q does not exist or has expired", err.key)
+}
+
+// NewKeyNotPresentError creates a new KeyNotPresentError.
+func NewKeyNotPresentError(key string) error {
+	return KeyNotPresentError{key: key}
+}
+
 // Storage is an interface which allows the gossip instance
 // to read and write bootstrapping data to persistent storage
 // between instantiations.
@@ -214,6 +228,8 @@ type Gossip struct {
 	resolvers      []resolver.Resolver
 	resolversTried map[int]struct{} // Set of attempted resolver indexes
 	nodeDescs      map[roachpb.NodeID]*roachpb.NodeDescriptor
+	// storeMap maps store IDs to node IDs.
+	storeMap map[roachpb.StoreID]roachpb.NodeID
 
 	// Membership sets for resolvers and bootstrap addresses.
 	// bootstrapAddrs also tracks which address is associated with which
@@ -226,6 +242,13 @@ type Gossip struct {
 // The higher level manages the NodeIDContainer instance (which can be shared by
 // various server components). The ambient context is expected to already
 // contain the node ID.
+//
+// grpcServer: The server on which the new Gossip instance will register its RPC
+//   service. Can be nil, in which case the Gossip will not register the
+//   service.
+// rpcContext: The context used to connect to other nodes. Can be nil for tests
+//   that also specify a nil grpcServer and that plan on using the Gossip in a
+//   restricted way by populating it with data manually.
 func New(
 	ambient log.AmbientContext,
 	nodeID *base.NodeIDContainer,
@@ -248,6 +271,7 @@ func New(
 		cullInterval:      defaultCullInterval,
 		resolversTried:    map[int]struct{}{},
 		nodeDescs:         map[roachpb.NodeID]*roachpb.NodeDescriptor{},
+		storeMap:          make(map[roachpb.StoreID]roachpb.NodeID),
 		resolverAddrs:     map[util.UnresolvedAddr]resolver.Resolver{},
 		bootstrapAddrs:    map[util.UnresolvedAddr]roachpb.NodeID{},
 	}
@@ -261,14 +285,24 @@ func New(
 	g.mu.is.registerCallback(KeySystemConfig, g.updateSystemConfig)
 	// Add ourselves as a node descriptor watcher.
 	g.mu.is.registerCallback(MakePrefixPattern(KeyNodeIDPrefix), g.updateNodeAddress)
+	g.mu.is.registerCallback(MakePrefixPattern(KeyStorePrefix), g.updateStoreMap)
 	g.mu.Unlock()
 
-	RegisterGossipServer(grpcServer, g.server)
+	if grpcServer != nil {
+		RegisterGossipServer(grpcServer, g.server)
+	}
 	return g
 }
 
 // NewTest is a simplified wrapper around New that creates the NodeIDContainer
 // internally. Used for testing.
+//
+// grpcServer: The server on which the new Gossip instance will register its RPC
+//   service. Can be nil, in which case the Gossip will not register the
+//   service.
+// rpcContext: The context used to connect to other nodes. Can be nil for tests
+//   that also specify a nil grpcServer and that plan on using the Gossip in a
+//   restricted way by populating it with data manually.
 func NewTest(
 	nodeID roachpb.NodeID,
 	rpcContext *rpc.Context,
@@ -421,6 +455,13 @@ func (g *Gossip) GetNodeIDAddress(nodeID roachpb.NodeID) (*util.UnresolvedAddr, 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.getNodeIDAddressLocked(nodeID)
+}
+
+// GetNodeIDForStoreID looks up the NodeID by StoreID.
+func (g *Gossip) GetNodeIDForStoreID(storeID roachpb.StoreID) (roachpb.NodeID, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.getNodeIDForStoreIDLocked(storeID)
 }
 
 // GetNodeDescriptor looks up the descriptor of the node by ID.
@@ -578,9 +619,14 @@ func (g *Gossip) maybeCleanupBootstrapAddressesLocked() {
 // will seek to "tighten" by creating new connections to distant
 // nodes.
 func maxPeers(nodeCount int) int {
-	// This formula uses maxHops-1, instead of maxHops, to provide a
+	// This formula uses maxHops-2, instead of maxHops, to provide a
 	// "fudge" factor for max connected peers, to account for the
 	// arbitrary, decentralized way in which gossip networks are created.
+	// This will return the following maxPeers for the given number of nodes:
+	//	 <= 27 nodes -> 3 peers
+	//   <= 64 nodes -> 4 peers
+	//   <= 125 nodes -> 5 peers
+	//   <= n^3 nodes -> n peers
 	//
 	// Quick derivation of the formula for posterity (without the fudge factor):
 	// maxPeers^maxHops > nodeCount
@@ -588,7 +634,7 @@ func maxPeers(nodeCount int) int {
 	// log(maxPeers) > log(nodeCount) / maxHops
 	// maxPeers > e^(log(nodeCount) / maxHops)
 	// hence maxPeers = ceil(e^(log(nodeCount) / maxHops)) should work
-	maxPeers := int(math.Ceil(math.Exp(math.Log(float64(nodeCount)) / float64(maxHops-1))))
+	maxPeers := int(math.Ceil(math.Exp(math.Log(float64(nodeCount)) / float64(maxHops-2))))
 	if maxPeers < minPeers {
 		return minPeers
 	}
@@ -698,6 +744,31 @@ func (g *Gossip) removeNodeDescriptorLocked(nodeID roachpb.NodeID) {
 	g.recomputeMaxPeersLocked()
 }
 
+// updateStoreMaps is a gossip callback which is used to update storeMap.
+func (g *Gossip) updateStoreMap(key string, content roachpb.Value) {
+	ctx := g.AnnotateCtx(context.TODO())
+	var desc roachpb.StoreDescriptor
+	if err := content.GetProto(&desc); err != nil {
+		log.Error(ctx, err)
+		return
+	}
+
+	if log.V(1) {
+		log.Infof(ctx, "updateStoreMap called on %q with desc %+v", key, desc)
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.storeMap[desc.StoreID] = desc.Node.NodeID
+}
+
+func (g *Gossip) getNodeIDForStoreIDLocked(storeID roachpb.StoreID) (roachpb.NodeID, error) {
+	if nodeID, ok := g.storeMap[storeID]; ok {
+		return nodeID, nil
+	}
+	return 0, errors.Errorf("unable to look up Node ID for store %d", storeID)
+}
+
 // recomputeMaxPeersLocked recomputes max peers based on size of
 // network and set the max sizes for incoming and outgoing node sets.
 //
@@ -777,7 +848,7 @@ func (g *Gossip) addInfoLocked(key string, val []byte, ttl time.Duration) error 
 
 // AddInfoProto adds or updates an info object. Returns an error if info
 // couldn't be added.
-func (g *Gossip) AddInfoProto(key string, msg proto.Message, ttl time.Duration) error {
+func (g *Gossip) AddInfoProto(key string, msg protoutil.Message, ttl time.Duration) error {
 	bytes, err := protoutil.Marshal(msg)
 	if err != nil {
 		return err
@@ -785,7 +856,7 @@ func (g *Gossip) AddInfoProto(key string, msg proto.Message, ttl time.Duration) 
 	return g.AddInfo(key, bytes, ttl)
 }
 
-// GetInfo returns an info value by key or an error if specified
+// GetInfo returns an info value by key or an KeyNotPresentError if specified
 // key does not exist or has expired.
 func (g *Gossip) GetInfo(key string) ([]byte, error) {
 	g.mu.Lock()
@@ -798,17 +869,27 @@ func (g *Gossip) GetInfo(key string) ([]byte, error) {
 		}
 		return i.Value.GetBytes()
 	}
-	return nil, errors.Errorf("key %q does not exist or has expired", key)
+	return nil, NewKeyNotPresentError(key)
 }
 
-// GetInfoProto returns an info value by key or an error if specified
+// GetInfoProto returns an info value by key or KeyNotPresentError if specified
 // key does not exist or has expired.
-func (g *Gossip) GetInfoProto(key string, msg proto.Message) error {
+func (g *Gossip) GetInfoProto(key string, msg protoutil.Message) error {
 	bytes, err := g.GetInfo(key)
 	if err != nil {
 		return err
 	}
-	return proto.Unmarshal(bytes, msg)
+	return protoutil.Unmarshal(bytes, msg)
+}
+
+// InfoOriginatedHere returns true iff the latest info for the provided key
+// originated on this node. This is useful for ensuring that the system config
+// is regossiped as soon as possible when its lease changes hands.
+func (g *Gossip) InfoOriginatedHere(key string) bool {
+	g.mu.Lock()
+	info := g.mu.is.getInfo(key)
+	g.mu.Unlock()
+	return info != nil && info.NodeID == g.NodeID.Get()
 }
 
 // GetInfoStatus returns the a copy of the contents of the infostore.

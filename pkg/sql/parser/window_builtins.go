@@ -11,15 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package parser
 
 import (
 	"fmt"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+
 	"golang.org/x/net/context"
 )
 
@@ -367,7 +366,7 @@ func newNtileWindow([]Type, *EvalContext) WindowFunc {
 	return &ntileWindow{}
 }
 
-var errInvalidArgumentForNtile = errors.Errorf("argument of ntile() must be greater than zero")
+var errInvalidArgumentForNtile = pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError, "argument of ntile() must be greater than zero")
 
 func (w *ntileWindow) Compute(_ context.Context, _ *EvalContext, wf WindowFrame) (Datum, error) {
 	if w.ntile == nil {
@@ -498,7 +497,7 @@ func newNthValueWindow([]Type, *EvalContext) WindowFunc {
 	return &nthValueWindow{}
 }
 
-var errInvalidArgumentForNthValue = errors.Errorf("argument of nth_value() must be greater than zero")
+var errInvalidArgumentForNthValue = pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError, "argument of nth_value() must be greater than zero")
 
 func (nthValueWindow) Compute(_ context.Context, _ *EvalContext, wf WindowFrame) (Datum, error) {
 	arg := wf.args()[1]

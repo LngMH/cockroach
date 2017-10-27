@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 // This file defines structures and basic functionality that is useful when
 // building distsql plans. It does not contain the actual physical planning
@@ -689,14 +687,18 @@ func (p *PhysicalPlan) PopulateEndpoints(nodeAddresses map[roachpb.NodeID]string
 
 // GenerateFlowSpecs takes a plan (with populated endpoints) and generates the
 // set of FlowSpecs (one per node involved in the plan).
-func (p *PhysicalPlan) GenerateFlowSpecs() map[roachpb.NodeID]distsqlrun.FlowSpec {
+//
+// gateway is the current node's NodeID.
+func (p *PhysicalPlan) GenerateFlowSpecs(
+	gateway roachpb.NodeID,
+) map[roachpb.NodeID]distsqlrun.FlowSpec {
 	flowID := distsqlrun.FlowID{UUID: uuid.MakeV4()}
 	flows := make(map[roachpb.NodeID]distsqlrun.FlowSpec)
 
 	for _, proc := range p.Processors {
 		flowSpec, ok := flows[proc.Node]
 		if !ok {
-			flowSpec = distsqlrun.FlowSpec{FlowID: flowID}
+			flowSpec = distsqlrun.FlowSpec{FlowID: flowID, Gateway: gateway}
 		}
 		flowSpec.Processors = append(flowSpec.Processors, proc.Spec)
 		flows[proc.Node] = flowSpec

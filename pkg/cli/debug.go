@@ -12,8 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Ben Darnell
 
 package cli
 
@@ -40,12 +38,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/gogo/protobuf/jsonpb"
-	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -72,7 +70,7 @@ func parseRangeID(arg string) (roachpb.RangeID, error) {
 }
 
 func openStore(cmd *cobra.Command, dir string, stopper *stop.Stopper) (*engine.RocksDB, error) {
-	cache := engine.NewRocksDBCache(512 << 20)
+	cache := engine.NewRocksDBCache(server.DefaultCacheSize)
 	defer cache.Release()
 	maxOpenFiles, err := server.SetOpenFileLimitForOneStore()
 	if err != nil {
@@ -80,6 +78,7 @@ func openStore(cmd *cobra.Command, dir string, stopper *stop.Stopper) (*engine.R
 	}
 	db, err := engine.NewRocksDB(
 		engine.RocksDBConfig{
+			Settings:     serverCfg.Settings,
 			Dir:          dir,
 			MaxOpenFiles: maxOpenFiles,
 		},
@@ -231,9 +230,9 @@ func tryMeta(kv engine.MVCCKeyValue) (string, error) {
 	return descStr(desc), nil
 }
 
-func maybeUnmarshalInline(v []byte, dest proto.Message) error {
+func maybeUnmarshalInline(v []byte, dest protoutil.Message) error {
 	var meta enginepb.MVCCMetadata
-	if err := meta.Unmarshal(v); err != nil {
+	if err := protoutil.Unmarshal(v, &meta); err != nil {
 		return err
 	}
 	value := roachpb.Value{
@@ -261,14 +260,14 @@ func tryRangeIDKey(kv engine.MVCCKeyValue) (string, error) {
 
 	// All range ID keys are stored inline on the metadata.
 	var meta enginepb.MVCCMetadata
-	if err := meta.Unmarshal(kv.Value); err != nil {
+	if err := protoutil.Unmarshal(kv.Value, &meta); err != nil {
 		return "", err
 	}
 	value := roachpb.Value{RawBytes: meta.RawBytes}
 
 	// Values encoded as protobufs set msg and continue outside the
 	// switch. Other types are handled inside the switch and return.
-	var msg proto.Message
+	var msg protoutil.Message
 	switch {
 	case bytes.Equal(suffix, keys.LocalLeaseAppliedIndexSuffix):
 		fallthrough
@@ -286,8 +285,8 @@ func tryRangeIDKey(kv engine.MVCCKeyValue) (string, error) {
 		}
 		return strconv.FormatBool(b), nil
 
-	case bytes.Equal(suffix, keys.LocalAbortCacheSuffix):
-		msg = &roachpb.AbortCacheEntry{}
+	case bytes.Equal(suffix, keys.LocalAbortSpanSuffix):
+		msg = &roachpb.AbortSpanEntry{}
 
 	case bytes.Equal(suffix, keys.LocalRangeLastGCSuffix):
 		msg = &hlc.Timestamp{}
@@ -359,7 +358,7 @@ func printRangeDescriptor(kv engine.MVCCKeyValue) (bool, error) {
 	return false, nil
 }
 
-func getProtoValue(data []byte, msg proto.Message) error {
+func getProtoValue(data []byte, msg protoutil.Message) error {
 	value := roachpb.Value{
 		RawBytes: data,
 	}
@@ -437,7 +436,7 @@ func tryRaftLogEntry(kv engine.MVCCKeyValue) (string, error) {
 		if len(ent.Data) > 0 {
 			_, cmdData := storage.DecodeRaftCommand(ent.Data)
 			var cmd storagebase.RaftCommand
-			if err := cmd.Unmarshal(cmdData); err != nil {
+			if err := protoutil.Unmarshal(cmdData, &cmd); err != nil {
 				return "", err
 			}
 			ent.Data = nil
@@ -446,15 +445,15 @@ func tryRaftLogEntry(kv engine.MVCCKeyValue) (string, error) {
 		return fmt.Sprintf("%s: EMPTY\n", &ent), nil
 	} else if ent.Type == raftpb.EntryConfChange {
 		var cc raftpb.ConfChange
-		if err := cc.Unmarshal(ent.Data); err != nil {
+		if err := protoutil.Unmarshal(ent.Data, &cc); err != nil {
 			return "", err
 		}
 		var ctx storage.ConfChangeContext
-		if err := ctx.Unmarshal(cc.Context); err != nil {
+		if err := protoutil.Unmarshal(cc.Context, &ctx); err != nil {
 			return "", err
 		}
 		var cmd storagebase.ReplicatedEvalResult
-		if err := cmd.Unmarshal(ctx.Payload); err != nil {
+		if err := protoutil.Unmarshal(ctx.Payload, &cmd); err != nil {
 			return "", err
 		}
 		ent.Data = nil
@@ -541,8 +540,8 @@ func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 	var descs []roachpb.RangeDescriptor
 
 	if _, err := engine.MVCCIterate(context.Background(), db, start, end, hlc.MaxTimestamp,
-		false /* !consistent */, nil, /* txn */
-		false /* !reverse */, func(kv roachpb.KeyValue) (bool, error) {
+		false /* consistent */, nil, /* txn */
+		false /* reverse */, func(kv roachpb.KeyValue) (bool, error) {
 			var desc roachpb.RangeDescriptor
 			_, suffix, _, err := keys.DecodeRangeKey(kv.Key)
 			if err != nil {
@@ -571,7 +570,7 @@ func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 		defer snap.Close()
 		_, info, err := storage.RunGC(context.Background(), &desc, snap, hlc.Timestamp{WallTime: timeutil.Now().UnixNano()},
 			config.GCPolicy{TTLSeconds: 24 * 60 * 60 /* 1 day */}, func(_ hlc.Timestamp, _ *roachpb.Transaction, _ roachpb.PushTxnType) {
-			}, func(_ []roachpb.Intent, _, _ bool) error { return nil })
+			}, func(_ []roachpb.Intent, _ storage.ResolveOptions) error { return nil })
 		if err != nil {
 			return err
 		}
@@ -627,8 +626,8 @@ func runDebugCheckStoreCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	if _, err := engine.MVCCIterate(context.Background(), db, start, end, hlc.MaxTimestamp,
-		false /* !consistent */, nil, /* txn */
-		false /* !reverse */, func(kv roachpb.KeyValue) (bool, error) {
+		false /* consistent */, nil, /* txn */
+		false /* reverse */, func(kv roachpb.KeyValue) (bool, error) {
 			rangeID, _, suffix, detail, err := keys.DecodeRangeIDKey(kv.Key)
 			if err != nil {
 				return false, err
@@ -846,7 +845,7 @@ func parseGossipValues(gossipInfo *gossip.InfoStatus) (string, error) {
 		} else if key == gossip.KeySystemConfig {
 			if debugCtx.printSystemConfig {
 				var config config.SystemConfig
-				if err := proto.Unmarshal(bytes, &config); err != nil {
+				if err := protoutil.Unmarshal(bytes, &config); err != nil {
 					return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 				}
 				output = append(output, fmt.Sprintf("%q: %+v", key, config))
@@ -855,31 +854,31 @@ func parseGossipValues(gossipInfo *gossip.InfoStatus) (string, error) {
 			}
 		} else if key == gossip.KeyFirstRangeDescriptor {
 			var desc roachpb.RangeDescriptor
-			if err := proto.Unmarshal(bytes, &desc); err != nil {
+			if err := protoutil.Unmarshal(bytes, &desc); err != nil {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
 			output = append(output, fmt.Sprintf("%q: %v", key, desc))
 		} else if gossip.IsNodeIDKey(key) {
 			var desc roachpb.NodeDescriptor
-			if err := proto.Unmarshal(bytes, &desc); err != nil {
+			if err := protoutil.Unmarshal(bytes, &desc); err != nil {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
 			output = append(output, fmt.Sprintf("%q: %+v", key, desc))
 		} else if strings.HasPrefix(key, gossip.KeyStorePrefix) {
 			var desc roachpb.StoreDescriptor
-			if err := proto.Unmarshal(bytes, &desc); err != nil {
+			if err := protoutil.Unmarshal(bytes, &desc); err != nil {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
 			output = append(output, fmt.Sprintf("%q: %+v", key, desc))
 		} else if strings.HasPrefix(key, gossip.KeyNodeLivenessPrefix) {
 			var liveness storage.Liveness
-			if err := proto.Unmarshal(bytes, &liveness); err != nil {
+			if err := protoutil.Unmarshal(bytes, &liveness); err != nil {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
 			output = append(output, fmt.Sprintf("%q: %+v", key, liveness))
 		} else if strings.HasPrefix(key, gossip.KeyDeadReplicasPrefix) {
 			var deadReplicas roachpb.StoreDeadReplicas
-			if err := proto.Unmarshal(bytes, &deadReplicas); err != nil {
+			if err := protoutil.Unmarshal(bytes, &deadReplicas); err != nil {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
 			output = append(output, fmt.Sprintf("%q: %+v", key, deadReplicas))

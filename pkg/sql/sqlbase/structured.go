@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sqlbase
 
@@ -29,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
@@ -39,12 +38,22 @@ import (
 // ID is a custom type for {Database,Table}Descriptor IDs.
 type ID parser.ID
 
+// InvalidID is the uninitialised descriptor id.
+const InvalidID ID = 0
+
 // IDs is a sortable list of IDs.
 type IDs []ID
 
 func (ids IDs) Len() int           { return len(ids) }
 func (ids IDs) Less(i, j int) bool { return ids[i] < ids[j] }
 func (ids IDs) Swap(i, j int)      { ids[i], ids[j] = ids[j], ids[i] }
+
+// TableDescriptors is a sortable list of *TableDescriptors.
+type TableDescriptors []*TableDescriptor
+
+func (t TableDescriptors) Len() int           { return len(t) }
+func (t TableDescriptors) Less(i, j int) bool { return t[i].ID < t[j].ID }
+func (t TableDescriptors) Swap(i, j int)      { t[i], t[j] = t[j], t[i] }
 
 // ColumnID is a custom type for ColumnDescriptor IDs.
 type ColumnID parser.ColumnID
@@ -69,14 +78,14 @@ const (
 	// https://www.cockroachlabs.com/blog/sql-in-cockroachdb-mapping-table-data-to-key-value-storage/.
 	BaseFormatVersion
 	// FamilyFormatVersion corresponds to the encoding described in
-	// https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/sql_column_families.md
+	// https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20151214_sql_column_families.md
 	FamilyFormatVersion
 	// InterleavedFormatVersion corresponds to the encoding described in
-	// https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/sql_interleaved_tables.md
+	// https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20160624_sql_interleaved_tables.md
 	InterleavedFormatVersion
 )
 
-// MutationID is custom type for TableDescriptor mutations.
+// MutationID is a custom type for TableDescriptor mutations.
 type MutationID uint32
 
 // InvalidMutationID is the uninitialised mutation id.
@@ -191,7 +200,7 @@ func (desc *IndexDescriptor) allocateName(tableDesc *TableDescriptor) {
 	name := baseName
 
 	exists := func(name string) bool {
-		_, _, err := tableDesc.findIndexByNormalizedName(name)
+		_, _, err := tableDesc.FindIndexByName(name)
 		return err == nil
 	}
 	for i := 1; exists(name); i++ {
@@ -309,10 +318,7 @@ func (desc *TableDescriptor) SetID(id ID) {
 
 // TypeName returns the plain type of this descriptor.
 func (desc *TableDescriptor) TypeName() string {
-	if desc.IsView() {
-		return "view"
-	}
-	return "table"
+	return "relation"
 }
 
 // SetName implements the DescriptorProto interface.
@@ -516,7 +522,7 @@ func (desc *TableDescriptor) AllocateIDs() error {
 			columnID = desc.NextColumnID
 			desc.NextColumnID++
 		}
-		columnNames[parser.ReNormalizeName(c.Name)] = columnID
+		columnNames[c.Name] = columnID
 		c.ID = columnID
 	}
 	for i := range desc.Columns {
@@ -587,6 +593,12 @@ func HasCompositeKeyEncoding(semanticType ColumnType_SemanticType) bool {
 	return false
 }
 
+// MustBeValueEncoded returns true if columns of the given kind can only be value
+// encoded.
+func MustBeValueEncoded(semanticType ColumnType_SemanticType) bool {
+	return semanticType == ColumnType_ARRAY
+}
+
 // HasOldStoredColumns returns whether the index has stored columns in the old
 // format (data encoded the same way as if they were in an implicit column).
 func (desc *IndexDescriptor) HasOldStoredColumns() bool {
@@ -641,7 +653,7 @@ func (desc *TableDescriptor) allocateIndexIDs(columnNames map[string]ColumnID) e
 				index.ColumnIDs = append(index.ColumnIDs, 0)
 			}
 			if index.ColumnIDs[j] == 0 {
-				index.ColumnIDs[j] = columnNames[parser.ReNormalizeName(colName)]
+				index.ColumnIDs[j] = columnNames[colName]
 			}
 		}
 
@@ -668,7 +680,7 @@ func (desc *TableDescriptor) allocateIndexIDs(columnNames map[string]ColumnID) e
 					continue
 				}
 				if index.ContainsColumnID(col.ID) {
-					return fmt.Errorf("index \"%s\" already contains column \"%s\"", index.Name, col.Name)
+					return fmt.Errorf("index %q already contains column %q", index.Name, col.Name)
 				}
 				if indexHasOldStoredColumns {
 					index.ExtraColumnIDs = append(index.ExtraColumnIDs, col.ID)
@@ -715,7 +727,7 @@ func (desc *TableDescriptor) allocateColumnFamilyIDs(columnNames map[string]Colu
 				family.ColumnIDs = append(family.ColumnIDs, 0)
 			}
 			if family.ColumnIDs[j] == 0 {
-				family.ColumnIDs[j] = columnNames[parser.ReNormalizeName(colName)]
+				family.ColumnIDs[j] = columnNames[colName]
 			}
 			columnsInFamilies[family.ColumnIDs[j]] = struct{}{}
 		}
@@ -869,7 +881,7 @@ func (desc *TableDescriptor) validateCrossReferences(ctx context.Context, txn *c
 				}
 			}
 			if !found {
-				return errors.Errorf("missing fk back reference to %s.%s from %s.%s",
+				return errors.Errorf("missing fk back reference to %q@%q from %q@%q",
 					desc.Name, index.Name, targetTable.Name, targetIndex.Name)
 			}
 		}
@@ -890,7 +902,7 @@ func (desc *TableDescriptor) validateCrossReferences(ctx context.Context, txn *c
 					targetTable.Name, backref.Index)
 			}
 			if fk := targetIndex.ForeignKey; fk.Table != desc.ID || fk.Index != index.ID {
-				return errors.Errorf("broken fk backward reference from %s.%s to %s.%s",
+				return errors.Errorf("broken fk backward reference from %q@%q to %q@%q",
 					desc.Name, index.Name, targetTable.Name, targetIndex.Name)
 			}
 		}
@@ -913,7 +925,7 @@ func (desc *TableDescriptor) validateCrossReferences(ctx context.Context, txn *c
 			}
 			if !found {
 				return errors.Errorf(
-					"missing interleave back reference to %s.%s from %s.%s",
+					"missing interleave back reference to %q@%q from %q@%q",
 					desc.Name, index.Name, targetTable.Name, targetIndex.Name)
 			}
 		}
@@ -935,14 +947,14 @@ func (desc *TableDescriptor) validateCrossReferences(ctx context.Context, txn *c
 			}
 			if len(targetIndex.Interleave.Ancestors) == 0 {
 				return errors.Errorf(
-					"broken interleave backward reference from %s.%s to %s.%s",
+					"broken interleave backward reference from %q@%q to %q@%q",
 					desc.Name, index.Name, targetTable.Name, targetIndex.Name)
 			}
 			// The last ancestor is required to be a backreference.
 			ancestor := targetIndex.Interleave.Ancestors[len(targetIndex.Interleave.Ancestors)-1]
 			if ancestor.TableID != desc.ID || ancestor.IndexID != index.ID {
 				return errors.Errorf(
-					"broken interleave backward reference from %s.%s to %s.%s",
+					"broken interleave backward reference from %q@%q to %q@%q",
 					desc.Name, index.Name, targetTable.Name, targetIndex.Name)
 			}
 		}
@@ -1009,20 +1021,24 @@ func (desc *TableDescriptor) ValidateTable() error {
 			return fmt.Errorf("invalid column ID %d", column.ID)
 		}
 
-		normName := parser.ReNormalizeName(column.Name)
-		if _, ok := columnNames[normName]; ok {
-			return fmt.Errorf("duplicate column name: \"%s\"", column.Name)
+		if _, ok := columnNames[column.Name]; ok {
+			for _, col := range desc.Columns {
+				if col.Name == column.Name {
+					return fmt.Errorf("duplicate column name: %q", column.Name)
+				}
+			}
+			return fmt.Errorf("duplicate: column %q in the middle of being added, not yet public", column.Name)
 		}
-		columnNames[normName] = column.ID
+		columnNames[column.Name] = column.ID
 
 		if other, ok := columnIDs[column.ID]; ok {
-			return fmt.Errorf("column \"%s\" duplicate ID of column \"%s\": %d",
+			return fmt.Errorf("column %q duplicate ID of column %q: %d",
 				column.Name, other, column.ID)
 		}
 		columnIDs[column.ID] = column.Name
 
 		if column.ID >= desc.NextColumnID {
-			return fmt.Errorf("column \"%s\" invalid ID (%d) > next column ID (%d)",
+			return fmt.Errorf("column %q invalid ID (%d) > next column ID (%d)",
 				column.Name, column.ID, desc.NextColumnID)
 		}
 	}
@@ -1033,7 +1049,7 @@ func (desc *TableDescriptor) ValidateTable() error {
 		case *DescriptorMutation_Column:
 			col := desc.Column
 			if unSetEnums {
-				return errors.Errorf("mutation in state %s, direction %s, col %s, id %v", m.State, m.Direction, col.Name, col.ID)
+				return errors.Errorf("mutation in state %s, direction %s, col %q, id %v", m.State, m.Direction, col.Name, col.ID)
 			}
 			columnIDs[col.ID] = col.Name
 		case *DescriptorMutation_Index:
@@ -1056,6 +1072,9 @@ func (desc *TableDescriptor) ValidateTable() error {
 			return err
 		}
 		if err := desc.validateTableIndexes(columnNames, colIDToFamilyID); err != nil {
+			return err
+		}
+		if err := desc.validatePartitioning(); err != nil {
 			return err
 		}
 	}
@@ -1082,20 +1101,19 @@ func (desc *TableDescriptor) validateColumnFamilies(
 			return nil, err
 		}
 
-		normName := parser.ReNormalizeName(family.Name)
-		if _, ok := familyNames[normName]; ok {
-			return nil, fmt.Errorf("duplicate family name: \"%s\"", family.Name)
+		if _, ok := familyNames[family.Name]; ok {
+			return nil, fmt.Errorf("duplicate family name: %q", family.Name)
 		}
-		familyNames[normName] = struct{}{}
+		familyNames[family.Name] = struct{}{}
 
 		if other, ok := familyIDs[family.ID]; ok {
-			return nil, fmt.Errorf("family \"%s\" duplicate ID of family \"%s\": %d",
+			return nil, fmt.Errorf("family %q duplicate ID of family %q: %d",
 				family.Name, other, family.ID)
 		}
 		familyIDs[family.ID] = family.Name
 
 		if family.ID >= desc.NextFamilyID {
-			return nil, fmt.Errorf("family \"%s\" invalid family ID (%d) > next family ID (%d)",
+			return nil, fmt.Errorf("family %q invalid family ID (%d) > next family ID (%d)",
 				family.Name, family.ID, desc.NextFamilyID)
 		}
 
@@ -1107,10 +1125,10 @@ func (desc *TableDescriptor) validateColumnFamilies(
 		for i, colID := range family.ColumnIDs {
 			name, ok := columnIDs[colID]
 			if !ok {
-				return nil, fmt.Errorf("family \"%s\" contains unknown column \"%d\"", family.Name, colID)
+				return nil, fmt.Errorf("family %q contains unknown column \"%d\"", family.Name, colID)
 			}
-			if parser.ReNormalizeName(name) != parser.ReNormalizeName(family.ColumnNames[i]) {
-				return nil, fmt.Errorf("family \"%s\" column %d should have name %q, but found name %q",
+			if name != family.ColumnNames[i] {
+				return nil, fmt.Errorf("family %q column %d should have name %q, but found name %q",
 					family.Name, colID, name, family.ColumnNames[i])
 			}
 		}
@@ -1130,11 +1148,14 @@ func (desc *TableDescriptor) validateColumnFamilies(
 	return colIDToFamilyID, nil
 }
 
+// validateTableIndexes validates that indexes are well formed. Checks include
+// validating the columns involved in the index, verifying the index names and
+// IDs are unique, and the family of the primary key is 0. This does not check
+// if indexes are unique (i.e. same set of columns, direction, and uniqueness)
+// as there are practical uses for them.
 func (desc *TableDescriptor) validateTableIndexes(
 	columnNames map[string]ColumnID, colIDToFamilyID map[ColumnID]FamilyID,
 ) error {
-	// TODO(pmattis): Check that the indexes are unique. That is, no 2 indexes
-	// should contain identical sets of columns.
 	if len(desc.PrimaryIndex.ColumnIDs) == 0 {
 		return ErrMissingPrimaryKey
 	}
@@ -1149,20 +1170,24 @@ func (desc *TableDescriptor) validateTableIndexes(
 			return fmt.Errorf("invalid index ID %d", index.ID)
 		}
 
-		normName := parser.ReNormalizeName(index.Name)
-		if _, ok := indexNames[normName]; ok {
-			return fmt.Errorf("duplicate index name: \"%s\"", index.Name)
+		if _, ok := indexNames[index.Name]; ok {
+			for _, idx := range desc.Indexes {
+				if idx.Name == index.Name {
+					return fmt.Errorf("duplicate index name: %q", index.Name)
+				}
+			}
+			return fmt.Errorf("duplicate: index %q in the middle of being added, not yet public", index.Name)
 		}
-		indexNames[normName] = struct{}{}
+		indexNames[index.Name] = struct{}{}
 
 		if other, ok := indexIDs[index.ID]; ok {
-			return fmt.Errorf("index \"%s\" duplicate ID of index \"%s\": %d",
+			return fmt.Errorf("index %q duplicate ID of index %q: %d",
 				index.Name, other, index.ID)
 		}
 		indexIDs[index.ID] = index.Name
 
 		if index.ID >= desc.NextIndexID {
-			return fmt.Errorf("index \"%s\" invalid index ID (%d) > next index ID (%d)",
+			return fmt.Errorf("index %q invalid index ID (%d) > next index ID (%d)",
 				index.Name, index.ID, desc.NextIndexID)
 		}
 
@@ -1176,16 +1201,16 @@ func (desc *TableDescriptor) validateTableIndexes(
 		}
 
 		if len(index.ColumnIDs) == 0 {
-			return fmt.Errorf("index \"%s\" must contain at least 1 column", index.Name)
+			return fmt.Errorf("index %q must contain at least 1 column", index.Name)
 		}
 
 		for i, name := range index.ColumnNames {
-			colID, ok := columnNames[parser.ReNormalizeName(name)]
+			colID, ok := columnNames[name]
 			if !ok {
-				return fmt.Errorf("index \"%s\" contains unknown column \"%s\"", index.Name, name)
+				return fmt.Errorf("index %q contains unknown column %q", index.Name, name)
 			}
 			if colID != index.ColumnIDs[i] {
-				return fmt.Errorf("index \"%s\" column \"%s\" should have ID %d, but found ID %d",
+				return fmt.Errorf("index %q column %q should have ID %d, but found ID %d",
 					index.Name, name, colID, index.ColumnIDs[i])
 			}
 		}
@@ -1199,6 +1224,226 @@ func (desc *TableDescriptor) validateTableIndexes(
 	}
 
 	return nil
+}
+
+// translateValueEncodingToKey parses columns encoded with the "value" encoding
+// and returns them reencoded using the "key ascending" encoding. The parsed
+// datums are also returned. If DEFAULT or MAXVALUE is encountered, the returned
+// row (both reencoded and parsed datums) will be shorter then len(colIDs);
+// specifically it will contain all the values up to but not including the
+// special one.
+//
+// TODO(dan): The upcoming PR that translates a TableDescriptor into spans for a
+// zone config will make this return the relevant key prefix (this is currently
+// implicit between this method and validatePartitioningDescriptor). At that
+// time, add documentation for how this logic works and lots of tests.
+func translateValueEncodingToKey(
+	typ parser.PartitionByType,
+	a *DatumAlloc,
+	desc *TableDescriptor,
+	valueEncBuf []byte,
+	colIDs []ColumnID,
+) (parser.Datums, []byte, error) {
+	datums := make(parser.Datums, len(colIDs))
+	var keyEncBuf []byte
+	specialIdx := -1
+	for i, colID := range colIDs {
+		col, err := desc.FindActiveColumnByID(colID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, dataOffset, _, typ, err := encoding.DecodeValueTag(valueEncBuf); err != nil {
+			return nil, nil, errors.Wrap(err, "decoding")
+		} else if typ == encoding.NotNull {
+			if specialIdx == -1 {
+				specialIdx = i
+			}
+			valueEncBuf = valueEncBuf[dataOffset:]
+			continue
+		}
+		datums[i], valueEncBuf, err = DecodeTableValue(a, col.Type.ToDatumType(), valueEncBuf)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "decoding")
+		}
+		if specialIdx != -1 {
+			switch typ {
+			case parser.PartitionByList:
+				return nil, nil, errors.Errorf("non-DEFAULT value (%s) not allowed after DEFAULT",
+					datums[i])
+			case parser.PartitionByRange:
+				return nil, nil, errors.Errorf("non-MAXVALUE value (%s) not allowed after MAXVALUE",
+					datums[i])
+			default:
+				return nil, nil, errors.Errorf("unknown partition type: %s", typ)
+			}
+		}
+		// TODO(dan): One we start using this method to fill in zone configs,
+		// this encoding has to match the index direction (instead of always
+		// being ascending).
+		keyEncBuf, err = EncodeTableKey(keyEncBuf, datums[i], encoding.Ascending)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if len(valueEncBuf) > 0 {
+		return nil, nil, fmt.Errorf("superfluous data in encoded value")
+	}
+	if specialIdx != -1 {
+		datums = datums[:specialIdx]
+	}
+	return datums, keyEncBuf, nil
+}
+
+func printPartitioningPrefix(datums []parser.Datum, s string) string {
+	var buf bytes.Buffer
+	for i, v := range datums {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(parser.AsString(v))
+	}
+	if len(datums) > 0 {
+		buf.WriteString(", ")
+	}
+	buf.WriteString(s)
+	return buf.String()
+}
+
+// validatePartitioningDescriptor validates that a PartitioningDescriptor, which
+// may represent a subpartition, is well-formed. Checks include validating the
+// table-level uniqueness of all partition names, validating that the encoded
+// tuples match the corresponding column types, and that range partitions are
+// stored sorted by upper bound. colOffset is non-zero for subpartitions and
+// indicates how many index columns to skip over.
+func (desc *TableDescriptor) validatePartitioningDescriptor(
+	a *DatumAlloc,
+	idxDesc *IndexDescriptor,
+	partDesc *PartitioningDescriptor,
+	colOffset int,
+	partitionNames map[string]struct{},
+) error {
+	if partDesc.NumColumns == 0 {
+		return nil
+	}
+	if colOffset+int(partDesc.NumColumns) > len(idxDesc.ColumnIDs) {
+		return fmt.Errorf("not enough columns in index for this partitioning")
+	}
+	colIDs := idxDesc.ColumnIDs[colOffset : colOffset+int(partDesc.NumColumns)]
+
+	if len(partDesc.List) == 0 && len(partDesc.Range) == 0 {
+		return fmt.Errorf("at least one of LIST or RANGE partitioning must be used")
+	}
+	if len(partDesc.List) > 0 && len(partDesc.Range) > 0 {
+		return fmt.Errorf("only one LIST or RANGE partitioning may used")
+	}
+
+	if len(partDesc.List) > 0 {
+		listValues := make(map[string]struct{}, len(partDesc.List))
+		for _, p := range partDesc.List {
+			if len(p.Name) == 0 {
+				return fmt.Errorf("partition name must be non-empty")
+			}
+			if _, exists := partitionNames[p.Name]; exists {
+				return fmt.Errorf("partition name %s must be unique", p.Name)
+			}
+			partitionNames[p.Name] = struct{}{}
+
+			if len(p.Values) == 0 {
+				return fmt.Errorf("partition %s must contain values", p.Name)
+			}
+			// NB: key encoding is used to check uniqueness because it has
+			// to match the behavior of the value when indexed.
+			for _, valueEncBuf := range p.Values {
+				datums, keyEncBuf, err := translateValueEncodingToKey(
+					parser.PartitionByList, a, desc, valueEncBuf, colIDs,
+				)
+				if err != nil {
+					return fmt.Errorf("PARTITION %s: %v", p.Name, err)
+				}
+				if _, exists := listValues[string(keyEncBuf)]; exists {
+					if len(datums) != len(colIDs) {
+						return fmt.Errorf("prefix (%s) cannot be present in more than one partition",
+							printPartitioningPrefix(datums, "DEFAULT"))
+					}
+					return fmt.Errorf("%s cannot be present in more than one partition",
+						parser.AsString(datums))
+				}
+				listValues[string(keyEncBuf)] = struct{}{}
+			}
+
+			newColOffset := colOffset + int(partDesc.NumColumns)
+			if err := desc.validatePartitioningDescriptor(
+				a, idxDesc, &p.Subpartitioning, newColOffset, partitionNames,
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	if len(partDesc.Range) > 0 {
+		var lastValue []byte
+		rangeValues := make(map[string]struct{}, len(partDesc.Range))
+		for _, p := range partDesc.Range {
+			if len(p.Name) == 0 {
+				return fmt.Errorf("partition name must be non-empty")
+			}
+			if _, exists := partitionNames[p.Name]; exists {
+				return fmt.Errorf("partition name %s must be unique", p.Name)
+			}
+			partitionNames[p.Name] = struct{}{}
+
+			// NB: key encoding is used to check sortedness and uniqueness
+			// because it has to match the behavior of the value when
+			// indexed.
+			datums, keyEncBuf, err := translateValueEncodingToKey(
+				parser.PartitionByRange, a, desc, p.UpperBound, colIDs,
+			)
+			if err != nil {
+				return fmt.Errorf("PARTITION %s: %v", p.Name, err)
+			}
+			if len(datums) < len(colIDs) {
+				// MAXVALUE, so encode something that always sorts higher than
+				// any possible value for this column.
+				keyEncBuf = roachpb.Key(keyEncBuf).PrefixEnd()
+			}
+			if _, exists := rangeValues[string(keyEncBuf)]; exists {
+				if len(datums) != len(colIDs) {
+					return fmt.Errorf("prefix (%s) cannot be present in more than one partition",
+						printPartitioningPrefix(datums, "MAXVALUE"))
+				}
+				return fmt.Errorf("%s cannot be present in more than one partition",
+					parser.AsString(datums))
+			}
+
+			rangeValues[string(keyEncBuf)] = struct{}{}
+			if bytes.Compare(lastValue, keyEncBuf) >= 0 {
+				return fmt.Errorf("values must be strictly increasing")
+			}
+			lastValue = keyEncBuf
+
+			newColOffset := colOffset + int(partDesc.NumColumns)
+			if err := desc.validatePartitioningDescriptor(
+				a, idxDesc, &p.Subpartitioning, newColOffset, partitionNames,
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// validatePartitioning validates that any PartitioningDescriptors contained in
+// table indexes are well-formed. See validatePartitioningDesc for details.
+func (desc *TableDescriptor) validatePartitioning() error {
+	partitionNames := make(map[string]struct{})
+
+	a := &DatumAlloc{}
+	return desc.ForeachNonDropIndex(func(idxDesc *IndexDescriptor) error {
+		return desc.validatePartitioningDescriptor(
+			a, idxDesc, &idxDesc.Partitioning, 0 /* colOffset */, partitionNames,
+		)
+	})
 }
 
 // FamilyHeuristicTargetBytes is the target total byte size of columns that the
@@ -1220,7 +1465,7 @@ func upperBoundColumnValueEncodedSize(col ColumnDescriptor) (int, bool) {
 		typ = encoding.Float
 	case ColumnType_INTERVAL:
 		typ = encoding.Duration
-	case ColumnType_STRING, ColumnType_BYTES, ColumnType_COLLATEDSTRING, ColumnType_NAME, ColumnType_UUID:
+	case ColumnType_STRING, ColumnType_BYTES, ColumnType_COLLATEDSTRING, ColumnType_NAME, ColumnType_UUID, ColumnType_INET:
 		// STRINGs are counted as runes, so this isn't totally correct, but this
 		// seems better than always assuming the maximum rune width.
 		typ, size = encoding.Bytes, int(col.Type.Width)
@@ -1268,6 +1513,51 @@ func fitColumnToFamily(desc TableDescriptor, col ColumnDescriptor) (int, bool) {
 	return 0, true
 }
 
+// columnTypeIsIndexable returns whether the type t is valid as an indexed column.
+func columnTypeIsIndexable(t ColumnType) bool {
+	return !MustBeValueEncoded(t.SemanticType)
+}
+
+func notIndexableError(cols []ColumnDescriptor) error {
+	if len(cols) == 0 {
+		return nil
+	}
+	if len(cols) == 1 {
+		col := cols[0]
+		return pgerror.UnimplementedWithIssueErrorf(
+			17154,
+			"column %s is of type %s and thus is not indexable",
+			col.Name,
+			col.Type.SemanticType,
+		)
+	}
+	result := "the following columns are not indexable due to their type: "
+	for i, col := range cols {
+		result += fmt.Sprintf("%s (type %s)", col.Name, col.Type.SemanticType)
+		if i != len(cols)-1 {
+			result += ", "
+		}
+	}
+	return errors.New(result)
+}
+
+func checkColumnsValidForIndex(tableDesc *TableDescriptor, indexColNames []string) error {
+	invalidColumns := make([]ColumnDescriptor, 0, len(indexColNames))
+	for _, indexCol := range indexColNames {
+		for _, col := range tableDesc.Columns {
+			if col.Name == indexCol {
+				if !columnTypeIsIndexable(col.Type) {
+					invalidColumns = append(invalidColumns, col)
+				}
+			}
+		}
+	}
+	if len(invalidColumns) > 0 {
+		return notIndexableError(invalidColumns)
+	}
+	return nil
+}
+
 // AddColumn adds a column to the table.
 func (desc *TableDescriptor) AddColumn(col ColumnDescriptor) {
 	desc.Columns = append(desc.Columns, col)
@@ -1280,6 +1570,9 @@ func (desc *TableDescriptor) AddFamily(fam ColumnFamilyDescriptor) {
 
 // AddIndex adds an index to the table.
 func (desc *TableDescriptor) AddIndex(idx IndexDescriptor, primary bool) error {
+	if err := checkColumnsValidForIndex(desc, idx.ColumnNames); err != nil {
+		return err
+	}
 	if primary {
 		// PrimaryIndex is unset.
 		if desc.PrimaryIndex.Name == "" {
@@ -1308,9 +1601,8 @@ func (desc *TableDescriptor) AddColumnToFamilyMaybeCreate(
 ) error {
 	idx := int(-1)
 	if len(family) > 0 {
-		normName := parser.ReNormalizeName(family)
 		for i := range desc.Families {
-			if parser.ReNormalizeName(desc.Families[i].Name) == normName {
+			if desc.Families[i].Name == family {
 				idx = i
 				break
 			}
@@ -1390,7 +1682,7 @@ func (desc *TableDescriptor) FindActiveColumnsByNames(
 ) ([]ColumnDescriptor, error) {
 	cols := make([]ColumnDescriptor, len(names))
 	for i := range names {
-		c, err := desc.FindActiveColumnByName(names[i])
+		c, err := desc.FindActiveColumnByName(string(names[i]))
 		if err != nil {
 			return nil, err
 		}
@@ -1399,30 +1691,23 @@ func (desc *TableDescriptor) FindActiveColumnsByNames(
 	return cols, nil
 }
 
-// findColumnByNormalizedName finds the column with the specified name.
-func (desc *TableDescriptor) findColumnByNormalizedName(
-	normName string,
-) (ColumnDescriptor, bool, error) {
+// FindColumnByName finds the column with the specified name. It returns
+// an active column or a column from the mutation list. It returns true
+// if the column is being dropped.
+func (desc *TableDescriptor) FindColumnByName(name parser.Name) (ColumnDescriptor, bool, error) {
 	for i, c := range desc.Columns {
-		if parser.ReNormalizeName(c.Name) == normName {
+		if c.Name == string(name) {
 			return desc.Columns[i], false, nil
 		}
 	}
 	for _, m := range desc.Mutations {
 		if c := m.GetColumn(); c != nil {
-			if parser.ReNormalizeName(c.Name) == normName {
+			if c.Name == string(name) {
 				return *c, m.Direction == DescriptorMutation_DROP, nil
 			}
 		}
 	}
-	return ColumnDescriptor{}, false, fmt.Errorf("column %q does not exist", normName)
-}
-
-// FindColumnByName finds the column with the specified name. It returns
-// an active column or a column from the mutation list. It returns true
-// if the column is being dropped.
-func (desc *TableDescriptor) FindColumnByName(name parser.Name) (ColumnDescriptor, bool, error) {
-	return desc.findColumnByNormalizedName(name.Normalize())
+	return ColumnDescriptor{}, false, fmt.Errorf("column %q does not exist", name)
 }
 
 // UpdateColumnDescriptor updates an existing column descriptor.
@@ -1443,21 +1728,14 @@ func (desc *TableDescriptor) UpdateColumnDescriptor(column ColumnDescriptor) {
 	panic(fmt.Sprintf("column %q does not exist", column.Name))
 }
 
-// FindActiveColumnByNormalizedName finds an active column with the specified normalized name.
-func (desc *TableDescriptor) FindActiveColumnByNormalizedName(
-	normName string,
-) (ColumnDescriptor, error) {
+// FindActiveColumnByName finds an active column with the specified name.
+func (desc *TableDescriptor) FindActiveColumnByName(name string) (ColumnDescriptor, error) {
 	for _, c := range desc.Columns {
-		if parser.ReNormalizeName(c.Name) == normName {
+		if c.Name == name {
 			return c, nil
 		}
 	}
-	return ColumnDescriptor{}, fmt.Errorf("column %q does not exist", normName)
-}
-
-// FindActiveColumnByName calls FindActiveColumnByNormalizedName on a normalized argument.
-func (desc *TableDescriptor) FindActiveColumnByName(name parser.Name) (ColumnDescriptor, error) {
-	return desc.FindActiveColumnByNormalizedName(name.Normalize())
+	return ColumnDescriptor{}, fmt.Errorf("column %q does not exist", name)
 }
 
 // FindColumnByID finds the column with specified ID.
@@ -1497,29 +1775,22 @@ func (desc *TableDescriptor) FindFamilyByID(id FamilyID) (*ColumnFamilyDescripto
 	return nil, fmt.Errorf("family-id \"%d\" does not exist", id)
 }
 
-// findIndexByNormalizedName finds the index with the specified name.
-func (desc *TableDescriptor) findIndexByNormalizedName(
-	normName string,
-) (IndexDescriptor, bool, error) {
+// FindIndexByName finds the index with the specified name in the active
+// list or the mutations list. It returns true if the index is being dropped.
+func (desc *TableDescriptor) FindIndexByName(name string) (IndexDescriptor, bool, error) {
 	for i, idx := range desc.Indexes {
-		if parser.ReNormalizeName(idx.Name) == normName {
+		if idx.Name == name {
 			return desc.Indexes[i], false, nil
 		}
 	}
 	for _, m := range desc.Mutations {
 		if idx := m.GetIndex(); idx != nil {
-			if parser.ReNormalizeName(idx.Name) == normName {
+			if idx.Name == name {
 				return *idx, m.Direction == DescriptorMutation_DROP, nil
 			}
 		}
 	}
-	return IndexDescriptor{}, false, fmt.Errorf("index %q does not exist", normName)
-}
-
-// FindIndexByName finds the index with the specified name in the active
-// list or the mutations list. It returns true if the index is being dropped.
-func (desc *TableDescriptor) FindIndexByName(name parser.Name) (IndexDescriptor, bool, error) {
-	return desc.findIndexByNormalizedName(name.Normalize())
+	return IndexDescriptor{}, false, fmt.Errorf("index %q does not exist", name)
 }
 
 // RenameIndexDescriptor renames an index descriptor.
@@ -1618,17 +1889,19 @@ func (desc *TableDescriptor) AddColumnMutation(
 	c ColumnDescriptor, direction DescriptorMutation_Direction,
 ) {
 	m := DescriptorMutation{Descriptor_: &DescriptorMutation_Column{Column: &c}, Direction: direction}
-	m.ResumeSpans = append(m.ResumeSpans, desc.PrimaryIndexSpan())
 	desc.addMutation(m)
 }
 
 // AddIndexMutation adds an index mutation to desc.Mutations.
 func (desc *TableDescriptor) AddIndexMutation(
 	idx IndexDescriptor, direction DescriptorMutation_Direction,
-) {
+) error {
+	if err := checkColumnsValidForIndex(desc, idx.ColumnNames); err != nil {
+		return err
+	}
 	m := DescriptorMutation{Descriptor_: &DescriptorMutation_Index{Index: &idx}, Direction: direction}
-	m.ResumeSpans = append(m.ResumeSpans, desc.PrimaryIndexSpan())
 	desc.addMutation(m)
+	return nil
 }
 
 func (desc *TableDescriptor) addMutation(m DescriptorMutation) {
@@ -1705,9 +1978,8 @@ func ColumnsSelectors(cols []ColumnDescriptor) parser.SelectExprs {
 	return exprs
 }
 
-// SQLString returns the SQL string corresponding to the type.
-func (c *ColumnType) SQLString() string {
-	switch c.SemanticType {
+func colTypeSQLString(c *ColumnType, semType ColumnType_SemanticType) string {
+	switch semType {
 	case ColumnType_INT:
 		if c.Width > 0 && c.VisibleType == ColumnType_BIT {
 			// A non-zero width indicates a bit array. The syntax "INT(N)"
@@ -1716,11 +1988,11 @@ func (c *ColumnType) SQLString() string {
 		}
 	case ColumnType_STRING:
 		if c.Width > 0 {
-			return fmt.Sprintf("%s(%d)", c.SemanticType.String(), c.Width)
+			return fmt.Sprintf("%s(%d)", semType.String(), c.Width)
 		}
 	case ColumnType_FLOAT:
 		if c.Precision > 0 {
-			return fmt.Sprintf("%s(%d)", c.SemanticType.String(), c.Precision)
+			return fmt.Sprintf("%s(%d)", semType.String(), c.Precision)
 		}
 		if c.VisibleType == ColumnType_DOUBLE_PRECISON {
 			return "DOUBLE PRECISION"
@@ -1728,9 +2000,9 @@ func (c *ColumnType) SQLString() string {
 	case ColumnType_DECIMAL:
 		if c.Precision > 0 {
 			if c.Width > 0 {
-				return fmt.Sprintf("%s(%d,%d)", c.SemanticType.String(), c.Precision, c.Width)
+				return fmt.Sprintf("%s(%d,%d)", semType.String(), c.Precision, c.Width)
 			}
-			return fmt.Sprintf("%s(%d)", c.SemanticType.String(), c.Precision)
+			return fmt.Sprintf("%s(%d)", semType.String(), c.Precision)
 		}
 	case ColumnType_TIMESTAMPTZ:
 		return "TIMESTAMP WITH TIME ZONE"
@@ -1742,13 +2014,18 @@ func (c *ColumnType) SQLString() string {
 			return fmt.Sprintf("%s(%d) COLLATE %s", ColumnType_STRING.String(), c.Width, *c.Locale)
 		}
 		return fmt.Sprintf("%s COLLATE %s", ColumnType_STRING.String(), *c.Locale)
-	case ColumnType_INT_ARRAY:
-		return "INT[]"
+	case ColumnType_ARRAY:
+		return colTypeSQLString(c, *c.ArrayContents) + "[]"
 	}
 	if c.VisibleType != ColumnType_NONE {
 		return c.VisibleType.String()
 	}
-	return c.SemanticType.String()
+	return semType.String()
+}
+
+// SQLString returns the SQL string corresponding to the type.
+func (c *ColumnType) SQLString() string {
+	return colTypeSQLString(c, c.SemanticType)
 }
 
 // MaxCharacterLength returns the declared maximum length of characters if the
@@ -1812,57 +2089,79 @@ func (c *ColumnType) NumericScale() (int32, bool) {
 	return 0, false
 }
 
-// DatumTypeToColumnType converts a parser Type to a ColumnType.
-func DatumTypeToColumnType(ptyp parser.Type) ColumnType {
-	var ctyp ColumnType
+// DatumTypeToColumnSemanticType converts a parser.Type to a SemanticType.
+func DatumTypeToColumnSemanticType(ptyp parser.Type) (ColumnType_SemanticType, error) {
 	switch ptyp {
 	case parser.TypeBool:
-		ctyp.SemanticType = ColumnType_BOOL
+		return ColumnType_BOOL, nil
 	case parser.TypeInt:
-		ctyp.SemanticType = ColumnType_INT
+		return ColumnType_INT, nil
 	case parser.TypeFloat:
-		ctyp.SemanticType = ColumnType_FLOAT
+		return ColumnType_FLOAT, nil
 	case parser.TypeDecimal:
-		ctyp.SemanticType = ColumnType_DECIMAL
+		return ColumnType_DECIMAL, nil
 	case parser.TypeBytes:
-		ctyp.SemanticType = ColumnType_BYTES
+		return ColumnType_BYTES, nil
 	case parser.TypeString:
-		ctyp.SemanticType = ColumnType_STRING
+		return ColumnType_STRING, nil
 	case parser.TypeName:
-		ctyp.SemanticType = ColumnType_NAME
+		return ColumnType_NAME, nil
 	case parser.TypeDate:
-		ctyp.SemanticType = ColumnType_DATE
+		return ColumnType_DATE, nil
 	case parser.TypeTimestamp:
-		ctyp.SemanticType = ColumnType_TIMESTAMP
+		return ColumnType_TIMESTAMP, nil
 	case parser.TypeTimestampTZ:
-		ctyp.SemanticType = ColumnType_TIMESTAMPTZ
+		return ColumnType_TIMESTAMPTZ, nil
 	case parser.TypeInterval:
-		ctyp.SemanticType = ColumnType_INTERVAL
+		return ColumnType_INTERVAL, nil
 	case parser.TypeUUID:
-		ctyp.SemanticType = ColumnType_UUID
+		return ColumnType_UUID, nil
+	case parser.TypeINet:
+		return ColumnType_INET, nil
 	case parser.TypeOid:
-		ctyp.SemanticType = ColumnType_OID
+		return ColumnType_OID, nil
 	case parser.TypeNull:
-		ctyp.SemanticType = ColumnType_NULL
-	case parser.TypeIntArray:
-		ctyp.SemanticType = ColumnType_INT_ARRAY
+		return ColumnType_NULL, nil
 	case parser.TypeIntVector:
-		ctyp.SemanticType = ColumnType_INT2VECTOR
+		return ColumnType_INT2VECTOR, nil
 	default:
-		if t, ok := ptyp.(parser.TCollatedString); ok {
-			ctyp.SemanticType = ColumnType_COLLATEDSTRING
-			ctyp.Locale = &t.Locale
-		} else {
-			panic(fmt.Sprintf("unsupported result type: %s", ptyp))
+		if ptyp.FamilyEqual(parser.TypeCollatedString) {
+			return ColumnType_COLLATEDSTRING, nil
 		}
+		return -1, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "unsupported result type: %s", ptyp)
 	}
-	return ctyp
 }
 
-// ToDatumType converts the ColumnType to the correct type, or nil if there is
-// no correspondence.
-func (c *ColumnType) ToDatumType() parser.Type {
-	switch c.SemanticType {
+// DatumTypeToColumnType converts a parser Type to a ColumnType.
+func DatumTypeToColumnType(ptyp parser.Type) (ColumnType, error) {
+	var ctyp ColumnType
+	switch t := ptyp.(type) {
+	case parser.TCollatedString:
+		ctyp.SemanticType = ColumnType_COLLATEDSTRING
+		ctyp.Locale = &t.Locale
+	case parser.TArray:
+		ctyp.SemanticType = ColumnType_ARRAY
+		contents, err := DatumTypeToColumnSemanticType(t.Typ)
+		if err != nil {
+			return ColumnType{}, err
+		}
+		ctyp.ArrayContents = &contents
+		if t.Typ.FamilyEqual(parser.TypeCollatedString) {
+			cs := t.Typ.(parser.TCollatedString)
+			ctyp.Locale = &cs.Locale
+		}
+	default:
+		semanticType, err := DatumTypeToColumnSemanticType(ptyp)
+		if err != nil {
+			return ColumnType{}, err
+		}
+		ctyp.SemanticType = semanticType
+	}
+	return ctyp, nil
+}
+
+func columnSemanticTypeToDatumType(c *ColumnType, k ColumnType_SemanticType) parser.Type {
+	switch k {
 	case ColumnType_BOOL:
 		return parser.TypeBool
 	case ColumnType_INT:
@@ -1885,6 +2184,8 @@ func (c *ColumnType) ToDatumType() parser.Type {
 		return parser.TypeInterval
 	case ColumnType_UUID:
 		return parser.TypeUUID
+	case ColumnType_INET:
+		return parser.TypeINet
 	case ColumnType_COLLATEDSTRING:
 		if c.Locale == nil {
 			panic("locale is required for COLLATEDSTRING")
@@ -1896,12 +2197,21 @@ func (c *ColumnType) ToDatumType() parser.Type {
 		return parser.TypeOid
 	case ColumnType_NULL:
 		return parser.TypeNull
-	case ColumnType_INT_ARRAY:
-		return parser.TypeIntArray
 	case ColumnType_INT2VECTOR:
 		return parser.TypeIntVector
 	}
 	return nil
+}
+
+// ToDatumType converts the ColumnType to the correct type, or nil if there is
+// no correspondence.
+func (c *ColumnType) ToDatumType() parser.Type {
+	switch c.SemanticType {
+	case ColumnType_ARRAY:
+		return parser.TArray{Typ: columnSemanticTypeToDatumType(c, *c.ArrayContents)}
+	default:
+		return columnSemanticTypeToDatumType(c, c.SemanticType)
+	}
 }
 
 // SetID implements the DescriptorProto interface.
@@ -2031,4 +2341,14 @@ func (desc *ColumnDescriptor) SQLString() string {
 		fmt.Fprintf(&buf, " DEFAULT %s", *desc.DefaultExpr)
 	}
 	return buf.String()
+}
+
+// ForeignKeyReferenceActionValue allows the conversion between a
+// parser.ReferenceAction and a ForeignKeyReference_Action.
+var ForeignKeyReferenceActionValue = [...]ForeignKeyReference_Action{
+	parser.NoAction:   ForeignKeyReference_NO_ACTION,
+	parser.Restrict:   ForeignKeyReference_RESTRICT,
+	parser.SetDefault: ForeignKeyReference_SET_DEFAULT,
+	parser.SetNull:    ForeignKeyReference_SET_NULL,
+	parser.Cascade:    ForeignKeyReference_CASCADE,
 }

@@ -11,23 +11,28 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
 	"fmt"
+	"sync"
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/pkg/errors"
 )
+
+var updateNodePool = sync.Pool{
+	New: func() interface{} {
+		return &updateNode{}
+	},
+}
 
 // editNode (Base, Run) is shared between all row updating
 // statements (DELETE, UPDATE, INSERT).
@@ -76,13 +81,14 @@ func (r *editNodeRun) initEditNode(
 	en *editNodeBase,
 	rows planNode,
 	tw tableWriter,
+	tn *parser.TableName,
 	re parser.ReturningClause,
 	desiredTypes []parser.Type,
 ) error {
 	r.rows = rows
 	r.tw = tw
 
-	rh, err := en.p.newReturningHelper(ctx, re, desiredTypes, en.tableDesc.Name, en.tableDesc.Columns)
+	rh, err := en.p.newReturningHelper(ctx, re, desiredTypes, tn, en.tableDesc.Columns)
 	if err != nil {
 		return err
 	}
@@ -91,7 +97,7 @@ func (r *editNodeRun) initEditNode(
 	return nil
 }
 
-func (r *editNodeRun) startEditNode(ctx context.Context, en *editNodeBase) error {
+func (r *editNodeRun) startEditNode(params runParams, en *editNodeBase) error {
 	if sqlbase.IsSystemConfigID(en.tableDesc.GetID()) {
 		// Mark transaction as operating on the system DB.
 		if err := en.p.txn.SetSystemConfigTrigger(); err != nil {
@@ -99,28 +105,7 @@ func (r *editNodeRun) startEditNode(ctx context.Context, en *editNodeBase) error
 		}
 	}
 
-	return r.rows.Start(ctx)
-}
-
-func (r *editNodeRun) collectSpans(ctx context.Context) (reads, writes roachpb.Spans, err error) {
-	scanReads, scanWrites, err := collectSpans(ctx, r.rows)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(scanWrites) > 0 {
-		return nil, nil, errors.Errorf("unexpected scan span writes: %v", scanWrites)
-	}
-	// TODO(nvanbenschoten): if we notice that r.rows is a ValuesClause, we
-	// may be able to contrain the tableWriter Spans.
-	writerReads, writerWrites, err := r.tw.spans()
-	if err != nil {
-		return nil, nil, err
-	}
-	sqReads, err := collectSubquerySpans(ctx, r.rows)
-	if err != nil {
-		return nil, nil, err
-	}
-	return append(scanReads, append(writerReads, sqReads...)...), writerWrites, nil
+	return r.rows.Start(params)
 }
 
 type updateNode struct {
@@ -217,10 +202,13 @@ func addOrMergeExpr(
 // Privileges: UPDATE and SELECT on table. We currently always use a select statement.
 //   Notes: postgres requires UPDATE. Requires SELECT with WHERE clause with table.
 //          mysql requires UPDATE. Also requires SELECT with WHERE clause with table.
-// TODO(guanqun): need to support CHECK in UPDATE
 func (p *planner) Update(
 	ctx context.Context, n *parser.Update, desiredTypes []parser.Type,
 ) (planNode, error) {
+	if n.Where == nil && p.session.SafeUpdates {
+		return nil, pgerror.NewDangerousStatementErrorf("UPDATE without WHERE clause")
+	}
+
 	tracing.AnnotateTrace()
 
 	tn, err := p.getAliasedTableName(n.Table)
@@ -270,7 +258,8 @@ func (p *planner) Update(
 	if err := p.fillFKTableMap(ctx, fkTables); err != nil {
 		return nil, err
 	}
-	ru, err := sqlbase.MakeRowUpdater(p.txn, en.tableDesc, fkTables, updateCols, requestedCols, sqlbase.RowUpdaterDefault)
+	ru, err := sqlbase.MakeRowUpdater(p.txn, en.tableDesc, fkTables, updateCols,
+		requestedCols, sqlbase.RowUpdaterDefault, &p.alloc)
 	if err != nil {
 		return nil, err
 	}
@@ -372,7 +361,8 @@ func (p *planner) Update(
 		updateColsIdx[col.ID] = i
 	}
 
-	un := &updateNode{
+	un := updateNodePool.Get().(*updateNode)
+	*un = updateNode{
 		n:             n,
 		editNodeBase:  en,
 		updateCols:    ru.UpdateCols,
@@ -384,29 +374,35 @@ func (p *planner) Update(
 		return nil, err
 	}
 	if err := un.run.initEditNode(
-		ctx, &un.editNodeBase, rows, &un.tw, n.Returning, desiredTypes); err != nil {
+		ctx, &un.editNodeBase, rows, &un.tw, tn, n.Returning, desiredTypes); err != nil {
 		return nil, err
 	}
 	return un, nil
 }
 
-func (u *updateNode) Start(ctx context.Context) error {
-	if err := u.run.startEditNode(ctx, &u.editNodeBase); err != nil {
+func (u *updateNode) Start(params runParams) error {
+	if err := u.run.startEditNode(params, &u.editNodeBase); err != nil {
 		return err
 	}
-	return u.run.tw.init(u.p.txn)
+	return u.run.tw.init(params.p.txn)
 }
 
 func (u *updateNode) Close(ctx context.Context) {
 	u.run.rows.Close(ctx)
+	u.tw.close(ctx)
+	*u = updateNode{}
+	updateNodePool.Put(u)
 }
 
-func (u *updateNode) Next(ctx context.Context) (bool, error) {
-	next, err := u.run.rows.Next(ctx)
+func (u *updateNode) Next(params runParams) (bool, error) {
+	next, err := u.run.rows.Next(params)
 	if !next {
 		if err == nil {
+			if err := params.p.cancelChecker.Check(); err != nil {
+				return false, err
+			}
 			// We're done. Finish the batch.
-			err = u.tw.finalize(ctx, u.p.session.Tracing.KVTracingEnabled())
+			_, err = u.tw.finalize(params.ctx, params.p.session.Tracing.KVTracingEnabled())
 		}
 		return false, err
 	}
@@ -435,7 +431,7 @@ func (u *updateNode) Next(ctx context.Context) (bool, error) {
 	if err := u.checkHelper.loadRow(u.updateColsIdx, updateValues, true); err != nil {
 		return false, err
 	}
-	if err := u.checkHelper.check(&u.p.evalCtx); err != nil {
+	if err := u.checkHelper.check(&params.p.evalCtx); err != nil {
 		return false, err
 	}
 
@@ -455,7 +451,7 @@ func (u *updateNode) Next(ctx context.Context) (bool, error) {
 
 	// Update the row values.
 	newValues, err := u.tw.row(
-		ctx, append(oldValues, updateValues...), u.p.session.Tracing.KVTracingEnabled(),
+		params.ctx, append(oldValues, updateValues...), params.p.session.Tracing.KVTracingEnabled(),
 	)
 	if err != nil {
 		return false, err

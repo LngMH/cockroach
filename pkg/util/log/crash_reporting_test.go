@@ -14,23 +14,85 @@
 
 package log
 
-import "testing"
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"syscall"
+	"testing"
+	"time"
 
-func TestCrashReportingFormatSave(t *testing.T) {
-	r1 := "i am hidden"
-	r2 := Safe{V: "i am public"}
-	r3 := Safe{V: &r2}
-	f1, f2, f3 := format(r1), format(r2), format(r3)
-	exp1, exp2 := "string", r2.V.(string)
-	exp3 := "&{V:i am public}"
-	if f1 != exp1 {
-		t.Errorf("wanted %s, got %s", exp1, f1)
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
+	"golang.org/x/net/context"
+)
+
+func TestCrashReportingSafeError(t *testing.T) {
+	type testCase struct {
+		format  string
+		rs      []interface{}
+		expType string
+		expErr  string
 	}
-	if f2 != exp2 {
-		t.Errorf("wanted %s, got %s", exp2, f2)
+
+	runtimeErr := &runtime.TypeAssertionError{}
+
+	testCases := []testCase{
+		{
+			// Intended result of panic(context.DeadlineExceeded). Note that this is a known sentinel
+			// error.
+			format: "", rs: []interface{}{context.DeadlineExceeded},
+			expType: "context.deadlineExceededError", expErr: "context deadline exceeded",
+		},
+		{
+			// Intended result of panic(runtimeErr) which exhibits special case of known safe error.
+			format: "", rs: []interface{}{runtimeErr},
+			expType: "*runtime.TypeAssertionError", expErr: "interface conversion: interface is nil, not ",
+		},
+		{
+			// Same as last, but skipping through to the cause: panic(errors.Wrap(safeErr, "gibberish")).
+			format: "", rs: []interface{}{errors.Wrap(runtimeErr, "unseen")},
+			expType: "*runtime.TypeAssertionError", expErr: "interface conversion: interface is nil, not ",
+		},
+		{
+			// Special-casing switched off when format string present.
+			format: "%s", rs: []interface{}{runtimeErr},
+			expType: "*log.safeError", expErr: "?:0: %s | <*runtime.TypeAssertionError>: interface conversion: interface is nil, not ",
+		},
+		{
+			// Special-casing switched off when more than one reportable present.
+			format: "", rs: []interface{}{runtimeErr, "foo"},
+			expType: "*log.safeError", expErr: "?:0: <*runtime.TypeAssertionError>: interface conversion: interface is nil, not ; <string>",
+		},
+		{
+			format: "I like %s and %q and my pin code is %d", rs: []interface{}{Safe("A"), &SafeType{V: "B"}, 1234},
+			expType: "*log.safeError", expErr: "?:0: I like %s and %q and my pin code is %d | A; B; <int>",
+		},
+		{
+			format: "outer %+v", rs: []interface{}{
+				errors.Wrapf(context.Canceled, "this will unfortunately be lost: %d", Safe(6)),
+			},
+			expType: "*log.safeError", expErr: "?:0: outer %+v | <*errors.withStack>: <redacted>: caused by <redacted>: caused by context canceled",
+		},
+		{
+			format: "", rs: []interface{}{os.NewSyscallError("write", syscall.ENOSPC)},
+			expType: "*os.SyscallError", expErr: "write: no space left on device",
+		},
 	}
-	if f3 != exp3 {
-		t.Errorf("wanted %s, got %s", exp3, f3)
+
+	for _, test := range testCases {
+		t.Run("", func(t *testing.T) {
+			err := reportablesToSafeError(0, test.format, test.rs)
+			if err == nil {
+				t.Fatal(err)
+			}
+			if typStr := fmt.Sprintf("%T", err); typStr != test.expType {
+				t.Errorf("expected %s, got %s", test.expType, typStr)
+			}
+			if errStr := err.Error(); errStr != test.expErr {
+				t.Errorf("expected %q, got %q", test.expErr, errStr)
+			}
+		})
 	}
 }
 
@@ -38,4 +100,37 @@ func TestingSetCrashReportingURL(url string) func() {
 	oldCrashReportURL := crashReportURL
 	crashReportURL = url
 	return func() { crashReportURL = oldCrashReportURL }
+}
+
+func TestUptimeTag(t *testing.T) {
+	startTime = timeutil.Unix(0, 0)
+	testCases := []struct {
+		crashTime time.Time
+		expected  string
+	}{
+		{timeutil.Unix(0, 0), "<1s"},
+		{timeutil.Unix(0, 0), "<1s"},
+		{timeutil.Unix(1, 0), "<10s"},
+		{timeutil.Unix(9, 0), "<10s"},
+		{timeutil.Unix(10, 0), "<1m"},
+		{timeutil.Unix(59, 0), "<1m"},
+		{timeutil.Unix(60, 0), "<10m"},
+		{timeutil.Unix(9*60, 0), "<10m"},
+		{timeutil.Unix(10*60, 0), "<1h"},
+		{timeutil.Unix(59*60, 0), "<1h"},
+		{timeutil.Unix(60*60, 0), "<10h"},
+		{timeutil.Unix(9*60*60, 0), "<10h"},
+		{timeutil.Unix(10*60*60, 0), "<1d"},
+		{timeutil.Unix(23*60*60, 0), "<1d"},
+		{timeutil.Unix(24*60*60, 0), "<2d"},
+		{timeutil.Unix(47*60*60, 0), "<2d"},
+		{timeutil.Unix(119*60*60, 0), "<5d"},
+		{timeutil.Unix(10*24*60*60, 0), "<11d"},
+		{timeutil.Unix(365*24*60*60, 0), "<366d"},
+	}
+	for _, tc := range testCases {
+		if a, e := uptimeTag(tc.crashTime), tc.expected; a != e {
+			t.Errorf("uptimeTag(%v) got %v, want %v)", tc.crashTime, a, e)
+		}
+	}
 }

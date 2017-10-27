@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf
 
 package roachpb
 
@@ -22,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
@@ -58,6 +57,7 @@ func (ba *BatchRequest) UpdateTxn(otherTxn *Transaction) {
 	if otherTxn == nil {
 		return
 	}
+	otherTxn.AssertInitialized(context.TODO())
 	if ba.Txn == nil {
 		ba.Txn = otherTxn
 		return
@@ -136,6 +136,16 @@ func (ba *BatchRequest) IsSinglePushTxnRequest() bool {
 func (ba *BatchRequest) IsSingleQueryTxnRequest() bool {
 	if ba.IsSingleRequest() {
 		_, ok := ba.Requests[0].GetInner().(*QueryTxnRequest)
+		return ok
+	}
+	return false
+}
+
+// IsSingleEndTransactionRequest returns true iff the batch contains a single
+// request, and that request is an EndTransactionRequest.
+func (ba *BatchRequest) IsSingleEndTransactionRequest() bool {
+	if ba.IsSingleRequest() {
+		_, ok := ba.Requests[0].GetInner().(*EndTransactionRequest)
 		return ok
 	}
 	return false
@@ -251,7 +261,6 @@ func (br *BatchResponse) Combine(otherBatch *BatchResponse, positions []int) err
 		}
 	}
 	br.Txn.Update(otherBatch.Txn)
-	br.CollectedSpans = append(br.CollectedSpans, otherBatch.CollectedSpans...)
 	return nil
 }
 

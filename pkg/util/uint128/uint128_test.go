@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tristan Ohlson (tsohlson@gmail.com)
 
 package uint128
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -28,6 +27,36 @@ func TestBytes(t *testing.T) {
 
 	if !bytes.Equal(i.GetBytes(), b) {
 		t.Errorf("incorrect bytes representation for num: %v", i)
+	}
+}
+
+func TestString(t *testing.T) {
+	s := "a95e31998f38490651c02b97c7f2acca"
+
+	i, _ := FromString(s)
+
+	if s != i.String() {
+		t.Errorf("incorrect string representation for num: %v", i)
+	}
+}
+
+func TestStringTooLong(t *testing.T) {
+	s := "ba95e31998f38490651c02b97c7f2acca"
+
+	_, err := FromString(s)
+
+	if err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Error("did not get error for encoding invalid uint128 string")
+	}
+}
+
+func TestStringInvalidHex(t *testing.T) {
+	s := "bazz95e31998849051c02b97c7f2acca"
+
+	_, err := FromString(s)
+
+	if err == nil || !strings.Contains(err.Error(), "could not decode") {
+		t.Error("did not get error for encoding invalid uint128 string")
 	}
 }
 
@@ -69,6 +98,29 @@ func TestAdd(t *testing.T) {
 		res := test.num.Add(test.add)
 		if res != test.expected {
 			t.Errorf("expected: %v + %d = %v but got %v", test.num, test.add, test.expected, res)
+		}
+	}
+}
+
+func TestEqual(t *testing.T) {
+	testData := []struct {
+		u1       Uint128
+		u2       Uint128
+		expected bool
+	}{
+		{Uint128{0, 0}, Uint128{0, 1}, false},
+		{Uint128{1, 0}, Uint128{0, 1}, false},
+		{Uint128{18446744073709551615, 18446744073709551614}, Uint128{18446744073709551615, 18446744073709551615}, false},
+		{Uint128{0, 1}, Uint128{0, 1}, true},
+		{Uint128{0, 0}, Uint128{0, 0}, true},
+		{Uint128{314, 0}, Uint128{314, 0}, true},
+		{Uint128{18446744073709551615, 18446744073709551615}, Uint128{18446744073709551615, 18446744073709551615}, true},
+	}
+
+	for _, test := range testData {
+
+		if actual := test.u1.Equal(test.u2); actual != test.expected {
+			t.Errorf("expected: %v.Equal(%v) expected %v but got %v", test.u1, test.u2, test.expected, actual)
 		}
 	}
 }

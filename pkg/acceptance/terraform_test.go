@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package acceptance
 
@@ -38,7 +36,11 @@ func TestBuildBabyCluster(t *testing.T) {
 
 	ctx := context.Background()
 	f := MakeFarmer(t, "baby", stopper)
-	defer f.CollectLogs()
+	defer func() {
+		if err := f.CollectLogs(); err != nil {
+			t.Logf("error collecting cluster logs: %s\n", err)
+		}
+	}()
 	if err := f.Resize(1); err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +68,15 @@ func TestFiveNodesAndWriters(t *testing.T) {
 	assertClusterUp := func() {
 		f.Assert(ctx, t)
 		for i := 0; i < f.NumNodes(); i++ {
-			f.AssertState(ctx, t, f.Hostname(i), "block_writer", "RUNNING")
+			if ch := f.GetProcDone(i, "block_writer"); ch == nil {
+				t.Fatalf("block writer not running on node %d", i)
+			} else {
+				select {
+				case err := <-ch:
+					t.Fatalf("block writer exited on node %d: %s", i, err)
+				default:
+				}
+			}
 		}
 	}
 
@@ -83,7 +93,9 @@ func TestFiveNodesAndWriters(t *testing.T) {
 	if err := f.WaitReady(3 * time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	CheckGossip(ctx, t, f, longWaitTime, HasPeers(size))
+	if err := CheckGossip(ctx, f, longWaitTime, HasPeers(size)); err != nil {
+		t.Fatal(err)
+	}
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)

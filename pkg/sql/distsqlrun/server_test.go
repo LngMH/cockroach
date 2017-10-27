@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
@@ -24,6 +22,8 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -61,7 +61,9 @@ func TestServer(t *testing.T) {
 		OutputColumns: []uint32{0, 1}, // a
 	}
 
-	req := &SetupFlowRequest{Version: Version}
+	txn := client.NewTxn(kvDB, s.NodeID())
+
+	req := &SetupFlowRequest{Version: Version, Txn: *txn.Proto()}
 	req.Flow = FlowSpec{
 		Processors: []ProcessorSpec{{
 			Core: ProcessorCoreUnion{TableReader: &ts},
@@ -102,7 +104,7 @@ func TestServer(t *testing.T) {
 	if len(metas) != 0 {
 		t.Errorf("unexpected metadata: %v", metas)
 	}
-	str := rows.String()
+	str := rows.String(twoIntCols)
 	expected := "[[1 10] [3 30]]"
 	if str != expected {
 		t.Errorf("invalid results: %s, expected %s'", str, expected)
@@ -111,7 +113,7 @@ func TestServer(t *testing.T) {
 	// Verify version handling.
 	t.Run("version", func(t *testing.T) {
 		testCases := []struct {
-			version     uint32
+			version     DistSQLVersion
 			expectedErr string
 		}{
 			{
@@ -119,7 +121,7 @@ func TestServer(t *testing.T) {
 				expectedErr: "version mismatch",
 			},
 			{
-				version:     Version - 1,
+				version:     MinAcceptedVersion - 1,
 				expectedErr: "version mismatch",
 			},
 			{
@@ -145,4 +147,24 @@ func TestServer(t *testing.T) {
 			})
 		}
 	})
+}
+
+// Test that a node gossips its DistSQL version information.
+func TestDistSQLServerGossipsVersion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	var v DistSQLVersionGossipInfo
+	if err := s.Gossip().GetInfoProto(
+		gossip.MakeDistSQLNodeVersionKey(s.NodeID()), &v,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if v.Version != Version || v.MinAcceptedVersion != MinAcceptedVersion {
+		t.Fatalf("node is gossipping the wrong version. Expected: [%d-%d], got [%d-%d",
+			Version, MinAcceptedVersion, v.Version, v.MinAcceptedVersion)
+	}
 }

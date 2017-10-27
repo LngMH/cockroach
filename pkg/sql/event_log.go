@@ -12,8 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package sql
 
@@ -61,12 +59,24 @@ const (
 	// EventLogFinishSchemaChange is recorded when a previously initiated schema
 	// change has completed.
 	EventLogFinishSchemaChange EventLogType = "finish_schema_change"
+	// EventLogFinishSchemaRollback is recorded when a previously
+	// initiated schema change rollback has completed.
+	EventLogFinishSchemaRollback EventLogType = "finish_schema_change_rollback"
 
 	// EventLogNodeJoin is recorded when a node joins the cluster.
 	EventLogNodeJoin EventLogType = "node_join"
 	// EventLogNodeRestart is recorded when an existing node rejoins the cluster
 	// after being offline.
 	EventLogNodeRestart EventLogType = "node_restart"
+	// EventLogNodeDecommissioned is recorded when a node is marked as
+	// decommissioning.
+	EventLogNodeDecommissioned EventLogType = "node_decommissioned"
+	// EventLogNodeRecommissioned is recorded when a decommissioned node is
+	// recommissioned.
+	EventLogNodeRecommissioned EventLogType = "node_recommissioned"
+
+	// EventLogSetClusterSetting is recorded when a cluster setting is changed.
+	EventLogSetClusterSetting EventLogType = "set_cluster_setting"
 )
 
 // An EventLogger exposes methods used to record events to the event table.
@@ -103,7 +113,7 @@ func (ev EventLogger) InsertEventRecord(
 
 	const insertEventTableStmt = `
 INSERT INTO system.eventlog (
-  timestamp, eventType, targetID, reportingID, info
+  timestamp, "eventType", "targetID", "reportingID", info
 )
 VALUES(
   now(), $1, $2, $3, $4

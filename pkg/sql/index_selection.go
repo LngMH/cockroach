@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
@@ -21,6 +19,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -28,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
 )
 
 const nonCoveringIndexPenalty = 10
@@ -64,7 +62,7 @@ const nonCoveringIndexPenalty = 10
 //    matchingCols is 1.
 //  - the bac index, along with the fact that b is constrained to a single
 //    value, matches the desired ordering; matchingCols is 2.
-type analyzeOrderingFn func(indexOrdering orderingInfo) (matchingCols, totalCols int)
+type analyzeOrderingFn func(indexProps physicalProps) (matchingCols, totalCols int)
 
 // selectIndex analyzes the scanNode to determine if there is an index
 // available that can fulfill the query with a more restrictive scan.
@@ -94,7 +92,7 @@ func (p *planner) selectIndex(
 		// No where-clause, no ordering, and no specified index.
 		s.initOrdering(0)
 		var err error
-		s.spans, err = makeSpans(nil, &s.desc, s.index)
+		s.spans, err = makeSpans(nil, s.desc, s.index)
 		if err != nil {
 			return nil, errors.Wrapf(err, "table ID = %d, index ID = %d", s.desc.ID, s.index.ID)
 		}
@@ -106,17 +104,17 @@ func (p *planner) selectIndex(
 		// An explicit secondary index was requested. Only add it to the candidate
 		// indexes list.
 		candidates = append(candidates, &indexInfo{
-			desc:  &s.desc,
+			desc:  s.desc,
 			index: s.specifiedIndex,
 		})
 	} else {
 		candidates = append(candidates, &indexInfo{
-			desc:  &s.desc,
+			desc:  s.desc,
 			index: &s.desc.PrimaryIndex,
 		})
 		for i := range s.desc.Indexes {
 			candidates = append(candidates, &indexInfo{
-				desc:  &s.desc,
+				desc:  s.desc,
 				index: &s.desc.Indexes[i],
 			})
 		}
@@ -138,7 +136,7 @@ func (p *planner) selectIndex(
 		if len(exprs) == 1 && len(exprs[0]) == 1 {
 			if d, ok := exprs[0][0].(*parser.DBool); ok && bool(!*d) {
 				// The expression simplified to false.
-				return &emptyNode{}, nil
+				return &zeroNode{}, nil
 			}
 		}
 
@@ -191,8 +189,11 @@ func (p *planner) selectIndex(
 		}
 	}
 
-	if analyzeOrdering != nil {
-		for _, c := range candidates {
+	for _, c := range candidates {
+		// Compute the prefix of the index for which we have exact constraints. This
+		// prefix is inconsequential for ordering because the values are identical.
+		c.exactPrefix = c.constraints.exactPrefix(&s.p.evalCtx)
+		if analyzeOrdering != nil {
 			c.analyzeOrdering(ctx, s, analyzeOrdering, preferOrderMatching)
 		}
 	}
@@ -220,9 +221,10 @@ func (p *planner) selectIndex(
 	}
 	if len(s.spans) == 0 {
 		// There are no spans to scan.
-		return &emptyNode{}, nil
+		return &zeroNode{}, nil
 	}
 
+	s.origFilter = s.filter
 	s.filter = applyIndexConstraints(&p.evalCtx, s.filter, c.constraints)
 	if s.filter != nil {
 		// Constraint propagation may have produced new constant sub-expressions.
@@ -233,12 +235,13 @@ func (p *planner) selectIndex(
 			return nil, err
 		}
 		if s.filter == parser.DBoolFalse {
-			return &emptyNode{}, nil
+			return &zeroNode{}, nil
 		}
 		if s.filter == parser.DBoolTrue {
 			s.filter = nil
 		}
 	}
+	s.filterVars.Rebind(s.filter, true, false)
 
 	s.reverse = c.reverse
 
@@ -409,15 +412,11 @@ func (v *indexInfo) analyzeExprs(exprs []parser.TypedExprs) {
 func (v *indexInfo) analyzeOrdering(
 	ctx context.Context, scan *scanNode, analyzeOrdering analyzeOrderingFn, preferOrderMatching bool,
 ) {
-	// Compute the prefix of the index for which we have exact constraints. This
-	// prefix is inconsequential for ordering because the values are identical.
-	v.exactPrefix = v.constraints.exactPrefix(&scan.p.evalCtx)
-
 	// Analyze the ordering provided by the index (either forward or reverse).
-	fwdIndexOrdering := scan.computeOrdering(v.index, v.exactPrefix, false)
-	revIndexOrdering := scan.computeOrdering(v.index, v.exactPrefix, true)
-	fwdMatch, fwdOrderCols := analyzeOrdering(fwdIndexOrdering)
-	revMatch, revOrderCols := analyzeOrdering(revIndexOrdering)
+	fwdIndexProps := scan.computePhysicalProps(v.index, v.exactPrefix, false)
+	revIndexProps := scan.computePhysicalProps(v.index, v.exactPrefix, true)
+	fwdMatch, fwdOrderCols := analyzeOrdering(fwdIndexProps)
+	revMatch, revOrderCols := analyzeOrdering(revIndexProps)
 
 	if fwdOrderCols != revOrderCols {
 		panic(fmt.Sprintf("fwdOrderCols(%d) != revOrderCols(%d)", fwdOrderCols, revOrderCols))

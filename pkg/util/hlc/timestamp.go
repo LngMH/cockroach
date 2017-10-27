@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package hlc
 
@@ -20,6 +18,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // Timestamp constant values.
@@ -39,6 +39,15 @@ func (t Timestamp) String() string {
 	return fmt.Sprintf("%d.%09d,%d", t.WallTime/1E9, t.WallTime%1E9, t.Logical)
 }
 
+// Less compares two timestamps.
+func (t LegacyTimestamp) Less(s LegacyTimestamp) bool {
+	return Timestamp(t).Less(Timestamp(s))
+}
+
+func (t LegacyTimestamp) String() string {
+	return Timestamp(t).String()
+}
+
 // Add returns a timestamp with the WallTime and Logical components increased.
 // wallTime is expressed in nanos.
 func (t Timestamp) Add(wallTime int64, logical int32) Timestamp {
@@ -46,6 +55,11 @@ func (t Timestamp) Add(wallTime int64, logical int32) Timestamp {
 		WallTime: t.WallTime + wallTime,
 		Logical:  t.Logical + logical,
 	}
+}
+
+// Clone return a new timestamp that has the same contents as the receiver.
+func (t Timestamp) Clone() *Timestamp {
+	return &t
 }
 
 // Next returns the timestamp with the next later timestamp.
@@ -100,5 +114,5 @@ func (t *Timestamp) Backward(s Timestamp) {
 
 // GoTime converts the timestamp to a time.Time.
 func (t Timestamp) GoTime() time.Time {
-	return time.Unix(0, t.WallTime)
+	return timeutil.Unix(0, t.WallTime)
 }

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package sql
 
@@ -69,7 +67,7 @@ func (p *planner) changePrivileges(
 	if err := p.txn.Run(ctx, b); err != nil {
 		return nil, err
 	}
-	return &emptyNode{}, nil
+	return &zeroNode{}, nil
 }
 
 // Grant adds privileges to users.

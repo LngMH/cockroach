@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@gmail.com)
 
 package rsg
 
@@ -26,7 +24,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/rsg/yacc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -210,7 +210,7 @@ func (r *RSG) Float64() float64 {
 }
 
 // GenerateRandomArg generates a random, valid, SQL function argument of
-// the spcified type.
+// the specified type.
 func (r *RSG) GenerateRandomArg(typ parser.Type) string {
 	if r.Intn(10) == 0 {
 		return "NULL"
@@ -226,7 +226,7 @@ func (r *RSG) GenerateRandomArg(typ parser.Type) string {
 	case parser.TypeBytes:
 		v = fmt.Sprintf("b%s", stringArgs[r.Intn(len(stringArgs))])
 	case parser.TypeTimestamp, parser.TypeTimestampTZ:
-		t := time.Unix(0, r.Int63())
+		t := timeutil.Unix(0, r.Int63())
 		v = fmt.Sprintf(`'%s'`, t.Format(time.RFC3339Nano))
 	case parser.TypeBool:
 		v = boolArgs[r.Intn(2)]
@@ -241,9 +241,12 @@ func (r *RSG) GenerateRandomArg(typ parser.Type) string {
 	case parser.TypeUUID:
 		u := uuid.MakeV4()
 		v = fmt.Sprintf(`'%s'`, u)
-	case parser.TypeIntArray,
-		parser.TypeStringArray,
-		parser.TypeOid,
+	case parser.TypeINet:
+		r.lock.Lock()
+		ipAddr := ipaddr.RandIPAddr(r.src)
+		r.lock.Unlock()
+		v = fmt.Sprintf(`'%s'`, ipAddr)
+	case parser.TypeOid,
 		parser.TypeRegClass,
 		parser.TypeRegNamespace,
 		parser.TypeRegProc,
@@ -253,8 +256,10 @@ func (r *RSG) GenerateRandomArg(typ parser.Type) string {
 		parser.TypeAny:
 		v = "NULL"
 	default:
-		switch typ.(type) {
-		case parser.TTuple:
+		// Check types that can't be compared using equality
+		switch parser.UnwrapType(typ).(type) {
+		case parser.TTuple,
+			parser.TArray:
 			v = "NULL"
 		default:
 			panic(fmt.Errorf("unknown arg type: %s (%T)", typ, typ))

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package main
 
@@ -52,6 +50,7 @@ var libsRe = func() *regexp.Regexp {
 		regexp.QuoteMeta("librt.so."),
 		regexp.QuoteMeta("libpthread.so."),
 		regexp.QuoteMeta("libdl.so."),
+		regexp.QuoteMeta("libtinfo.so."),
 		regexp.QuoteMeta("libm.so."),
 		regexp.QuoteMeta("libc.so."),
 		strings.Replace(regexp.QuoteMeta("ld-linux-ARCH.so."), "ARCH", ".*", -1),
@@ -214,10 +213,6 @@ func main() {
 
 			{
 				recipe := "build"
-				// TODO(tamird, #14673): make CCL compile on Windows.
-				if strings.HasSuffix(target.buildType, "windows") {
-					recipe = "buildoss"
-				}
 				args := []string{recipe}
 				args = append(args, fmt.Sprintf("%s=%s", "TYPE", target.buildType))
 				args = append(args, fmt.Sprintf("%s=%s", "GOFLAGS", extraArgs.goflags))

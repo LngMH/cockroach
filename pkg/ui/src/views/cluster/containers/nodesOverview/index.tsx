@@ -25,17 +25,21 @@ const deadNodesSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "nodes/dead_sort_setting", (s) => s.localSettings,
 );
 
+const decommissionedNodesSortSetting = new LocalSetting<AdminUIState, SortSetting>(
+  "nodes/decommissioned_sort_setting", (s) => s.localSettings,
+);
+
 // Specialization of generic SortedTable component:
 //   https://github.com/Microsoft/TypeScript/issues/3960
 //
-// The variable name must start with a capital letter or TSX will not recognize
+// The variable name must start with a capital letter or JSX will not recognize
 // it as a component.
 // tslint:disable-next-line:variable-name
 const NodeSortedTable = SortedTable as new () => SortedTable<NodeStatus$Properties>;
 
 /**
  * NodeCategoryListProps are the properties shared by both LiveNodeList and
- * DeadNodeList.
+ * NotLiveNodeList.
  */
 interface NodeCategoryListProps {
   sortSetting: SortSetting;
@@ -57,9 +61,9 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
     }
 
     return <div>
-      <div className="header header--subsection">
-        Live Nodes
-      </div>
+      <section className="section section--heading">
+        <h2>Live Nodes</h2>
+      </section>
       <section className="section">
         <NodeSortedTable
           data={statuses}
@@ -143,18 +147,28 @@ class LiveNodeList extends React.Component<NodeCategoryListProps, {}> {
 }
 
 /**
- * DeadNodeList renders a sortable table of all "dead" nodes on the cluster.
+ * NotLiveNodeListProps are the properties of NotLiveNodeList.
  */
-class DeadNodeList extends React.Component<NodeCategoryListProps, {}> {
+interface NotLiveNodeListProps extends NodeCategoryListProps {
+  status: LivenessStatus.DECOMMISSIONED | LivenessStatus.DEAD;
+}
+
+/**
+ * NotLiveNodeList renders a sortable table of all "dead" or "decommissioned"
+ * nodes on the cluster.
+ */
+class NotLiveNodeList extends React.Component<NotLiveNodeListProps, {}> {
   render() {
-    const { statuses, nodesSummary, sortSetting } = this.props;
+    const { status, statuses, nodesSummary, sortSetting } = this.props;
     if (!statuses || statuses.length === 0) {
       return null;
     }
 
+    const statusName = _.capitalize(LivenessStatus[status]);
+
     return <div>
-      <section className="header header--subsection">
-        Dead Nodes
+      <section className="section section--heading">
+        <h2>{`${statusName} Nodes`}</h2>
       </section>
       <section className="section">
         <NodeSortedTable
@@ -190,16 +204,20 @@ class DeadNodeList extends React.Component<NodeCategoryListProps, {}> {
               // construct the full BEM class in the table component itself.
               className: "sort-table__cell--link",
             },
-            // Down since - displays the time that the node started.
+            // Down/decommissioned since - displays how long the node has been
+            // considered dead.
             {
-              title: "Downtime",
+              title: `${statusName} Since`,
               cell: (ns) => {
                 const liveness = nodesSummary.livenessByNodeID[ns.desc.node_id];
                 const deadTime = liveness.expiration.wall_time;
                 const deadMoment = LongToMoment(deadTime);
-                return moment.duration(deadMoment.diff(moment())).humanize();
+                return `${moment.duration(deadMoment.diff(moment())).humanize()} ago`;
               },
-              sort: (ns) => ns.started_at,
+              sort: (ns) => {
+                const liveness = nodesSummary.livenessByNodeID[ns.desc.node_id];
+                return liveness.expiration.wall_time;
+              },
             },
           ]} />
       </section>
@@ -216,19 +234,26 @@ const nodeQueryValid = (state: AdminUIState): boolean => state.cachedData.nodes.
 const partitionedStatuses = createSelector(
   nodesSummarySelector,
   (summary) => {
-    const liveOrDead = _.partition(
+    return _.groupBy(
       summary.nodeStatuses,
-      (ns) => summary.livenessStatusByNodeID[ns.desc.node_id] !== LivenessStatus.DEAD,
+      (ns) => {
+        switch (summary.livenessStatusByNodeID[ns.desc.node_id]) {
+          case LivenessStatus.HEALTHY:
+          case LivenessStatus.SUSPECT:
+            return "live";
+          case LivenessStatus.DECOMMISSIONED:
+            return "decommissioned";
+          case LivenessStatus.DEAD:
+          default:
+            return "dead";
+        }
+      },
     );
-    return {
-      live: liveOrDead[0],
-      dead: liveOrDead[1],
-    };
   },
 );
 
 /**
- * LiveNodesConnected is a redux-connected HOC of LiveNodes.
+ * LiveNodesConnected is a redux-connected HOC of LiveNodeList.
  */
 // tslint:disable-next-line:variable-name
 const LiveNodesConnected = connect(
@@ -246,7 +271,7 @@ const LiveNodesConnected = connect(
 )(LiveNodeList);
 
 /**
- * DeadNodesConnected is a redux-connected HOC of DeadNodes.
+ * DeadNodesConnected is a redux-connected HOC of NotLiveNodeList.
  */
 // tslint:disable-next-line:variable-name
 const DeadNodesConnected = connect(
@@ -254,6 +279,7 @@ const DeadNodesConnected = connect(
     const statuses = partitionedStatuses(state);
     return {
       sortSetting: deadNodesSortSetting.selector(state),
+      status: LivenessStatus.DEAD,
       statuses: statuses.dead,
       nodesSummary: nodesSummarySelector(state),
     };
@@ -261,7 +287,26 @@ const DeadNodesConnected = connect(
   {
     setSort: deadNodesSortSetting.set,
   },
-)(DeadNodeList);
+)(NotLiveNodeList);
+
+/**
+ * DecommissionedNodesConnected is a redux-connected HOC of NotLiveNodeList.
+ */
+// tslint:disable-next-line:variable-name
+const DecommissionedNodesConnected = connect(
+  (state: AdminUIState) => {
+    const statuses = partitionedStatuses(state);
+    return {
+      sortSetting: decommissionedNodesSortSetting.selector(state),
+      status: LivenessStatus.DECOMMISSIONED,
+      statuses: statuses.decommissioned,
+      nodesSummary: nodesSummarySelector(state),
+    };
+  },
+  {
+    setSort: decommissionedNodesSortSetting.set,
+  },
+)(NotLiveNodeList);
 
 /**
  * NodesMainProps is the type of the props object that must be passed to
@@ -302,6 +347,7 @@ class NodesMain extends React.Component<NodesMainProps, {}> {
       </section>
       <LiveNodesConnected />
       <DeadNodesConnected />
+      <DecommissionedNodesConnected />
     </div>;
   }
 }

@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package distsqlrun
 
@@ -94,6 +91,17 @@ type RowReceiver interface {
 	ProducerDone()
 }
 
+// CancellableRowReceiver is a special type of a RowReceiver that can be set to
+// cancelled asynchronously (i.e. concurrently or after Push()es and ProducerDone()s).
+// Once cancelled, subsequent Push()es return ConsumerClosed. Implemented by distSQLReceiver
+// which is the final RowReceiver, and the origin point for propagation of ConsumerClosed
+// consumer statuses.
+type CancellableRowReceiver interface {
+	// SetCancelled sets this RowReceiver as cancelled. Subsequent Push()es (if any)
+	// return a ConsumerStatus of ConsumerClosed.
+	SetCancelled()
+}
+
 // RowSource is any component of a flow that produces rows that cam be consumed
 // by another component.
 type RowSource interface {
@@ -163,7 +171,8 @@ func DrainAndForwardMetadata(ctx context.Context, src RowSource, dst RowReceiver
 		}
 		if row != nil {
 			log.Fatalf(
-				ctx, "both row data and metadata in the same record. row: %s meta: %+v", row, meta,
+				ctx, "both row data and metadata in the same record. row: %s meta: %+v",
+				row.String(src.Types()), meta,
 			)
 		}
 
@@ -234,6 +243,11 @@ type NoMetadataRowSource struct {
 // MakeNoMetadataRowSource builds a NoMetadataRowSource.
 func MakeNoMetadataRowSource(src RowSource, sink RowReceiver) NoMetadataRowSource {
 	return NoMetadataRowSource{src: src, metadataSink: sink}
+}
+
+// Types returns the source types.
+func (rs *NoMetadataRowSource) Types() []sqlbase.ColumnType {
+	return rs.src.Types()
 }
 
 // NextRow is analogous to RowSource.Next. If the producer sends an error, we
@@ -509,24 +523,19 @@ type RowBufferArgs struct {
 	OnNext func(*RowBuffer) (sqlbase.EncDatumRow, ProducerMetadata)
 }
 
-// NewRowBuffer creates a RowBuffer with the given schema and initial rows. The
-// types are optional if there is at least one row.
+// NewRowBuffer creates a RowBuffer with the given schema and initial rows.
 func NewRowBuffer(
 	types []sqlbase.ColumnType, rows sqlbase.EncDatumRows, hooks RowBufferArgs,
 ) *RowBuffer {
+	if types == nil {
+		panic("types required")
+	}
 	wrappedRows := make([]BufferedRecord, len(rows))
 	for i, row := range rows {
 		wrappedRows[i].Row = row
 	}
 	rb := &RowBuffer{types: types, args: hooks}
 	rb.mu.records = wrappedRows
-
-	if len(rb.mu.records) > 0 && rb.types == nil {
-		rb.types = make([]sqlbase.ColumnType, len(rb.mu.records[0].Row))
-		for i, d := range rb.mu.records[0].Row {
-			rb.types[i] = d.Type
-		}
-	}
 	return rb
 }
 
@@ -570,7 +579,7 @@ func (rb *RowBuffer) ProducerDone() {
 // Types is part of the RowSource interface.
 func (rb *RowBuffer) Types() []sqlbase.ColumnType {
 	if rb.types == nil {
-		panic("not initialized with types")
+		panic("not initialized")
 	}
 	return rb.types
 }
@@ -597,7 +606,7 @@ func (rb *RowBuffer) Next() (sqlbase.EncDatumRow, ProducerMetadata) {
 
 // ConsumerDone is part of the RowSource interface.
 func (rb *RowBuffer) ConsumerDone() {
-	rb.ConsumerStatus = DrainRequested
+	atomic.StoreUint32((*uint32)(&rb.ConsumerStatus), uint32(DrainRequested))
 	if rb.args.OnConsumerDone != nil {
 		rb.args.OnConsumerDone(rb)
 	}
@@ -605,7 +614,7 @@ func (rb *RowBuffer) ConsumerDone() {
 
 // ConsumerClosed is part of the RowSource interface.
 func (rb *RowBuffer) ConsumerClosed() {
-	rb.ConsumerStatus = ConsumerClosed
+	atomic.StoreUint32((*uint32)(&rb.ConsumerStatus), uint32(ConsumerClosed))
 	if rb.args.OnConsumerClosed != nil {
 		rb.args.OnConsumerClosed(rb)
 	}

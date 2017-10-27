@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Daniel Harrison (daniel.harrison@gmail.com)
 
 package sql
 
@@ -36,6 +34,7 @@ var upsertExcludedTable = parser.TableName{TableName: "excluded"}
 type upsertHelper struct {
 	p                  *planner
 	evalExprs          []parser.TypedExpr
+	whereExpr          parser.TypedExpr
 	sourceInfo         *dataSourceInfo
 	excludedSourceInfo *dataSourceInfo
 	curSourceRow       parser.Datums
@@ -87,6 +86,7 @@ func (p *planner) makeUpsertHelper(
 	updateCols []sqlbase.ColumnDescriptor,
 	updateExprs parser.UpdateExprs,
 	upsertConflictIndex *sqlbase.IndexDescriptor,
+	whereClause *parser.Where,
 ) (*upsertHelper, error) {
 	defaultExprs, err := sqlbase.MakeDefaultExprs(updateCols, &p.parser, &p.evalCtx)
 	if err != nil {
@@ -137,6 +137,25 @@ func (p *planner) makeUpsertHelper(
 	}
 	helper.evalExprs = evalExprs
 
+	if whereClause != nil {
+		whereExpr, err := p.analyzeExpr(
+			ctx, whereClause.Expr, sources, ivarHelper, parser.TypeBool, true /* requireType */, "WHERE",
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		// Make sure there are no aggregation/window functions in the filter
+		// (after subqueries have been expanded).
+		if err := p.parser.AssertNoAggregationOrWindowing(
+			whereExpr, "WHERE", p.session.SearchPath,
+		); err != nil {
+			return nil, err
+		}
+
+		helper.whereExpr = whereExpr
+	}
+
 	return helper, nil
 }
 
@@ -163,6 +182,17 @@ func (uh *upsertHelper) eval(
 		}
 	}
 	return ret, nil
+}
+
+// shouldUpdate returns the result of evaluating the WHERE clause of the
+// ON CONFLICT ... DO UPDATE clause.
+func (uh *upsertHelper) shouldUpdate(
+	insertRow parser.Datums, existingRow parser.Datums,
+) (bool, error) {
+	uh.curSourceRow = existingRow
+	uh.curExcludedRow = insertRow
+
+	return sqlbase.RunFilter(uh.whereExpr, &uh.p.evalCtx)
 }
 
 // upsertExprsAndIndex returns the upsert conflict index and the (possibly
@@ -207,7 +237,7 @@ func upsertExprsAndIndex(
 			return false
 		}
 		for i, colName := range index.ColumnNames {
-			if parser.ReNormalizeName(colName) != onConflict.Columns[i].Normalize() {
+			if colName != string(onConflict.Columns[i]) {
 				return false
 			}
 		}

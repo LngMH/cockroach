@@ -36,7 +36,13 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Leaseholders per Store" tooltip={`The number of replicas on each store.`}>
+    <LineGraph
+      title="Leaseholders per Store"
+      tooltip={
+          `The number of leaseholder replicas on each store. A leaseholder replica is the one that
+          receives and coordinates all read and write requests for its range.`
+      }
+    >
       <Axis>
         {
           _.map(nodeIDs, (nid) => (
@@ -51,13 +57,13 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Live Bytes per Store" tooltip={`The number of live bytes of data on each store.`}>
+    <LineGraph title="Logical Bytes per Store" tooltip={`The number of logical bytes of data on each store.`}>
       <Axis units={AxisUnits.Bytes}>
         {
           _.map(nodeIDs, (nid) => (
             <Metric
               key={nid}
-              name="cr.store.livebytes"
+              name="cr.store.totalbytes"
               title={nodeAddress(nodesSummary, nid)}
               sources={storeIDsForNode(nodesSummary, nid)}
             />
@@ -81,7 +87,7 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Replicas" sources={storeSources}>
+    <LineGraph title="Replica Quiescence" sources={storeSources}>
       <Axis>
         <Metric name="cr.store.replicas" title="Replicas" />
         <Metric name="cr.store.replicas.quiescent" title="Quiescent" />

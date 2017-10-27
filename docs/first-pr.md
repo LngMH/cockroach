@@ -57,37 +57,36 @@ reviewing the style guide until you've written your first few functions in go.
 
 Here's what's in each top-level directory in this repository:
 
-  + **`build/`**  
+  + **`build/`**
     Build support scripts. You'll likely only need to
     interact with [build/builder.sh]. See ["Building on Linux"] below.
 
-  + **`c-deps/`**  
+  + **`c-deps/`**
     Glue to convince our build system to build non-Go dependencies. At the time
     of writing, "non-Go dependencies" means C or C++ dependencies. The most
     important of these is [RocksDB], our underlying persistent key-value store.
 
-  + **`cloud/`**  
-    Terraform and Kubernetes configuration to auto-launch CockroachDB clusters
-    on several popular cloud IaaS providers.
+  + **`cloud/kubernetes/`**
+    Kubernetes configuration to auto-launch CockroachDB clusters.
 
-  + **`docs/`**  
+  + **`docs/`**
     Documentation for CockroachDB developers. See ["Internal
     documentation"] below.
 
-  + **`monitoring/`**  
+  + **`monitoring/`**
     Configuration to integrate monitoring frameworks, namely Prometheus and
     Grafana, with CockroachDB. This configuration powers our internal monitoring
     dashboard as well.
 
-  + **`pkg/`**  
+  + **`pkg/`**
     First-party Go code. See ["Internal documentation"] below for details.
 
-  + **`scripts/`**  
+  + **`scripts/`**
     Handy shell scripts that aren't part of the build process. You'll likely
     interact with [scripts/azworker.sh] most, which spins up a personal Linux VM
     for you to develop on in the Azure cloud.
 
-  + **`vendor/`**  
+  + **`vendor/`**
     A Git submodule that contains the right version of our dependent libraries.
     For many years, the Go answer to dependency management was "write
     backwards-compatible code." That strategy is as dangerous as it sounds, so
@@ -214,15 +213,6 @@ OpenTracing/LightStep or point you at someone who can.
 You'll notice that all source files in this repository have a license
 notification at the top. Be sure to copy this license into any files that you
 create.
-
-At the end of a license block is a line that begins with `Author:`, followed by
-someone's name and email address. The "author" is somewhat of a misnomer—it
-should really be `Maintainer`. List yourself when you create a new file, so that
-people know who to contact with questions and who to CC on code reviews!
-
-Though many employees list their personal email in the `Author` comment, this is
-largely historic happenstance. New employees are encouraged to use their company
-email.
 
 ## When to submit
 
@@ -466,6 +456,15 @@ for [production-ready code].
 No one is expected to write perfect code on the first try. That's why we have
 code reviews in the first place!
 
+## By humans for humans
+
+Probably everyone has at some time had an unpleasant interaction during a code
+review, and with code reviews being [by humans for humans], one or both of these
+humans could be having a bad day. As if that weren't enough already, text-based
+communication is fraught with miscommunication. Consider being a [minimally nice maintainer]),
+reflect upon mistakes that will inevitably be made, and take inspiration from the
+constructive and friendly reviews that are the daily staple of our repository.
+
 ### Reviewable
 
 Except for the smallest of PRs, we eschew GitHub reviews in favor of a
@@ -554,7 +553,7 @@ These are the acronyms you'll frequently encounter during code reviews.
 * **TF[YT]R**, "thanks for your/the review"
 
 A list of even more Cockroach jargon lives on [this repository's wiki].
- 
+
 ### Merging
 
 *External contributors: you don't need to worry about this section. We'll merge
@@ -640,3 +639,5 @@ Here's a checklist of action items to keep you sane:
 [RocksDB]: http://rocksdb.org
 [STYLE.md]: /STYLE.md
 [this repository's wiki]: https://github.com/cockroachdb/cockroach/wiki/Jargon
+[by humans for humans]: https://mtlynch.io/human-code-reviews-1/
+[minimally nice maintainer]: https://brson.github.io/2017/04/05/minimally-nice-maintainer

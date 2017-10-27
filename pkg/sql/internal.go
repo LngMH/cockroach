@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package sql
 
@@ -45,7 +43,7 @@ func (ie InternalExecutor) ExecuteStatementInTransaction(
 ) (int, error) {
 	p := makeInternalPlanner(opName, txn, security.RootUser, ie.LeaseManager.memMetrics)
 	defer finishInternalPlanner(p)
-	p.session.tables.leaseMgr = ie.LeaseManager
+	ie.initSession(p)
 	return p.exec(ctx, statement, qargs...)
 }
 
@@ -57,8 +55,20 @@ func (ie InternalExecutor) QueryRowInTransaction(
 ) (parser.Datums, error) {
 	p := makeInternalPlanner(opName, txn, security.RootUser, ie.LeaseManager.memMetrics)
 	defer finishInternalPlanner(p)
-	p.session.tables.leaseMgr = ie.LeaseManager
+	ie.initSession(p)
 	return p.QueryRow(ctx, statement, qargs...)
+}
+
+// QueryRowsInTransaction executes the supplied SQL statement as part of the
+// supplied transaction and returns the resulting rows. Statements are currently
+// executed as the root user.
+func (ie InternalExecutor) QueryRowsInTransaction(
+	ctx context.Context, opName string, txn *client.Txn, statement string, qargs ...interface{},
+) ([]parser.Datums, error) {
+	p := makeInternalPlanner(opName, txn, security.RootUser, ie.LeaseManager.memMetrics)
+	defer finishInternalPlanner(p)
+	ie.initSession(p)
+	return p.queryRows(ctx, statement, qargs...)
 }
 
 // GetTableSpan gets the key span for a SQL table, including any indices.
@@ -68,7 +78,7 @@ func (ie InternalExecutor) GetTableSpan(
 	// Lookup the table ID.
 	p := makeInternalPlanner("get-table-span", txn, user, ie.LeaseManager.memMetrics)
 	defer finishInternalPlanner(p)
-	p.session.tables.leaseMgr = ie.LeaseManager
+	ie.initSession(p)
 
 	tn := parser.TableName{DatabaseName: parser.Name(dbName), TableName: parser.Name(tableName)}
 	tableID, err := getTableID(ctx, p, &tn)
@@ -81,6 +91,11 @@ func (ie InternalExecutor) GetTableSpan(
 	tableStartKey := roachpb.Key(tablePrefix)
 	tableEndKey := tableStartKey.PrefixEnd()
 	return roachpb.Span{Key: tableStartKey, EndKey: tableEndKey}, nil
+}
+
+func (ie InternalExecutor) initSession(p *planner) {
+	p.evalCtx.NodeID = ie.LeaseManager.LeaseStore.nodeID.Get()
+	p.session.tables.leaseMgr = ie.LeaseManager
 }
 
 // getTableID retrieves the table ID for the specified table.
@@ -97,7 +112,11 @@ func getTableID(ctx context.Context, p *planner, tn *parser.TableName) (sqlbase.
 		return virtual.GetID(), nil
 	}
 
-	dbID, err := p.session.tables.databaseCache.getDatabaseID(ctx, p.txn, p.getVirtualTabler(), tn.Database())
+	txnRunner := func(ctx context.Context, retryable func(ctx context.Context, txn *client.Txn) error) error {
+		return retryable(ctx, p.txn)
+	}
+
+	dbID, err := p.session.tables.databaseCache.getDatabaseID(ctx, txnRunner, p.getVirtualTabler(), tn.Database())
 	if err != nil {
 		return 0, err
 	}
@@ -109,7 +128,7 @@ func getTableID(ctx context.Context, p *planner, tn *parser.TableName) (sqlbase.
 		return 0, err
 	}
 	if !gr.Exists() {
-		return 0, sqlbase.NewUndefinedTableError(parser.AsString(tn))
+		return 0, sqlbase.NewUndefinedRelationError(tn)
 	}
 	return sqlbase.ID(gr.ValueInt()), nil
 }

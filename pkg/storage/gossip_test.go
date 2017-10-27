@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package storage_test
 
@@ -144,15 +142,15 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 	// the replaced node's leases to time out, but has still shown itself to be
 	// long enough to avoid flakes.
 	serverArgs := base.TestServerArgs{
-		Addr:                     util.IsolatedTestAddr.String(),
-		Insecure:                 true, // because our certs are only valid for 127.0.0.1
-		RaftTickInterval:         50 * time.Millisecond,
-		RaftElectionTimeoutTicks: 10,
+		Addr:     util.IsolatedTestAddr.String(),
+		Insecure: true, // because our certs are only valid for 127.0.0.1
 		RetryOptions: retry.Options{
 			InitialBackoff: 10 * time.Millisecond,
 			MaxBackoff:     50 * time.Millisecond,
 		},
 	}
+	serverArgs.RaftTickInterval = 50 * time.Millisecond
+	serverArgs.RaftElectionTimeoutTicks = 10
 
 	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
@@ -180,9 +178,8 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 	newServerArgs.JoinAddr = tc.Servers[1].ServingAddr()
 	log.Infof(ctx, "stopping server %d", oldNodeIdx)
 	tc.StopServer(oldNodeIdx)
-	if err := tc.AddServer(t, newServerArgs); err != nil {
-		t.Fatal(err)
-	}
+	tc.AddServer(t, newServerArgs)
+
 	tc.WaitForStores(t, tc.Server(1).Gossip())
 
 	// Ensure that all servers still running are responsive. If the two remaining

@@ -7,6 +7,7 @@ import * as api from "src/util/api";
 import { VersionList } from "src/interfaces/cockroachlabs";
 import { versionCheck } from "src/util/cockroachlabsAPI";
 import { NodeStatus$Properties, RollupStoreMetrics } from "src/util/proto";
+import * as protos from "src/js/protos";
 
 // The primary export of this file are the "refresh" functions of the various
 // reducers, which are used by many react components to request fresh data.
@@ -33,7 +34,7 @@ function rollupStoreMetrics(res: api.NodesResponseMessage): NodeStatus$Propertie
 export const nodesReducerObj = new CachedDataReducer((req: api.NodesRequestMessage, timeout?: moment.Duration) => api.getNodes(req, timeout).then(rollupStoreMetrics), "nodes", moment.duration(10, "s"));
 export const refreshNodes = nodesReducerObj.refresh;
 
-const raftReducerObj = new CachedDataReducer(api.raftDebug, "raft");
+const raftReducerObj = new CachedDataReducer(api.raftDebug, "raft", moment.duration(10, "s"));
 export const refreshRaft = raftReducerObj.refresh;
 
 export const versionReducerObj = new CachedDataReducer(versionCheck, "version");
@@ -67,13 +68,37 @@ export const refreshLogs = logsReducerObj.refresh;
 const livenessReducerObj = new CachedDataReducer(api.getLiveness, "liveness", moment.duration(10, "s"));
 export const refreshLiveness = livenessReducerObj.refresh;
 
+export const jobsKey = (status: string, type: protos.cockroach.sql.jobs.Type, limit: number) =>
+  `${encodeURIComponent(status)}/${encodeURIComponent(type.toString())}/${encodeURIComponent(limit.toString())}`;
+
+const jobsRequestKey = (req: api.JobsRequestMessage): string =>
+  jobsKey(req.status, req.type, req.limit);
+
+const jobsReducerObj = new KeyedCachedDataReducer(api.getJobs, "jobs", jobsRequestKey, moment.duration(10, "s"));
+export const refreshJobs = jobsReducerObj.refresh;
+
 export const queryToID = (req: api.QueryPlanRequestMessage): string => req.query;
 
 const queryPlanReducerObj = new CachedDataReducer(api.getQueryPlan, "queryPlan");
 export const refreshQueryPlan = queryPlanReducerObj.refresh;
 
-const problemRangesReducerObj = new CachedDataReducer(api.getProblemRanges, "problemRanges");
+const problemRangesReducerObj = new CachedDataReducer(api.getProblemRanges, "problemRanges", moment.duration(10, "s"));
 export const refreshProblemRanges = problemRangesReducerObj.refresh;
+
+const certificatesReducerObj = new CachedDataReducer(api.getCertificates, "certificates", moment.duration(10, "s"));
+export const refreshCertificates = certificatesReducerObj.refresh;
+
+const rangeReducerObj = new CachedDataReducer(api.getRange, "range", moment.duration(10, "s"));
+export const refreshRange = rangeReducerObj.refresh;
+
+const allocatorRangeReducerObj = new CachedDataReducer(api.getAllocatorRange, "allocatorRange", moment.duration(10, "s"));
+export const refreshAllocatorRange = allocatorRangeReducerObj.refresh;
+
+const rangeLogReducerObj = new CachedDataReducer(api.getRangeLog, "rangeLog", moment.duration(10, "m"));
+export const refreshRangeLog = rangeLogReducerObj.refresh;
+
+const commandQueueReducerObj = new CachedDataReducer(api.getCommandQueue, "commandQueue", moment.duration(10, "s"));
+export const refreshCommandQueue = commandQueueReducerObj.refresh;
 
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
@@ -88,11 +113,17 @@ export interface APIReducersState {
   tableStats: KeyedCachedDataReducerState<api.TableStatsResponseMessage>;
   logs: CachedDataReducerState<api.LogEntriesResponseMessage>;
   liveness: CachedDataReducerState<api.LivenessResponseMessage>;
+  jobs: KeyedCachedDataReducerState<api.JobsResponseMessage>;
   queryPlan: CachedDataReducerState<api.QueryPlanResponseMessage>;
   problemRanges: CachedDataReducerState<api.ProblemRangesResponseMessage>;
+  certificates: CachedDataReducerState<api.CertificatesResponseMessage>;
+  range: CachedDataReducerState<api.RangeResponseMessage>;
+  allocatorRange: CachedDataReducerState<api.AllocatorRangeResponseMessage>;
+  rangeLog: CachedDataReducerState<api.RangeLogResponseMessage>;
+  commandQueue: CachedDataReducerState<api.CommandQueueResponseMessage>;
 }
 
-export default combineReducers<APIReducersState>({
+export const apiReducersReducer = combineReducers<APIReducersState>({
   [clusterReducerObj.actionNamespace]: clusterReducerObj.reducer,
   [eventsReducerObj.actionNamespace]: eventsReducerObj.reducer,
   [healthReducerObj.actionNamespace]: healthReducerObj.reducer,
@@ -105,8 +136,14 @@ export default combineReducers<APIReducersState>({
   [tableStatsReducerObj.actionNamespace]: tableStatsReducerObj.reducer,
   [logsReducerObj.actionNamespace]: logsReducerObj.reducer,
   [livenessReducerObj.actionNamespace]: livenessReducerObj.reducer,
+  [jobsReducerObj.actionNamespace]: jobsReducerObj.reducer,
   [queryPlanReducerObj.actionNamespace]: queryPlanReducerObj.reducer,
   [problemRangesReducerObj.actionNamespace]: problemRangesReducerObj.reducer,
+  [certificatesReducerObj.actionNamespace]: certificatesReducerObj.reducer,
+  [rangeReducerObj.actionNamespace]: rangeReducerObj.reducer,
+  [allocatorRangeReducerObj.actionNamespace]: allocatorRangeReducerObj.reducer,
+  [rangeLogReducerObj.actionNamespace]: rangeLogReducerObj.reducer,
+  [commandQueueReducerObj.actionNamespace]: commandQueueReducerObj.reducer,
 });
 
 export {CachedDataReducerState, KeyedCachedDataReducerState};

@@ -12,6 +12,16 @@ export BUILDER_HIDE_GOPATH_SRC=1
 mkdir -p artifacts/acceptance
 export TMPDIR=$PWD/artifacts/acceptance
 
-build/builder.sh make TYPE=release-linux-gnu testbuild TAGS=acceptance PKG=./pkg/acceptance
+TYPE=release-$(go env GOOS)
+case $TYPE in
+  *-linux)
+    TYPE+=-gnu
+    ;;
+esac
+
+# For the acceptance tests that run without Docker.
+ln -s cockroach-linux-2.6.32-gnu-amd64 cockroach
+
+build/builder.sh make TYPE=$TYPE testbuild TAGS=acceptance PKG=./pkg/acceptance
 cd pkg/acceptance
-./acceptance.test -nodes 3 -l "$TMPDIR" -test.v -test.timeout 10m 2>&1 | tee "$TMPDIR/acceptance.log" | go-test-teamcity
+./acceptance.test -nodes 4 -l "$TMPDIR" -test.v -test.timeout 20m 2>&1 | tee "$TMPDIR/acceptance.log" | go-test-teamcity

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Daniel Harrison (daniel.harrison@gmail.com
 
 package parser
 
@@ -44,9 +42,8 @@ func (node *Backup) Format(buf *bytes.Buffer, f FmtFlags) {
 		FormatNode(buf, f, node.IncrementalFrom)
 	}
 	if node.Options != nil {
-		buf.WriteString(" WITH OPTIONS (")
+		buf.WriteString(" WITH ")
 		FormatNode(buf, f, node.Options)
-		buf.WriteString(")")
 	}
 }
 
@@ -71,30 +68,19 @@ func (node *Restore) Format(buf *bytes.Buffer, f FmtFlags) {
 		FormatNode(buf, f, node.AsOf)
 	}
 	if node.Options != nil {
-		buf.WriteString(" WITH OPTIONS (")
+		buf.WriteString(" WITH ")
 		FormatNode(buf, f, node.Options)
-		buf.WriteString(")")
 	}
 }
 
 // KVOption is a key-value option.
 type KVOption struct {
-	Key   string
-	Value string
+	Key   Name
+	Value Expr
 }
 
 // KVOptions is a list of KVOptions.
 type KVOptions []KVOption
-
-// Get returns first value for requested key and if it was found or not.
-func (o KVOptions) Get(key string) (string, bool) {
-	for _, k := range o {
-		if key == k.Key {
-			return k.Value, true
-		}
-	}
-	return "", false
-}
 
 // Format implements the NodeFormatter interface.
 func (o KVOptions) Format(buf *bytes.Buffer, f FmtFlags) {
@@ -102,10 +88,10 @@ func (o KVOptions) Format(buf *bytes.Buffer, f FmtFlags) {
 		if i > 0 {
 			buf.WriteString(", ")
 		}
-		encodeSQLStringWithFlags(buf, n.Key, f)
-		if len(n.Value) != 0 {
-			buf.WriteString(`=`)
-			encodeSQLStringWithFlags(buf, n.Value, f)
+		FormatNode(buf, f, n.Key)
+		if n.Value != nil {
+			buf.WriteString(` = `)
+			FormatNode(buf, f, n.Value)
 		}
 	}
 }

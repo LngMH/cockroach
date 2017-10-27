@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
@@ -21,8 +19,8 @@ import (
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
 
 // OpenAccount interfaces between Session and mon.MemoryMonitor.
@@ -42,7 +40,7 @@ func (ts *txnState) OpenAccount() WrappableMemoryAccount {
 // WrappableMemoryAccount encapsulates a MemoryAccount to
 // give it the Wsession()/Wtxn() method below.
 type WrappableMemoryAccount struct {
-	acc mon.MemoryAccount
+	acc mon.BytesAccount
 }
 
 // Wsession captures the current session monitor pointer so it can be provided
@@ -66,8 +64,8 @@ func (w *WrappableMemoryAccount) Wtxn(s *Session) WrappedMemoryAccount {
 // WrappedMemoryAccount is the transient structure that carries
 // the extra argument to the MemoryAccount APIs.
 type WrappedMemoryAccount struct {
-	acc *mon.MemoryAccount
-	mon *mon.MemoryMonitor
+	acc *mon.BytesAccount
+	mon *mon.BytesMonitor
 }
 
 // OpenAndInit interfaces between Session and mon.MemoryMonitor.
@@ -101,7 +99,7 @@ func (w WrappedMemoryAccount) ResizeItem(ctx context.Context, oldSize, newSize i
 var noteworthyMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEWORTHY_SESSION_MEMORY_USAGE", 1024*1024)
 
 // StartMonitor interfaces between Session and mon.MemoryMonitor
-func (s *Session) StartMonitor(pool *mon.MemoryMonitor, reserved mon.BoundAccount) {
+func (s *Session) StartMonitor(pool *mon.BytesMonitor, reserved mon.BoundAccount) {
 	// Note: we pass `reserved` to s.mon where it causes `s.mon` to act
 	// as a buffer. This is not done for sessionMon nor TxnState.mon:
 	// these monitors don't start with any buffer, so they'll need to
@@ -109,6 +107,7 @@ func (s *Session) StartMonitor(pool *mon.MemoryMonitor, reserved mon.BoundAccoun
 	// allocation. This is acceptable because the session is single
 	// threaded, and the point of buffering is just to avoid contention.
 	s.mon = mon.MakeMonitor("root",
+		mon.MemoryResource,
 		s.memMetrics.CurBytesCount,
 		s.memMetrics.MaxBytesHist,
 		-1, math.MaxInt64)
@@ -120,6 +119,7 @@ func (s *Session) StartMonitor(pool *mon.MemoryMonitor, reserved mon.BoundAccoun
 func (s *Session) StartUnlimitedMonitor() {
 	s.mon = mon.MakeUnlimitedMonitor(s.context,
 		"root",
+		mon.MemoryResource,
 		s.memMetrics.CurBytesCount,
 		s.memMetrics.MaxBytesHist,
 		math.MaxInt64,
@@ -129,6 +129,7 @@ func (s *Session) StartUnlimitedMonitor() {
 
 func (s *Session) deriveAndStartMonitors() {
 	s.sessionMon = mon.MakeMonitor("session",
+		mon.MemoryResource,
 		s.memMetrics.SessionCurBytesCount,
 		s.memMetrics.SessionMaxBytesHist,
 		-1, noteworthyMemoryUsageBytes)
@@ -137,6 +138,7 @@ func (s *Session) deriveAndStartMonitors() {
 	// We merely prepare the txn monitor here. It is fully started in
 	// resetForNewSQLTxn().
 	s.TxnState.mon = mon.MakeMonitor("txn",
+		mon.MemoryResource,
 		s.memMetrics.TxnCurBytesCount,
 		s.memMetrics.TxnMaxBytesHist,
 		-1, noteworthyMemoryUsageBytes)

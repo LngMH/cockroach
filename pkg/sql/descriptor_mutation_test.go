@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Vivek Menezes (vivek@cockroachlabs.com)
 
 package sql_test
 
@@ -99,8 +97,7 @@ func (mt mutationTest) makeMutationsActive() {
 // writeColumnMutation adds column as a mutation and writes the
 // descriptor to the DB.
 func (mt mutationTest) writeColumnMutation(column string, m sqlbase.DescriptorMutation) {
-	name := parser.Name(column)
-	col, _, err := mt.tableDesc.FindColumnByName(name)
+	col, _, err := mt.tableDesc.FindColumnByName(parser.Name(column))
 	if err != nil {
 		mt.Fatal(err)
 	}
@@ -188,6 +185,9 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i', FAMILY (k),
 			sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY} {
 			// Init table to start state.
 			mTest.Exec(`TRUNCATE TABLE t.test`)
+			// read table descriptor
+			mTest.tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+
 			initRows := [][]string{{"a", "z", "q"}}
 			for _, row := range initRows {
 				if useUpsert {
@@ -229,7 +229,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i', FAMILY (k),
 			} else {
 				_, err = sqlDB.Exec(`INSERT INTO t.test VALUES ('b', 'y', 'i')`)
 			}
-			if !testutils.IsError(err, "INSERT error: table t.test has 2 columns but 3 values were supplied") {
+			if !testutils.IsError(err, "INSERT has more expressions than target columns, 3 expressions for 2 targets") {
 				t.Fatal(err)
 			}
 
@@ -290,7 +290,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i', FAMILY (k),
 			// Updating column "i" for a row fails.
 			if useUpsert {
 				_, err := sqlDB.Exec(`UPSERT INTO t.test VALUES ('a', 'u', 'u')`)
-				if !testutils.IsError(err, `table t.test has 2 columns but 3 values were supplied`) {
+				if !testutils.IsError(err, `INSERT has more expressions than target columns, 3 expressions for 2 targets`) {
 					t.Fatal(err)
 				}
 			} else {
@@ -347,16 +347,16 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i', FAMILY (k),
 	}
 	tableDesc.Mutations = []sqlbase.DescriptorMutation{{Descriptor_: &sqlbase.DescriptorMutation_Column{Column: &tableDesc.Columns[len(tableDesc.Columns)-1]}}}
 	tableDesc.Columns = tableDesc.Columns[:len(tableDesc.Columns)-1]
-	if err := tableDesc.ValidateTable(); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, col i, id 3") {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, `mutation in state UNKNOWN, direction NONE, col "i", id 3`) {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations[0].State = sqlbase.DescriptorMutation_DELETE_ONLY
-	if err := tableDesc.ValidateTable(); !testutils.IsError(err, "mutation in state DELETE_ONLY, direction NONE, col i, id 3") {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, `mutation in state DELETE_ONLY, direction NONE, col "i", id 3`) {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations[0].State = sqlbase.DescriptorMutation_UNKNOWN
 	tableDesc.Mutations[0].Direction = sqlbase.DescriptorMutation_DROP
-	if err := tableDesc.ValidateTable(); !testutils.IsError(err, "mutation in state UNKNOWN, direction DROP, col i, id 3") {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, `mutation in state UNKNOWN, direction DROP, col "i", id 3`) {
 		t.Fatal(err)
 	}
 }
@@ -365,8 +365,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i', FAMILY (k),
 // descriptor to the DB.
 func (mt mutationTest) writeIndexMutation(index string, m sqlbase.DescriptorMutation) {
 	tableDesc := mt.tableDesc
-	name := parser.Name(index)
-	idx, _, err := tableDesc.FindIndexByName(name)
+	idx, _, err := tableDesc.FindIndexByName(index)
 	if err != nil {
 		mt.Fatal(err)
 	}
@@ -417,6 +416,9 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 			if _, err := sqlDB.Exec(`TRUNCATE TABLE t.test`); err != nil {
 				t.Fatal(err)
 			}
+			// read table descriptor
+			mTest.tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+
 			initRows := [][]string{{"a", "z"}, {"b", "y"}}
 			for _, row := range initRows {
 				if useUpsert {
@@ -574,6 +576,10 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR, INDEX foo (i, v), FAMIL
 				if _, err := sqlDB.Exec(`TRUNCATE TABLE t.test`); err != nil {
 					t.Fatal(err)
 				}
+
+				// read table descriptor
+				mTest.tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+
 				initRows := [][]string{{"a", "z", "q"}, {"b", "y", "r"}}
 				for _, row := range initRows {
 					if useUpsert {
@@ -616,11 +622,13 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR, INDEX foo (i, v), FAMIL
 
 				// Updating column "i" for a row fails.
 				if useUpsert {
-					if _, err := sqlDB.Exec(`UPSERT INTO t.test VALUES ('a', 'u', 'u')`); !testutils.IsError(err, `table t.test has 2 columns but 3 values were supplied`) {
+					_, err := sqlDB.Exec(`UPSERT INTO t.test VALUES ('a', 'u', 'u')`)
+					if !testutils.IsError(err, `INSERT has more expressions than target columns, 3 expressions for 2 targets`) {
 						t.Error(err)
 					}
 				} else {
-					if _, err := sqlDB.Exec(`UPDATE t.test SET (v, i) = ('u', 'u') WHERE k = 'a'`); !testutils.IsError(err, `column "i" does not exist`) {
+					_, err := sqlDB.Exec(`UPDATE t.test SET (v, i) = ('u', 'u') WHERE k = 'a'`)
+					if !testutils.IsError(err, `column "i" does not exist`) {
 						t.Error(err)
 					}
 				}
@@ -717,7 +725,8 @@ CREATE TABLE t.test (a CHAR PRIMARY KEY, b CHAR, c CHAR, INDEX foo (c));
 
 	// "foo" is being added.
 	mt.writeIndexMutation("foo", sqlbase.DescriptorMutation{Direction: sqlbase.DescriptorMutation_ADD})
-	if _, err := sqlDB.Exec(`CREATE INDEX foo ON t.test (c)`); !testutils.IsError(err, `duplicate index name: "foo"`) {
+	if _, err := sqlDB.Exec(`CREATE INDEX foo ON t.test (c)`); !testutils.IsError(err,
+		`duplicate: index "foo" in the middle of being added, not yet public`) {
 		t.Fatal(err)
 	}
 	// Make "foo" live.
@@ -765,7 +774,8 @@ CREATE TABLE t.test (a CHAR PRIMARY KEY, b CHAR, c CHAR, INDEX foo (c));
 	mt.makeMutationsActive()
 	// "b" is being added.
 	mt.writeColumnMutation("b", sqlbase.DescriptorMutation{Direction: sqlbase.DescriptorMutation_ADD})
-	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD b CHAR`); !testutils.IsError(err, `duplicate column name: "b"`) {
+	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD b CHAR`); !testutils.IsError(err,
+		`duplicate: column "b" in the middle of being added, not yet public`) {
 		t.Fatal(err)
 	}
 	if _, err := sqlDB.Exec(`ALTER TABLE t.test DROP b`); !testutils.IsError(err, `column "b" in the middle of being added, try again later`) {
@@ -785,7 +795,8 @@ CREATE TABLE t.test (a CHAR PRIMARY KEY, b CHAR, c CHAR, INDEX foo (c));
 	mt.makeMutationsActive()
 	// "foo" is being added.
 	mt.writeIndexMutation("foo", sqlbase.DescriptorMutation{Direction: sqlbase.DescriptorMutation_ADD})
-	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD CONSTRAINT foo UNIQUE (c)`); !testutils.IsError(err, `duplicate index name: "foo"`) {
+	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD CONSTRAINT foo UNIQUE (c)`); !testutils.IsError(err,
+		`duplicate: index "foo" in the middle of being added, not yet public`) {
 		t.Fatal(err)
 	}
 	// Make "foo" live.
@@ -860,8 +871,8 @@ CREATE TABLE t.test (a CHAR PRIMARY KEY, b CHAR, c CHAR, INDEX foo (c));
 	mt.CheckQueryResults(
 		"SHOW COLUMNS FROM t.test",
 		[][]string{
-			{"a", "STRING", "false", "NULL", "{primary,ufo}"},
-			{"d", "STRING", "true", "NULL", "{ufo}"},
+			{"a", "STRING", "false", "NULL", "{\"primary\",\"ufo\"}"},
+			{"d", "STRING", "true", "NULL", "{\"ufo\"}"},
 			{"e", "STRING", "true", "NULL", "{}"},
 		},
 	)

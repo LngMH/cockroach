@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Vivek Menezes (vivek.menezes@gmail.com)
 
 package sql
 
@@ -53,9 +51,9 @@ func (p *planner) Distinct(n *parser.SelectClause) *distinctNode {
 	return d
 }
 
-func (n *distinctNode) Start(ctx context.Context) error {
+func (n *distinctNode) Start(params runParams) error {
 	n.suffixSeen = make(map[string]struct{})
-	return n.plan.Start(ctx)
+	return n.plan.Start(params)
 }
 
 func (n *distinctNode) Values() parser.Datums { return n.plan.Values() }
@@ -71,13 +69,18 @@ func (n *distinctNode) addSuffixSeen(
 	return nil
 }
 
-func (n *distinctNode) Next(ctx context.Context) (bool, error) {
+func (n *distinctNode) Next(params runParams) (bool, error) {
+	ctx := params.ctx
 
 	prefixMemAcc := n.prefixMemAcc.Wtxn(n.p.session)
 	suffixMemAcc := n.suffixMemAcc.Wtxn(n.p.session)
 
 	for {
-		next, err := n.plan.Next(ctx)
+		if err := params.p.cancelChecker.Check(); err != nil {
+			return false, err
+		}
+
+		next, err := n.plan.Next(params)
 		if !next {
 			return false, err
 		}

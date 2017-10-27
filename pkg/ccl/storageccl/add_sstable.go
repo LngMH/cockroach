@@ -36,54 +36,43 @@ func evalAddSSTable(
 	args := cArgs.Args.(*roachpb.AddSSTableRequest)
 	h := cArgs.Header
 	ms := cArgs.Stats
+	mvccStartKey, mvccEndKey := engine.MVCCKey{Key: args.Key}, engine.MVCCKey{Key: args.EndKey}
 
 	// TODO(tschottdorf): restore the below in some form (gets in the way of testing).
 	// _, span := tracing.ChildSpan(ctx, fmt.Sprintf("AddSSTable [%s,%s)", args.Key, args.EndKey))
 	// defer tracing.FinishSpan(span)
-	log.Eventf(ctx, "evaluating AddSSTable")
+	log.Eventf(ctx, "evaluating AddSSTable [%s,%s)", mvccStartKey.Key, mvccEndKey.Key)
+
+	// Compute the stats for any existing data in the affected span. The sstable
+	// being ingested can overwrite all, some, or none of the existing kvs.
+	// (Note: the expected case is that it's none or, in the case of a retry of
+	// the request, all.) So subtract out the existing mvcc stats, and add back
+	// what they'll be after the sstable is ingested.
+	existingIter := batch.NewIterator(false)
+	defer existingIter.Close()
+	existingIter.Seek(mvccStartKey)
+	if ok, err := existingIter.Valid(); err != nil {
+		return storage.EvalResult{}, errors.Wrap(err, "computing existing stats")
+	} else if ok && existingIter.UnsafeKey().Less(mvccEndKey) {
+		log.Eventf(ctx, "target key range not empty, will merge existing data with sstable")
+	}
+	// This ComputeStats is cheap if the span is empty.
+	existingStats, err := existingIter.ComputeStats(mvccStartKey, mvccEndKey, h.Timestamp.WallTime)
+	if err != nil {
+		return storage.EvalResult{}, errors.Wrap(err, "computing existing stats")
+	}
+	ms.Subtract(existingStats)
 
 	// Verify that the keys in the sstable are within the range specified by the
 	// request header, verify the key-value checksums, and compute the new
 	// MVCCStats.
-	mvccStartKey, mvccEndKey := engine.MVCCKey{Key: args.Key}, engine.MVCCKey{Key: args.EndKey}
-	stats, err := verifySSTable(args.Data, mvccStartKey, mvccEndKey, h.Timestamp.WallTime)
+	stats, err := verifySSTable(
+		existingIter, args.Data, mvccStartKey, mvccEndKey, h.Timestamp.WallTime)
 	if err != nil {
 		return storage.EvalResult{}, errors.Wrap(err, "verifying sstable data")
 	}
-
-	// Check if there was data in the affected keyrange. If so, delete it.
-	existingStats, err := clearExistingData(ctx, batch, mvccStartKey, mvccEndKey, h.Timestamp.WallTime)
-	if err != nil {
-		return storage.EvalResult{}, errors.Wrap(err, "clearing existing data")
-	}
-
-	if existingStats != (enginepb.MVCCStats{}) {
-		log.Eventf(ctx, "key range contains existing data %+v, falling back to regular WriteBatch", existingStats)
-		ms.Subtract(existingStats) // account for clearExistingData
-
-		// If we're overwriting data, linking the SSTable is tricky since we have
-		// to link before we delete, and so the deletions could clobber the data
-		// in the SSTable. Instead, we put everything into a WriteBatch. Not
-		// pretty, but this case should be the exception.
-		reader := engine.MakeRocksDBSstFileReader()
-		defer reader.Close()
-		if err := reader.IngestExternalFile(args.Data); err != nil {
-			return storage.EvalResult{}, errors.Wrap(err, "while preparing SSTable for copy into WriteBatch")
-		}
-		var v roachpb.Value
-		if err := reader.Iterate(mvccStartKey, mvccEndKey, func(kv engine.MVCCKeyValue) (bool, error) {
-			v.RawBytes = kv.Value
-			return false, engine.MVCCPut(ctx, batch, ms, kv.Key.Key, kv.Key.Timestamp, v, nil /* txn */)
-		}); err != nil {
-			return storage.EvalResult{}, errors.Wrap(err, "copying SSTable into batch")
-		}
-		// Return with only a WriteBatch and no sideloading.
-		return storage.EvalResult{}, nil
-	}
-
-	// More frequent case: the underlying key range is empty and we can ingest an SSTable.
-	log.Event(ctx, "key range is empty; commencing with SSTable proposal")
 	ms.Add(stats)
+
 	return storage.EvalResult{
 		Replicated: storagebase.ReplicatedEvalResult{
 			AddSSTable: &storagebase.ReplicatedEvalResult_AddSSTable{
@@ -95,94 +84,52 @@ func evalAddSSTable(
 }
 
 func verifySSTable(
-	data []byte, start, end engine.MVCCKey, nowNanos int64,
+	existingIter engine.SimpleIterator, data []byte, start, end engine.MVCCKey, nowNanos int64,
 ) (enginepb.MVCCStats, error) {
-	{
-		iter, err := engineccl.NewMemSSTIterator(data)
-		if err != nil {
-			return enginepb.MVCCStats{}, err
-		}
-		defer iter.Close()
-
-		iter.Seek(engine.MVCCKey{Key: keys.MinKey})
-		ok, err := iter.Valid()
-		for ; ok; ok, err = iter.Valid() {
-			unsafeKey := iter.UnsafeKey()
-			if unsafeKey.Less(start) || !unsafeKey.Less(end) {
-				// TODO(dan): Add a new field in roachpb.Error, so the client can
-				// catch this and retry. It can happen if the range splits between
-				// when the client constructs the file and sends the request.
-				return enginepb.MVCCStats{}, errors.Errorf("key %s not in request range [%s,%s)",
-					unsafeKey.Key, start.Key, end.Key)
-			}
-
-			v := roachpb.Value{RawBytes: iter.UnsafeValue()}
-			if err := v.Verify(unsafeKey.Key); err != nil {
-				return enginepb.MVCCStats{}, err
-			}
-			iter.Next()
-		}
-		if err != nil {
-			return enginepb.MVCCStats{}, err
-		}
-	}
-
-	{
-		// TODO(dan): Switch this to the cgo-free sst iterator, too.
-		sstReader := engine.MakeRocksDBSstFileReader()
-		defer sstReader.Close()
-		if err := sstReader.IngestExternalFile(data); err != nil {
-			return enginepb.MVCCStats{}, err
-		}
-		iter := sstReader.NewIterator(false)
-		defer iter.Close()
-		return iter.ComputeStats(start, end, nowNanos)
-	}
-}
-
-func clearExistingData(
-	ctx context.Context, batch engine.ReadWriter, start, end engine.MVCCKey, nowNanos int64,
-) (enginepb.MVCCStats, error) {
-	{
-		isEmpty := true
-		if err := batch.Iterate(start, end, func(_ engine.MVCCKeyValue) (bool, error) {
-			isEmpty = false
-			return true, nil // stop right away
-		}); err != nil {
-			return enginepb.MVCCStats{}, errors.Wrap(err, "while checking for empty key space")
-		}
-
-		if isEmpty {
-			return enginepb.MVCCStats{}, nil
-		}
-	}
-
-	iter := batch.NewIterator(false)
-	defer iter.Close()
-
-	iter.Seek(start)
-	if ok, err := iter.Valid(); err != nil {
-		return enginepb.MVCCStats{}, err
-	} else if ok && !iter.UnsafeKey().Less(end) {
-		return enginepb.MVCCStats{}, nil
-	}
-
-	existingStats, err := iter.ComputeStats(start, end, nowNanos)
+	// To verify every KV is a valid roachpb.KeyValue in the range [start, end)
+	// we a) pass a verify flag on the iterator so that as ComputeStatsGo calls
+	// Next, we're also verifying each KV pair. We explicitly check the first key
+	// is >= start and then that we do not find a key after end.
+	dataIter, err := engineccl.NewMemSSTIterator(data, true)
 	if err != nil {
 		return enginepb.MVCCStats{}, err
 	}
+	defer dataIter.Close()
 
-	log.Eventf(ctx, "target key range not empty, will clear existing data: %+v", existingStats)
-	// If this is a SpanSetIterator, we have to unwrap it because
-	// ClearIterRange needs a plain rocksdb iterator (and can't unwrap
-	// it itself because of import cycles).
-	if ssi, ok := iter.(*storage.SpanSetIterator); ok {
-		iter = ssi.Iterator()
-	}
-	// TODO(dan): Ideally, this would use `batch.ClearRange` but it doesn't
-	// yet work with read-write batches (or IngestExternalData).
-	if err := batch.ClearIterRange(iter, start, end); err != nil {
+	// Check that the first key is in the expected range.
+	dataIter.Seek(engine.MVCCKey{Key: keys.MinKey})
+	ok, err := dataIter.Valid()
+	if err != nil {
 		return enginepb.MVCCStats{}, err
+	} else if ok {
+		if unsafeKey := dataIter.UnsafeKey(); unsafeKey.Less(start) {
+			return enginepb.MVCCStats{}, errors.Errorf("first key %s not in request range [%s,%s)",
+				unsafeKey.Key, start.Key, end.Key)
+		}
 	}
-	return existingStats, nil
+
+	// In the case that two iterators have an entry with the same key and
+	// timestamp, MultiIterator breaks ties by preferring later ones in the
+	// ordering. So it's important that the sstable iterator comes after the one
+	// for the existing data (because the sstable will overwrite it when
+	// ingested).
+	mergedIter := engineccl.MakeMultiIterator([]engine.SimpleIterator{existingIter, dataIter})
+	defer mergedIter.Close()
+
+	stats, err := engine.ComputeStatsGo(mergedIter, start, end, nowNanos)
+	if err != nil {
+		return stats, err
+	}
+
+	dataIter.Seek(end)
+	ok, err = dataIter.Valid()
+	if err != nil {
+		return enginepb.MVCCStats{}, err
+	} else if ok {
+		if unsafeKey := dataIter.UnsafeKey(); !unsafeKey.Less(end) {
+			return enginepb.MVCCStats{}, errors.Errorf("last key %s not in request range [%s,%s)",
+				unsafeKey.Key, start.Key, end.Key)
+		}
+	}
+	return stats, nil
 }

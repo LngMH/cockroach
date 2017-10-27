@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 // This file includes test-only helper methods added to types in
 // package storage. These methods are only linked in to tests in this
@@ -31,11 +29,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/pkg/errors"
 )
 
 // AddReplica adds the replica to the store's replica map and to the sorted
@@ -138,8 +138,10 @@ func (s *Store) LogReplicaChangeTest(
 	changeType roachpb.ReplicaChangeType,
 	replica roachpb.ReplicaDescriptor,
 	desc roachpb.RangeDescriptor,
+	reason RangeLogEventReason,
+	details string,
 ) error {
-	return s.logChange(ctx, txn, changeType, replica, desc)
+	return s.logChange(ctx, txn, changeType, replica, desc, reason, details)
 }
 
 // ReplicateQueuePurgatoryLength returns the number of replicas in replicate
@@ -172,6 +174,16 @@ func (s *Store) SetRaftSnapshotQueueActive(active bool) {
 // inactive, removals are still processed.
 func (s *Store) SetReplicaScannerActive(active bool) {
 	s.setScannerActive(active)
+}
+
+// GetOrCreateReplica passes through to its lowercase sibling.
+func (s *Store) GetOrCreateReplica(
+	ctx context.Context,
+	rangeID roachpb.RangeID,
+	replicaID roachpb.ReplicaID,
+	creatingReplica *roachpb.ReplicaDescriptor,
+) (*Replica, bool, error) {
+	return s.getOrCreateReplica(ctx, rangeID, replicaID, creatingReplica)
 }
 
 func (s *Store) SetRebalancesDisabled(v bool) {
@@ -209,18 +221,19 @@ func (s *Store) ManualReplicaGC(repl *Replica) error {
 }
 
 func (s *Store) ReservationCount() int {
-	return len(s.emptySnapshotApplySem) + len(s.nonEmptySnapshotApplySem)
+	return len(s.snapshotApplySem)
 }
 
 func NewTestStorePool(cfg StoreConfig) *StorePool {
+	TimeUntilStoreDead.Override(&cfg.Settings.SV, TestTimeUntilStoreDeadOff)
 	return NewStorePool(
 		cfg.AmbientCtx,
+		cfg.Settings,
 		cfg.Gossip,
 		cfg.Clock,
 		func(roachpb.NodeID, time.Time, time.Duration) nodeStatus {
 			return nodeStatusLive
 		},
-		settings.TestingDuration(TestTimeUntilStoreDeadOff),
 		/* deterministic */ false,
 	)
 }
@@ -238,7 +251,7 @@ func (r *Replica) DescLocked() *roachpb.RangeDescriptor {
 func (r *Replica) GetGCThreshold() hlc.Timestamp {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.mu.state.GCThreshold
+	return *r.mu.state.GCThreshold
 }
 
 // GetTxnSpanGCThreshold returns the range's TxnSpanGCThreshold, acquiring a replica lock in
@@ -246,7 +259,7 @@ func (r *Replica) GetGCThreshold() hlc.Timestamp {
 func (r *Replica) GetTxnSpanGCThreshold() hlc.Timestamp {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.mu.state.TxnSpanGCThreshold
+	return *r.mu.state.TxnSpanGCThreshold
 }
 
 func (r *Replica) AssertState(ctx context.Context, reader engine.Reader) {
@@ -321,7 +334,7 @@ func (r *Replica) CommandSizesLen() int {
 func (r *Replica) GetTimestampCacheLowWater() hlc.Timestamp {
 	r.store.tsCacheMu.Lock()
 	defer r.store.tsCacheMu.Unlock()
-	t := r.store.tsCacheMu.cache.lowWater
+	t := r.store.tsCacheMu.cache.GlobalLowWater()
 	// Bump the per-Store low-water mark using the per-range read and write info.
 	start := roachpb.Key(r.Desc().StartKey)
 	end := roachpb.Key(r.Desc().EndKey)
@@ -336,14 +349,22 @@ func (r *Replica) GetTimestampCacheLowWater() hlc.Timestamp {
 
 // GetRaftLogSize returns the raft log size.
 func (r *Replica) GetRaftLogSize() int64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.mu.raftLogSize
 }
 
+// GetCachedLastTerm returns the cached last term value. May return
+// invalidLastTerm if the cache is not set.
+func (r *Replica) GetCachedLastTerm() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.mu.lastTerm
+}
+
 func (r *Replica) IsRaftGroupInitialized() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.mu.internalRaftGroup != nil
 }
 
@@ -369,18 +390,103 @@ func (sl *StoreList) Stores() []roachpb.StoreDescriptor {
 	return stores
 }
 
-func (r *Replica) PutBogusSideloadedData(index, term uint64) {
+const (
+	sideloadBogusIndex = 12345
+	sideloadBogusTerm  = 67890
+)
+
+func (r *Replica) PutBogusSideloadedData() {
 	r.raftMu.Lock()
 	defer r.raftMu.Unlock()
-	if err := r.raftMu.sideloaded.PutIfNotExists(context.Background(), index, term, []byte("bogus")); err != nil {
+	if err := r.raftMu.sideloaded.PutIfNotExists(context.Background(), sideloadBogusIndex, sideloadBogusTerm, []byte("bogus")); err != nil {
 		panic(err)
 	}
 }
 
-func (r *Replica) SideloadedDataCount() int {
+func (r *Replica) HasBogusSideloadedData() bool {
 	r.raftMu.Lock()
 	defer r.raftMu.Unlock()
-	return len(r.raftMu.sideloaded.(*inMemSideloadStorage).m)
+	if _, err := r.raftMu.sideloaded.Get(context.Background(), sideloadBogusIndex, sideloadBogusTerm); err == errSideloadedFileNotFound {
+		return false
+	} else if err != nil {
+		panic(err)
+	}
+	return true
+}
+
+func MakeSSTable(key, value string, ts hlc.Timestamp) ([]byte, engine.MVCCKeyValue) {
+	sst, err := engine.MakeRocksDBSstFileWriter()
+	if err != nil {
+		panic(err)
+	}
+	defer sst.Close()
+
+	v := roachpb.MakeValueFromBytes([]byte(value))
+	v.InitChecksum([]byte(key))
+
+	kv := engine.MVCCKeyValue{
+		Key: engine.MVCCKey{
+			Key:       []byte(key),
+			Timestamp: ts,
+		},
+		Value: v.RawBytes,
+	}
+
+	if err := sst.Add(kv); err != nil {
+		panic(errors.Wrap(err, "while finishing SSTable"))
+	}
+	b, err := sst.Finish()
+	if err != nil {
+		panic(errors.Wrap(err, "while finishing SSTable"))
+	}
+	return b, kv
+}
+
+func ProposeAddSSTable(ctx context.Context, key, val string, ts hlc.Timestamp, store *Store) error {
+	var ba roachpb.BatchRequest
+	ba.RangeID = store.LookupReplica(roachpb.RKey(key), nil).RangeID
+
+	var addReq roachpb.AddSSTableRequest
+	addReq.Data, _ = MakeSSTable(key, val, ts)
+	addReq.Key = roachpb.Key(key)
+	addReq.EndKey = addReq.Key.Next()
+	ba.Add(&addReq)
+
+	_, pErr := store.Send(ctx, ba)
+	if pErr != nil {
+		return pErr.GoError()
+	}
+	return nil
+}
+
+func SetMockAddSSTable() (undo func()) {
+	prev := commands[roachpb.AddSSTable]
+
+	// TODO(tschottdorf): this already does nontrivial work. Worth open-sourcing the relevant
+	// subparts of the real evalAddSSTable to make this test less likely to rot.
+	evalAddSSTable := func(
+		ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, _ roachpb.Response,
+	) (EvalResult, error) {
+		log.Event(ctx, "evaluated testing-only AddSSTable mock")
+		args := cArgs.Args.(*roachpb.AddSSTableRequest)
+
+		return EvalResult{
+			Replicated: storagebase.ReplicatedEvalResult{
+				AddSSTable: &storagebase.ReplicatedEvalResult_AddSSTable{
+					Data:  args.Data,
+					CRC32: util.CRC32(args.Data),
+				},
+			},
+		}, nil
+	}
+
+	SetAddSSTableCmd(Command{
+		DeclareKeys: DefaultDeclareKeys,
+		Eval:        evalAddSSTable,
+	})
+	return func() {
+		SetAddSSTableCmd(prev)
+	}
 }
 
 // IsQuiescent returns whether the replica is quiescent or not.
@@ -416,6 +522,6 @@ func (nl *NodeLiveness) SetDrainingInternal(
 
 func (nl *NodeLiveness) SetDecommissioningInternal(
 	ctx context.Context, nodeID roachpb.NodeID, liveness *Liveness, decommission bool,
-) error {
+) (changeCommitted bool, err error) {
 	return nl.setDecommissioningInternal(ctx, nodeID, liveness, decommission)
 }

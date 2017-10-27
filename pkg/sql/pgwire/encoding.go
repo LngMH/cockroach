@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Ben Darnell
 
 package pgwire
 
@@ -169,6 +167,12 @@ type writeBuffer struct {
 	// buffer. This is passed in so that finishMsg can track all messages we've sent to a network
 	// socket, reducing the onus on the many callers of finishMsg.
 	bytecount *metric.Counter
+}
+
+// Write implements the io.Write interface.
+func (b *writeBuffer) Write(p []byte) (int, error) {
+	b.write(p)
+	return len(p), b.err
 }
 
 func (b *writeBuffer) writeByte(c byte) {

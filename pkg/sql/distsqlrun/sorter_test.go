@@ -11,20 +11,23 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package distsqlrun
 
 import (
 	"fmt"
+	math "math"
 	"math/rand"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 
 	"golang.org/x/net/context"
@@ -46,6 +49,7 @@ func TestSorter(t *testing.T) {
 		name     string
 		spec     SorterSpec
 		post     PostProcessSpec
+		types    []sqlbase.ColumnType
 		input    sqlbase.EncDatumRows
 		expected sqlbase.EncDatumRows
 	}{
@@ -60,6 +64,7 @@ func TestSorter(t *testing.T) {
 						{ColIdx: 2, Direction: asc},
 					}),
 			},
+			types: threeIntCols,
 			input: sqlbase.EncDatumRows{
 				{v[1], v[0], v[4]},
 				{v[3], v[4], v[1]},
@@ -89,7 +94,8 @@ func TestSorter(t *testing.T) {
 						{ColIdx: 2, Direction: asc},
 					}),
 			},
-			post: PostProcessSpec{Limit: 4},
+			post:  PostProcessSpec{Limit: 4},
+			types: threeIntCols,
 			input: sqlbase.EncDatumRows{
 				{v[3], v[3], v[0]},
 				{v[3], v[4], v[1]},
@@ -117,6 +123,7 @@ func TestSorter(t *testing.T) {
 						{ColIdx: 2, Direction: asc},
 					}),
 			},
+			types: threeIntCols,
 			input: sqlbase.EncDatumRows{
 				{v[0], v[1], v[2]},
 				{v[0], v[1], v[0]},
@@ -153,6 +160,7 @@ func TestSorter(t *testing.T) {
 						{ColIdx: 3, Direction: asc},
 					}),
 			},
+			types: []sqlbase.ColumnType{intType, intType, intType, intType},
 			input: sqlbase.EncDatumRows{
 				{v[1], v[1], v[2], v[5]},
 				{v[0], v[1], v[2], v[4]},
@@ -177,48 +185,78 @@ func TestSorter(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	tempEngine, err := engine.NewTempEngine(base.DefaultTestTempStorageConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tempEngine.Close()
+
+	evalCtx := parser.MakeTestingEvalContext()
+	defer evalCtx.Stop(ctx)
+	diskMonitor := mon.MakeMonitor(
+		"test-disk",
+		mon.DiskResource,
+		nil, /* curCount */
+		nil, /* maxHist */
+		-1,  /* increment: use default block size */
+		math.MaxInt64,
+	)
+	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	defer diskMonitor.Stop(ctx)
+	flowCtx := FlowCtx{
+		EvalCtx:     evalCtx,
+		Settings:    cluster.MakeTestingClusterSettings(),
+		TempStorage: tempEngine,
+		diskMonitor: &diskMonitor,
+	}
+
 	for _, c := range testCases {
-		t.Run(c.name, func(t *testing.T) {
-			types := make([]sqlbase.ColumnType, len(c.input[0]))
-			for i := range types {
-				types[i] = c.input[0][i].Type
-			}
-			in := NewRowBuffer(types, c.input, RowBufferArgs{})
-			out := &RowBuffer{}
-			evalCtx := parser.MakeTestingEvalContext()
-			defer evalCtx.Stop(ctx)
-			flowCtx := FlowCtx{
-				evalCtx: evalCtx,
-			}
+		// Test with several memory limits:
+		// 0: Use the default limit.
+		// 1: Immediately switch to disk.
+		// 1150: This is the memory used after we store a couple of rows in
+		// memory. Tests the transfer of rows from memory to disk on
+		// initialization.
+		// 2048: A memory limit that should not be hit; the strategy will not
+		// use disk.
+		for _, memLimit := range []int64{0, 1, 1150, 2048} {
+			t.Run(fmt.Sprintf("%sMemLimit=%d", c.name, memLimit), func(t *testing.T) {
+				in := NewRowBuffer(c.types, c.input, RowBufferArgs{})
+				out := &RowBuffer{}
 
-			s, err := newSorter(&flowCtx, &c.spec, in, &c.post, out)
-			if err != nil {
-				t.Fatal(err)
-			}
-			s.Run(ctx, nil)
-			if !out.ProducerClosed {
-				t.Fatalf("output RowReceiver not closed")
-			}
-
-			var retRows sqlbase.EncDatumRows
-			for {
-				row, meta := out.Next()
-				if !meta.Empty() {
-					t.Fatalf("unexpected metadata: %v", meta)
+				s, err := newSorter(&flowCtx, &c.spec, in, &c.post, out)
+				if err != nil {
+					t.Fatal(err)
 				}
-				if row == nil {
-					break
+				// Override the default memory limit. This will result in using
+				// a memory row container which will hit this limit and fall
+				// back to using a disk row container.
+				s.flowCtx.testingKnobs.MemoryLimitBytes = memLimit
+				s.Run(ctx, nil)
+				if !out.ProducerClosed {
+					t.Fatalf("output RowReceiver not closed")
 				}
-				retRows = append(retRows, row)
-			}
 
-			expStr := c.expected.String()
-			retStr := retRows.String()
-			if expStr != retStr {
-				t.Errorf("invalid results; expected:\n   %s\ngot:\n   %s",
-					expStr, retStr)
-			}
-		})
+				var retRows sqlbase.EncDatumRows
+				for {
+					row, meta := out.Next()
+					if !meta.Empty() {
+						t.Fatalf("unexpected metadata: %v", meta)
+					}
+					if row == nil {
+						break
+					}
+					retRows = append(retRows, row)
+				}
+
+				expStr := c.expected.String(c.types)
+				retStr := retRows.String(c.types)
+				if expStr != retStr {
+					t.Errorf("invalid results; expected:\n   %s\ngot:\n   %s",
+						expStr, retStr)
+				}
+			})
+		}
 	}
 }
 
@@ -228,13 +266,14 @@ func BenchmarkSortAll(b *testing.B) {
 	evalCtx := parser.MakeTestingEvalContext()
 	defer evalCtx.Stop(ctx)
 	flowCtx := FlowCtx{
-		evalCtx: evalCtx,
+		Settings: cluster.MakeTestingClusterSettings(),
+		EvalCtx:  evalCtx,
 	}
 
 	// One column integer rows.
 	columnTypeInt := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
 	types := []sqlbase.ColumnType{columnTypeInt}
-	rng := rand.New(rand.NewSource(int64(timeutil.Now().UnixNano())))
+	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 
 	spec := SorterSpec{
 		OutputOrdering: convertToSpecOrdering(sqlbase.ColumnOrdering{{ColIdx: 0, Direction: encoding.Ascending}}),
@@ -270,13 +309,14 @@ func BenchmarkSortLimit(b *testing.B) {
 	evalCtx := parser.MakeTestingEvalContext()
 	defer evalCtx.Stop(ctx)
 	flowCtx := FlowCtx{
-		evalCtx: evalCtx,
+		Settings: cluster.MakeTestingClusterSettings(),
+		EvalCtx:  evalCtx,
 	}
 
 	// One column integer rows.
 	columnTypeInt := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
 	types := []sqlbase.ColumnType{columnTypeInt}
-	rng := rand.New(rand.NewSource(int64(timeutil.Now().UnixNano())))
+	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 
 	spec := SorterSpec{
 		OutputOrdering: convertToSpecOrdering(sqlbase.ColumnOrdering{{ColIdx: 0, Direction: encoding.Ascending}}),

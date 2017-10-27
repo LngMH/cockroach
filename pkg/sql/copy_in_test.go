@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson
 
 package sql_test
 
@@ -22,7 +20,6 @@ import (
 	"math/rand"
 	"reflect"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -56,6 +53,8 @@ func TestCopyNullInfNaN(t *testing.T) {
 			n INTERVAL NULL,
 			o BOOL NULL,
 			e DECIMAL NULL,
+			u UUID NULL,
+			ip INET NULL,
 			tz TIMESTAMP WITH TIME ZONE NULL
 		);
 	`); err != nil {
@@ -73,10 +72,10 @@ func TestCopyNullInfNaN(t *testing.T) {
 	}
 
 	input := [][]interface{}{
-		{nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.Inf(1), nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.Inf(-1), nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.NaN(), nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.Inf(1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.Inf(-1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.NaN(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
 	}
 
 	for _, in := range input {
@@ -146,6 +145,8 @@ func TestCopyRandom(t *testing.T) {
 			t TIMESTAMP,
 			s STRING,
 			b BYTES,
+			u UUID,
+			ip INET,
 			tz TIMESTAMP WITH TIME ZONE
 		);
 	`); err != nil {
@@ -157,7 +158,7 @@ func TestCopyRandom(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stmt, err := txn.Prepare(pq.CopyInSchema("d", "t", "id", "n", "o", "i", "f", "e", "t", "s", "b", "tz"))
+	stmt, err := txn.Prepare(pq.CopyInSchema("d", "t", "id", "n", "o", "i", "f", "e", "t", "s", "b", "u", "ip", "tz"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +172,8 @@ func TestCopyRandom(t *testing.T) {
 		sqlbase.ColumnType_TIMESTAMP,
 		sqlbase.ColumnType_STRING,
 		sqlbase.ColumnType_BYTES,
+		sqlbase.ColumnType_UUID,
+		sqlbase.ColumnType_INET,
 		sqlbase.ColumnType_TIMESTAMPTZ,
 	}
 
@@ -191,11 +194,6 @@ func TestCopyRandom(t *testing.T) {
 		for j, t := range types {
 			d := sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: t}, false)
 			ds := parser.AsStringWithFlags(d, parser.FmtBareStrings)
-			switch t {
-			case sqlbase.ColumnType_DECIMAL:
-				// Trailing 0s aren't represented below, so truncate here.
-				ds = strings.TrimRight(ds, "0")
-			}
 			row[j+2] = ds
 		}
 		_, err = stmt.Exec(row...)
@@ -305,7 +303,7 @@ func TestCopyError(t *testing.T) {
 func TestCopyOne(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	t.Skip("https://github.com/lib/pq/issues/558")
+	t.Skip("#18352")
 
 	params, _ := createTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
@@ -339,7 +337,7 @@ func TestCopyOne(t *testing.T) {
 func TestCopyInProgress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	t.Skip("https://github.com/lib/pq/issues/558")
+	t.Skip("#18352")
 
 	params, _ := createTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)

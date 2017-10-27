@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson
 
 package parser
 
@@ -28,7 +26,7 @@ type CopyFrom struct {
 // Format implements the NodeFormatter interface.
 func (node *CopyFrom) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("COPY ")
-	FormatNode(buf, f, node.Table)
+	FormatNode(buf, f, &node.Table)
 	if len(node.Columns) > 0 {
 		buf.WriteString(" (")
 		FormatNode(buf, f, node.Columns)

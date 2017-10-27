@@ -22,18 +22,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 func BenchmarkAddSSTable(b *testing.B) {
 	tempDir, dirCleanupFn := testutils.TempDir(b)
 	defer dirCleanupFn()
 
-	for _, numEntries := range []int{100, 1000, 10000} {
+	for _, numEntries := range []int{100, 1000, 10000, 300000} {
 		b.Run(fmt.Sprintf("numEntries=%d", numEntries), func(b *testing.B) {
 			bankData := sampledataccl.BankRows(numEntries)
 			backupDir := filepath.Join(tempDir, strconv.Itoa(numEntries))
@@ -77,7 +77,7 @@ func BenchmarkAddSSTable(b *testing.B) {
 				totalLen += int64(len(data))
 
 				b.StartTimer()
-				if err := kvDB.ExperimentalAddSSTable(ctx, span.Key, span.EndKey, data); err != nil {
+				if err := kvDB.AddSSTable(ctx, span.Key, span.EndKey, data); err != nil {
 					b.Fatalf("%+v", err)
 				}
 				b.StopTimer()
@@ -136,21 +136,10 @@ func BenchmarkWriteBatch(b *testing.B) {
 }
 
 func BenchmarkImport(b *testing.B) {
-	b.Run("AddSSTable", func(b *testing.B) {
-		defer settings.TestingSetBool(&storageccl.AddSSTableEnabled, true)()
-		runBenchmarkImport(b)
-	})
-	b.Run("WriteBatch", func(b *testing.B) {
-		defer settings.TestingSetBool(&storageccl.AddSSTableEnabled, false)()
-		runBenchmarkImport(b)
-	})
-}
-
-func runBenchmarkImport(b *testing.B) {
 	tempDir, dirCleanupFn := testutils.TempDir(b)
 	defer dirCleanupFn()
 
-	for _, numEntries := range []int{1, 100, 10000, 100000} {
+	for _, numEntries := range []int{1, 100, 10000, 300000} {
 		b.Run(fmt.Sprintf("numEntries=%d", numEntries), func(b *testing.B) {
 			bankData := sampledataccl.BankRows(numEntries)
 			backupDir := filepath.Join(tempDir, strconv.Itoa(numEntries))
@@ -187,7 +176,7 @@ func runBenchmarkImport(b *testing.B) {
 					oldStartKey = sqlbase.MakeIndexKeyPrefix(tableDesc, tableDesc.PrimaryIndex.ID)
 					newDesc := *tableDesc
 					newDesc.ID = id
-					newDescBytes, err := sqlbase.WrapDescriptor(&newDesc).Marshal()
+					newDescBytes, err := protoutil.Marshal(sqlbase.WrapDescriptor(&newDesc))
 					if err != nil {
 						panic(err)
 					}

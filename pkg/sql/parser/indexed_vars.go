@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package parser
 
@@ -21,7 +19,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/pkg/errors"
 )
 
 // IndexedVarContainer provides the implementation of TypeCheck, Eval, and
@@ -63,7 +60,8 @@ func (v *IndexedVar) TypeCheck(_ *SemaContext, desired Type) (TypedExpr, error) 
 		// instead we acknowledge that we only get here if someone has
 		// used a column reference in a place where it's not allowed by
 		// the docs, so just say that instead.
-		return nil, errors.Errorf("column reference @%d not allowed in this context", v.Idx+1)
+		return nil, pgerror.NewErrorf(
+			pgerror.CodeUndefinedColumnError, "column reference @%d not allowed in this context", v.Idx+1)
 	}
 	return v, nil
 }
@@ -134,7 +132,8 @@ func (h *IndexedVarHelper) BindIfUnbound(ivar *IndexedVar) (*IndexedVar, error) 
 	// bound, as a form of safety assertion against misreuse of ivars
 	// across containers.
 	if ivar.Idx < 0 || ivar.Idx >= len(h.vars) {
-		return ivar, errors.Errorf("invalid column ordinal: @%d", ivar.Idx+1)
+		return ivar, pgerror.NewErrorf(
+			pgerror.CodeUndefinedColumnError, "invalid column ordinal: @%d", ivar.Idx+1)
 	}
 
 	if ivar.container == nil {

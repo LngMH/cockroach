@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package parser
 
@@ -34,7 +32,7 @@ func (node *AlterTable) Format(buf *bytes.Buffer, f FmtFlags) {
 	if node.IfExists {
 		buf.WriteString("IF EXISTS ")
 	}
-	FormatNode(buf, f, node.Table)
+	FormatNode(buf, f, &node.Table)
 	buf.WriteByte(' ')
 	FormatNode(buf, f, node.Cmds)
 }

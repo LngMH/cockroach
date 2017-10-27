@@ -21,11 +21,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 const (
 	replStatsRotateInterval = 5 * time.Minute
 	decayFactor             = 0.8
+
+	// MinStatsDuration defines a lower bound on how long users of replica stats
+	// should wait before using those stats for anything. If the duration of a
+	// measurement has been less than MinStatsDuration, these methods could easily
+	// return outlier/anomalous data.
+	MinStatsDuration = 5 * time.Second
 )
 
 type localityOracle func(roachpb.NodeID) string
@@ -63,9 +70,40 @@ func newReplicaStats(clock *hlc.Clock, getNodeLocality localityOracle) *replicaS
 		getNodeLocality: getNodeLocality,
 	}
 	rs.mu.requests[rs.mu.idx] = make(perLocalityCounts)
-	rs.mu.lastRotate = time.Unix(0, rs.clock.PhysicalNow())
+	rs.mu.lastRotate = timeutil.Unix(0, rs.clock.PhysicalNow())
 	rs.mu.lastReset = rs.mu.lastRotate
 	return rs
+}
+
+// splitRequestCounts divides the current replicaStats object in two for the
+// purposes of splitting a range. It modifies itself to have half its requests
+// and the provided other to have the other half.
+//
+// Note that assuming a 50/50 split is optimistic, but it's much better than
+// resetting both sides upon a split.
+// TODO(a-robinson): Write test for this.
+func (rs *replicaStats) splitRequestCounts(other *replicaStats) {
+	other.mu.Lock()
+	defer other.mu.Unlock()
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	other.mu.idx = rs.mu.idx
+	other.mu.lastRotate = rs.mu.lastRotate
+	other.mu.lastReset = rs.mu.lastReset
+
+	for i := range rs.mu.requests {
+		if rs.mu.requests[i] == nil {
+			other.mu.requests[i] = nil
+			continue
+		}
+		other.mu.requests[i] = make(perLocalityCounts)
+		for k := range rs.mu.requests[i] {
+			newVal := rs.mu.requests[i][k] / 2.0
+			rs.mu.requests[i][k] = newVal
+			other.mu.requests[i][k] = newVal
+		}
+	}
 }
 
 func (rs *replicaStats) record(nodeID roachpb.NodeID) {
@@ -77,7 +115,7 @@ func (rs *replicaStats) recordCount(count float64, nodeID roachpb.NodeID) {
 	if rs.getNodeLocality != nil {
 		locality = rs.getNodeLocality(nodeID)
 	}
-	now := time.Unix(0, rs.clock.PhysicalNow())
+	now := timeutil.Unix(0, rs.clock.PhysicalNow())
 
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -103,7 +141,7 @@ func (rs *replicaStats) rotateLocked() {
 // Note that the QPS stats are exponentially decayed such that newer requests
 // are weighted more heavily than older requests.
 func (rs *replicaStats) perLocalityDecayingQPS() (perLocalityCounts, time.Duration) {
-	now := time.Unix(0, rs.clock.PhysicalNow())
+	now := timeutil.Unix(0, rs.clock.PhysicalNow())
 
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -148,7 +186,7 @@ func (rs *replicaStats) perLocalityDecayingQPS() (perLocalityCounts, time.Durati
 // one way or the the other, but not decaying makes the average more stable,
 // which is probably better for avoiding rebalance thrashing).
 func (rs *replicaStats) avgQPS() (float64, time.Duration) {
-	now := time.Unix(0, rs.clock.PhysicalNow())
+	now := timeutil.Unix(0, rs.clock.PhysicalNow())
 
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -187,6 +225,6 @@ func (rs *replicaStats) resetRequestCounts() {
 		rs.mu.requests[i] = nil
 	}
 	rs.mu.requests[rs.mu.idx] = make(perLocalityCounts)
-	rs.mu.lastRotate = time.Unix(0, rs.clock.PhysicalNow())
+	rs.mu.lastRotate = timeutil.Unix(0, rs.clock.PhysicalNow())
 	rs.mu.lastReset = rs.mu.lastRotate
 }

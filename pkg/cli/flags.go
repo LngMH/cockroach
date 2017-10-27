@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Daniel Theophanes (kardianos@gmail.com)
 
 package cli
 
@@ -31,10 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 )
@@ -45,28 +40,15 @@ var sqlConnURL, sqlConnUser, sqlConnDBName string
 var serverConnHost, serverConnPort, serverAdvertiseHost, serverAdvertisePort string
 var serverHTTPHost, serverHTTPPort string
 var clientConnHost, clientConnPort string
-var zoneConfig string
-var zoneDisableReplication bool
-
-var serverCfg = server.MakeConfig()
-var baseCfg = serverCfg.Config
-var cliCtx = cliContext{Config: baseCfg}
-var sqlCtx = sqlContext{cliContext: &cliCtx}
-var dumpCtx = dumpContext{cliContext: &cliCtx, dumpMode: dumpBoth}
-var debugCtx = debugContext{
-	startKey:   engine.NilKey,
-	endKey:     engine.MVCCKeyMax,
-	replicated: false,
-}
-
-// server-specific values of some flags.
-var serverInsecure bool
-var serverSSLCertsDir string
+var tempDir string
 
 // InitCLIDefaults is used for testing.
 func InitCLIDefaults() {
 	cliCtx.tableDisplayFormat = tableDisplayTSV
+	cliCtx.showTimes = false
 	dumpCtx.dumpMode = dumpBoth
+	dumpCtx.asOf = ""
+	sqlCtx.echo = false
 }
 
 const usageIndentation = 8
@@ -256,22 +238,23 @@ func init() {
 
 		// Use a separate variable to store the value of ServerInsecure.
 		// We share the default with the ClientInsecure flag.
-		boolFlag(f, &serverInsecure, cliflags.ServerInsecure, baseCfg.Insecure)
+		boolFlag(f, &startCtx.serverInsecure, cliflags.ServerInsecure, baseCfg.Insecure)
 
 		// Certificates directory. Use a server-specific flag and value to ignore environment
 		// variables, but share the same default.
-		stringFlag(f, &serverSSLCertsDir, cliflags.ServerCertsDir, base.DefaultCertsDirectory)
+		stringFlag(f, &startCtx.serverSSLCertsDir, cliflags.ServerCertsDir, base.DefaultCertsDirectory)
 
 		// Cluster joining flags.
 		varFlag(f, &serverCfg.JoinList, cliflags.Join)
 
 		// Engine flags.
-		setDefaultSizeParameters(&serverCfg)
-		cacheSize := humanizeutil.NewBytesValue(&serverCfg.CacheSize)
-		varFlag(f, cacheSize, cliflags.Cache)
-
-		sqlSize := humanizeutil.NewBytesValue(&serverCfg.SQLMemoryPoolSize)
-		varFlag(f, sqlSize, cliflags.SQLMem)
+		varFlag(f, cacheSizeValue, cliflags.Cache)
+		varFlag(f, sqlSizeValue, cliflags.SQLMem)
+		// N.B. diskTempStorageSizeValue.ResolvePercentage() will be called after
+		// the stores flag has been parsed and the storage device that a percentage
+		// refers to becomes known.
+		varFlag(f, diskTempStorageSizeValue, cliflags.SQLTempStorage)
+		stringFlag(f, &tempDir, cliflags.TempDir, "")
 	}
 
 	for _, cmd := range certCmds {
@@ -316,6 +299,7 @@ func init() {
 	clientCmds = append(clientCmds, userCmds...)
 	clientCmds = append(clientCmds, zoneCmds...)
 	clientCmds = append(clientCmds, nodeCmds...)
+	clientCmds = append(clientCmds, initCmd)
 	for _, cmd := range clientCmds {
 		f := cmd.PersistentFlags()
 		stringFlag(f, &clientConnHost, cliflags.ClientHost, "")
@@ -327,11 +311,28 @@ func init() {
 		stringFlag(f, &baseCfg.SSLCertsDir, cliflags.CertsDir, base.DefaultCertsDirectory)
 	}
 
+	// Node Status command.
+	{
+		f := statusNodeCmd.Flags()
+		boolFlag(f, &nodeCtx.statusShowRanges, cliflags.NodeRanges, false)
+		boolFlag(f, &nodeCtx.statusShowStats, cliflags.NodeStats, false)
+		boolFlag(f, &nodeCtx.statusShowAll, cliflags.NodeAll, false)
+		boolFlag(f, &nodeCtx.statusShowDecommission, cliflags.NodeDecommission, false)
+	}
+
+	// Decommission command.
+	varFlag(decommissionNodeCmd.Flags(), &nodeCtx.nodeDecommissionWait, cliflags.Wait)
+
+	// Quit command.
+	boolFlag(quitCmd.Flags(), &quitCtx.serverDecommission, cliflags.Decommission, false)
+
 	zf := setZoneCmd.Flags()
-	stringFlag(zf, &zoneConfig, cliflags.ZoneConfig, "")
-	boolFlag(zf, &zoneDisableReplication, cliflags.ZoneDisableReplication, false)
+	stringFlag(zf, &zoneCtx.zoneConfig, cliflags.ZoneConfig, "")
+	boolFlag(zf, &zoneCtx.zoneDisableReplication, cliflags.ZoneDisableReplication, false)
 
 	varFlag(sqlShellCmd.Flags(), &sqlCtx.execStmts, cliflags.Execute)
+	boolFlag(sqlShellCmd.Flags(), &sqlCtx.unsafeUpdates, cliflags.UnsafeUpdates, false)
+
 	varFlag(dumpCmd.Flags(), &dumpCtx.dumpMode, cliflags.DumpMode)
 	stringFlag(dumpCmd.Flags(), &dumpCtx.asOf, cliflags.DumpTime, "")
 
@@ -341,6 +342,7 @@ func init() {
 	sqlCmds = append(sqlCmds, userCmds...)
 	for _, cmd := range sqlCmds {
 		f := cmd.PersistentFlags()
+		boolFlag(f, &sqlCtx.echo, cliflags.EchoSQL, false)
 		stringFlag(f, &sqlConnURL, cliflags.URL, "")
 		stringFlag(f, &sqlConnUser, cliflags.User, security.RootUser)
 
@@ -357,7 +359,10 @@ func init() {
 	// By default, these commands print their output as pretty-formatted
 	// tables on terminals, and TSV when redirected to a file. The user
 	// can override with --format.
+	// By default, query times are not displayed. The default is overridden
+	// in the CLI shell.
 	cliCtx.tableDisplayFormat = tableDisplayTSV
+	cliCtx.showTimes = false
 	if isInteractive {
 		cliCtx.tableDisplayFormat = tableDisplayPretty
 	}

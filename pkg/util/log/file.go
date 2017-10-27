@@ -16,8 +16,6 @@
 
 // File I/O for logs.
 
-// Author: Bram Gruneir (bram@cockroachlabs.com)
-
 package log
 
 import (
@@ -38,6 +36,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // LogFileMaxSize is the maximum size of a log file in bytes.
@@ -199,7 +198,6 @@ func parseLogFilename(filename string) (FileDetails, error) {
 		Program:  matches[1],
 		Host:     matches[2],
 		UserName: matches[3],
-		Severity: Severity_INFO,
 		Time:     time.UnixNano(),
 		PID:      pid,
 	}, nil
@@ -225,7 +223,7 @@ func create(
 		unix = lastRotation + 1
 	}
 	updatedRotation = unix
-	t = time.Unix(unix, 0)
+	t = timeutil.Unix(unix, 0)
 
 	// Generate the file name.
 	name, link := logName(t)

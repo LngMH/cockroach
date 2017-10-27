@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package sql
 
@@ -30,7 +28,7 @@ import (
 
 const (
 	informationSchemaName = "information_schema"
-	pgCatalogName         = "pg_catalog"
+	pgCatalogName         = parser.PgCatalogName
 )
 
 var informationSchema = virtualSchema{
@@ -40,6 +38,7 @@ var informationSchema = virtualSchema{
 		informationSchemaKeyColumnUsageTable,
 		informationSchemaSchemataTable,
 		informationSchemaSchemataTablePrivileges,
+		informationSchemaSequences,
 		informationSchemaStatisticsTable,
 		informationSchemaTableConstraintTable,
 		informationSchemaTablePrivileges,
@@ -288,6 +287,31 @@ func dStringForIndexDirection(dir sqlbase.IndexDescriptor_Direction) parser.Datu
 	panic("unreachable")
 }
 
+// https://www.postgresql.org/docs/9.6/static/infoschema-sequences.html
+var informationSchemaSequences = virtualSchemaTable{
+	schema: `
+CREATE TABLE information_schema.sequences (
+    SEQUENCE_CATALOG STRING NOT NULL DEFAULT '',
+    SEQUENCE_SCHEMA STRING NOT NULL DEFAULT '',
+    SEQUENCE_NAME STRING NOT NULL DEFAULT '',
+    DATA_TYPE STRING NOT NULL DEFAULT '',
+    NUMERIC_PRECISION INT NOT NULL DEFAULT 0,
+    NUMERIC_PRECISION_RADIX INT NOT NULL DEFAULT 0,
+    NUMERIC_SCALE INT NOT NULL DEFAULT 0,
+    START_VALUE STRING NOT NULL DEFAULT '',
+    MINIMUM_VALUE STRING NOT NULL DEFAULT '',
+    MAXIMUM_VALUE STRING NOT NULL DEFAULT '',
+    INCREMENT STRING NOT NULL DEFAULT '',
+    CYCLE_OPTION STRING NOT NULL DEFAULT 'NO'
+);`,
+	populate: func(ctx context.Context, p *planner, prefix string, addRow func(...parser.Datum) error) error {
+		// Sequences are not yet supported: #5811
+		// However, we support an empty information_schema table to enable
+		// clients to observe that there are no sequences.
+		return nil
+	},
+}
+
 var informationSchemaStatisticsTable = virtualSchemaTable{
 	schema: `
 CREATE TABLE information_schema.statistics (
@@ -386,9 +410,12 @@ CREATE TABLE information_schema.table_constraints (
 	CONSTRAINT_CATALOG STRING NOT NULL DEFAULT '',
 	CONSTRAINT_SCHEMA STRING NOT NULL DEFAULT '',
 	CONSTRAINT_NAME STRING NOT NULL DEFAULT '',
+	TABLE_CATALOG STRING NOT NULL DEFAULT '',
 	TABLE_SCHEMA STRING NOT NULL DEFAULT '',
 	TABLE_NAME STRING NOT NULL DEFAULT '',
-	CONSTRAINT_TYPE STRING NOT NULL DEFAULT ''
+	CONSTRAINT_TYPE STRING NOT NULL DEFAULT '',
+	IS_DEFERRABLE STRING NOT NULL DEFAULT '',
+	INITIALLY_DEFERRED STRING NOT NULL DEFAULT ''
 );`,
 	populate: func(ctx context.Context, p *planner, prefix string, addRow func(...parser.Datum) error) error {
 		return forEachTableDescWithTableLookup(ctx, p, prefix, func(
@@ -406,9 +433,12 @@ CREATE TABLE information_schema.table_constraints (
 					defString,                         // constraint_catalog
 					parser.NewDString(db.Name),        // constraint_schema
 					dStringOrNull(name),               // constraint_name
+					defString,                         // table_catalog
 					parser.NewDString(db.Name),        // table_schema
 					parser.NewDString(table.Name),     // table_name
 					parser.NewDString(string(c.Kind)), // constraint_type
+					yesOrNoDatum(false),               // is_deferrable
+					yesOrNoDatum(false),               // initially_deferred
 				); err != nil {
 					return err
 				}
@@ -596,6 +626,11 @@ func forEachDatabaseDesc(
 // with respect primarily to database name and secondarily to table name. For
 // each table, the function will call fn with its respective database and table
 // descriptor.
+//
+// The prefix argument specifies in which database context we are
+// requesting the descriptors. In context "" all descriptors are
+// visible, in non-empty contexts only the descriptors of that
+// database are visible.
 func forEachTableDesc(
 	ctx context.Context,
 	p *planner,
@@ -603,6 +638,23 @@ func forEachTableDesc(
 	fn func(*sqlbase.DatabaseDescriptor, *sqlbase.TableDescriptor) error,
 ) error {
 	return forEachTableDescWithTableLookup(ctx, p, prefix, func(
+		db *sqlbase.DatabaseDescriptor,
+		table *sqlbase.TableDescriptor,
+		_ tableLookupFn,
+	) error {
+		return fn(db, table)
+	})
+}
+
+// forEachTableDescAll does the same as forEachTableDesc but also
+// includes newly added non-public descriptors.
+func forEachTableDescAll(
+	ctx context.Context,
+	p *planner,
+	prefix string,
+	fn func(*sqlbase.DatabaseDescriptor, *sqlbase.TableDescriptor) error,
+) error {
+	return forEachTableDescWithTableLookupInternal(ctx, p, prefix, true /* allowAdding */, func(
 		db *sqlbase.DatabaseDescriptor,
 		table *sqlbase.TableDescriptor,
 		_ tableLookupFn,
@@ -640,13 +692,30 @@ func isSystemDatabaseName(name string) bool {
 // tableLookupFn when calling fn to allow callers to lookup fetched table descriptors
 // on demand. This is important for callers dealing with objects like foreign keys, where
 // the metadata for each object must be augmented by looking at the referenced table.
-// The prefix argument specifies in which database context we are requesting the descriptors.
-// In context "" all descriptors are visible, in non-empty contexts only the descriptors
-// of that database are visible.
+//
+// The prefix argument specifies in which database context we are
+// requesting the descriptors.  In context "" all descriptors are
+// visible, in non-empty contexts only the descriptors of that
+// database are visible.
 func forEachTableDescWithTableLookup(
 	ctx context.Context,
 	p *planner,
 	prefix string,
+	fn func(*sqlbase.DatabaseDescriptor, *sqlbase.TableDescriptor, tableLookupFn) error,
+) error {
+	return forEachTableDescWithTableLookupInternal(ctx, p, prefix, false /* allowAdding */, fn)
+}
+
+// forEachTableDescWithTableLookupInternal is the logic that supports
+// forEachTableDescWithTableLookup.
+//
+// The allowAdding argument if true includes newly added tables that
+// are not yet public.
+func forEachTableDescWithTableLookupInternal(
+	ctx context.Context,
+	p *planner,
+	prefix string,
+	allowAdding bool,
 	fn func(*sqlbase.DatabaseDescriptor, *sqlbase.TableDescriptor, tableLookupFn) error,
 ) error {
 	type dbDescTables struct {
@@ -680,6 +749,12 @@ func forEachTableDescWithTableLookup(
 		if table, ok := desc.(*sqlbase.TableDescriptor); ok && !table.Dropped() {
 			dbName, ok := dbIDsToName[table.GetParentID()]
 			if !ok {
+				// Contrary to `crdb_internal.tables`, which for debugging
+				// purposes also displays dropped tables which miss a parent
+				// database (because the parent descriptor has already been
+				// deleted), information_schema.tables is specified to only
+				// report usable tables, so we exclude dropped tables and the
+				// parent database must always exist.
 				return errors.Errorf("no database with ID %d found", table.GetParentID())
 			}
 			dbTables := databases[dbName]
@@ -732,7 +807,7 @@ func forEachTableDescWithTableLookup(
 		sort.Strings(dbTableNames)
 		for _, tableName := range dbTableNames {
 			tableDesc := db.tables[tableName]
-			if userCanSeeTable(tableDesc, p.session.User) {
+			if userCanSeeTable(tableDesc, p.session.User, allowAdding) {
 				if err := fn(db.desc, tableDesc, tableLookup); err != nil {
 					return err
 				}
@@ -807,9 +882,13 @@ func forEachUser(ctx context.Context, p *planner, fn func(username string) error
 	if err := fn(security.RootUser); err != nil {
 		return err
 	}
+	params := runParams{
+		ctx: ctx,
+		p:   p,
+	}
 
 	for {
-		next, err := plan.Next(ctx)
+		next, err := plan.Next(params)
 		if err != nil {
 			return err
 		}
@@ -829,6 +908,10 @@ func userCanSeeDatabase(db *sqlbase.DatabaseDescriptor, user string) bool {
 	return userCanSeeDescriptor(db, user)
 }
 
-func userCanSeeTable(table *sqlbase.TableDescriptor, user string) bool {
-	return userCanSeeDescriptor(table, user) && table.State == sqlbase.TableDescriptor_PUBLIC
+func userCanSeeTable(table *sqlbase.TableDescriptor, user string, allowAdding bool) bool {
+	if !(table.State == sqlbase.TableDescriptor_PUBLIC ||
+		(allowAdding && table.State == sqlbase.TableDescriptor_ADD)) {
+		return false
+	}
+	return userCanSeeDescriptor(table, user)
 }

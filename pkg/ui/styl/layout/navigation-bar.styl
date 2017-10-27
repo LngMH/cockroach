@@ -12,8 +12,6 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 implied. See the License for the specific language governing
 permissions and limitations under the License.
-
-Author: Matt Tracy (matt@cockroachlabs.com)
 */
 
 // ---- Navigation ----
@@ -34,7 +32,6 @@ $subnav-underline-height = 3px
   min-height 350px
   z-index $z-index-navigation
   width $nav-width
-  modular-font-size '1'
   background-color $navbar-bg
   border-right 1px solid $table-border-color
   margin 0
@@ -58,17 +55,21 @@ $subnav-underline-height = 3px
     float left
     color $body-color
     list-style-type none
-    line-height 1.8rem
+    line-height 18px
 
     &.normal
       path
         fill $body-color
+      polyline, rect
+        stroke $body-color
 
       &.active, &.active:hover, &:hover
         color $link-color
 
         path
           fill $link-color
+        polyline, rect
+          stroke $link-color
 
     &.cockroach
       padding-top 10px
@@ -110,13 +111,12 @@ $subnav-underline-height = 3px
     display flex
     flex-flow row nowrap
     justify-content flex-start
-    modular-font-size '1'
     color $tooltip-color
     list-style-type none
     line-height $subnav-height - $subnav-underline-height
 
     font-family Lato-Bold
-    font-size 1.1rem
+    font-size 9px
     max-width calc(100vw - 80px)
     @media (min-width: 1300px)
       max-width 1300px

@@ -12,8 +12,6 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 implied. See the License for the specific language governing
 permissions and limitations under the License.
-
-Author: Matt Tracy (matt@cockroachlabs.com)
 */
 
 $subnav-background  = $background-color
@@ -25,6 +23,7 @@ $subnav-background  = $background-color
   height 100vh
   min-width 100%
   padding-left $nav-width
+  padding-top 20px
 
   &:after
     content ""
@@ -48,47 +47,39 @@ $subnav-background  = $background-color
   &__item
     float left
     list-style none
-    margin-right 2rem
-
-.header
-  flex 0 0 auto
-  color $headings-color
-  font-size 24px
-  padding 24px 24px 12px
-  text-transform uppercase
-  font-family Lato-Bold
-  letter-spacing 5px
-
-.header--subsection
-  text-transform none
-  letter-spacing 0
+    margin-right 24px
 
 .l-columns
-  clearfix()
-  min-width 1360px
+  display flex
+  margin 0 -5px
 
 .l-columns__left
-  float left
-  width 930px
+  flex 3
+  padding 0 5px
 
 .l-columns__right
-  float left
-  width 380px
+  flex 1
+  padding 0 5px
 
 .page.help-us
   height 100%
   background-color white
 
 .section
-  flex 1 1 auto
+  flex 0 0 auto
   padding 12px 24px
   max-width 1350px
   clearfix()
 
+  &--heading
+    padding-top 0
+    padding-bottom 0
+
 .parent-link a
   color $link-color
-  font-size 13px
+  font-size 14px
   font-family Lato-Regular
+  font-weight bold
   text-transform uppercase
   text-decoration none
   letter-spacing 2px
@@ -131,6 +122,34 @@ $subnav-background  = $background-color
     font-size 16px
     margin-bottom 2rem
 
+.section-heading
+  &__tooltip
+    color $tooltip-color
+    display inline-block
+    font-family Lato-Medium
+    font-size 14px
+    font-weight normal
+    letter-spacing 0
+    text-transform none
+    vertical-align middle
+
+  &__tooltip-hover-area
+    padding 6px
+
+  &__info-icon
+    width 13px
+    height 13px
+    border-radius 50%
+    border 1px solid $tooltip-color
+    font-size 11px
+    color $tooltip-color
+    line-height 11px
+    text-align center
+
+  .hover-tooltip--hovered &__info-icon
+    border-color $body-color
+    color $body-color
+
 div.raft-filters
   label, b
     margin 5px
@@ -143,3 +162,18 @@ div.raft-filters
 
 .table-stats
   margin-bottom 50px
+
+.loading-image
+  height 100%
+  background-repeat no-repeat
+  background-position center 40%
+  padding 12px 24px
+
+  &__spinner
+    background-size 40px 40px
+    min-height 40px
+
+  &__spinner-left
+    background-size 40px 40px
+    min-height 40px
+    width 400px

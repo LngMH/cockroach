@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package acceptance
 
@@ -33,13 +31,17 @@ func TestBuildInfo(t *testing.T) {
 	s := log.Scope(t)
 	defer s.Close(t)
 
-	runTestOnConfigs(t, testBuildInfoInner)
+	RunLocal(t, func(t *testing.T) {
+		runTestWithCluster(t, testBuildInfoInner)
+	})
 }
 
 func testBuildInfoInner(
 	ctx context.Context, t *testing.T, c cluster.Cluster, cfg cluster.TestConfig,
 ) {
-	CheckGossip(ctx, t, c, 20*time.Second, HasPeers(c.NumNodes()))
+	if err := CheckGossip(ctx, c, 20*time.Second, HasPeers(c.NumNodes())); err != nil {
+		t.Fatal(err)
+	}
 
 	var details serverpb.DetailsResponse
 	testutils.SucceedsSoon(t, func() error {

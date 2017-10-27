@@ -114,11 +114,6 @@ SELECT SUBSTR('RoacH', -2, 4)
 ----
 R
 
-# See #6601 and #8210. We use three arguments to guarantee a very high
-# probability that at least one of the UUIDs is invalid UTF8.
-query error invalid utf8
-select cast(uuid_v4() as string), cast(uuid_v4() as string), cast(uuid_v4() as string)
-
 query T
 SELECT SUBSTR('12345', 2, 77)
 ----
@@ -202,6 +197,10 @@ empty
 
 statement error pq: repeat\(\): .* memory budget exceeded
 SELECT repeat('s', 9223372036854775807)
+
+# Regression for #19035.
+statement error pq: repeat\(\): requested length too large
+SELECT repeat('1234567890'::string, 6978072892806141784::int)
 
 query I
 SELECT ascii('x')
@@ -427,6 +426,11 @@ query RRRIIR
 SELECT abs(-1.2::float), abs(1.2::float), abs(-0.0::float), abs(0), abs(1), abs(-1.2121::decimal)
 ----
 1.2 1.2 0 0 1 1.2121
+
+query R
+SELECT abs(NULL)
+----
+NULL
 
 query error abs\(\): abs of min integer value \(-9223372036854775808\) not defined
 SELECT abs(-9223372036854775808)
@@ -751,7 +755,24 @@ SELECT round(123.456::float, -1), round(123.456::float, -2), round(123.456::floa
 query RRRR
 SELECT round(123.456::decimal, -1), round(123.456::decimal, -2), round(123.456::decimal, -3), round(123.456::decimal, -200)
 ----
-120  100  0000  000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+1.2E+2  1E+2  0E+3  0E+200
+
+query RRRR
+SELECT round('nan'::decimal), round('nan'::decimal, 1), round('nan'::float), round('nan'::float, 1)
+----
+NaN NaN NaN NaN
+
+# Match postgres float round for inf.
+query RRRR
+SELECT round('inf'::float), round('inf'::float, 1), round('-inf'::float), round('-inf'::float, 1)
+----
++Inf  +Inf  -Inf  -Inf
+
+# But decimal round (which isn't supported at all in postgres because
+# postgres doesn't support NaN or Inf for its decimals) conforms to
+# the GDA spec.
+query error invalid operation
+SELECT round('inf'::decimal)
 
 query error invalid operation
 SELECT round(1::decimal, 3000)
@@ -923,99 +944,26 @@ DOGGIE
 CAT
 
 query T
-SELECT (timestamp '2016-02-10 19:46:33.306157519')::string
+SELECT regexp_replace('abc', 'b', e'\n', 'w')
 ----
-2016-02-10 19:46:33.306158+00:00
+a
+c
 
 query T
-SELECT (timestamptz '2016-02-10 19:46:33.306157519')::string
+SELECT regexp_replace('abc\', 'b', 'a', 'w')
 ----
-2016-02-10 19:46:33.306158+00:00
+aac\
 
-query I
-SELECT extract(milliseconds FROM '2016-02-10 19:46:33.306157519'::timestamp)
+query T
+SELECT regexp_replace('abc', 'c', 'a\', 'w')
 ----
-306
+aba\
 
-query I
-SELECT extract(millisecond FROM '2016-02-10 19:46:33.306157519'::timestamp)
+# #19046
+query T
+SELECT regexp_replace('ReRe','R(e)','1\\1','g');
 ----
-306
-
-query I
-SELECT extract(microseconds FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-306158
-
-query I
-SELECT extract(microsecond FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-306158
-
-query I
-SELECT extract(second FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-33
-
-query I
-SELECT extract(seconds FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-33
-
-query I
-SELECT extract(minute FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-46
-
-query I
-SELECT extract(minutes FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-46
-
-query I
-SELECT extract(hour FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-19
-
-query I
-SELECT extract(hours FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-19
-
-query I
-SELECT extract(day FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-10
-
-query I
-SELECT extract(days FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-10
-
-query I
-SELECT extract(month FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-2
-
-query I
-SELECT extract(months FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-2
-
-query I
-SELECT extract(year FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-2016
-
-query I
-SELECT extract(years FROM '2016-02-10 19:46:33.306157519'::timestamp)
-----
-2016
-
-query I
-SELECT extract(epoch FROM '1970-01-02 00:00:01.000001'::timestamp)
-----
-86401
+1\11\1
 
 query B
 SELECT unique_rowid() < unique_rowid()
@@ -1078,11 +1026,15 @@ SELECT LEAST(NULL, NULL, NULL)
 ----
 NULL
 
-query error greatest\(\): expected '4' to be of type int, found type string
+query I
 SELECT GREATEST(2, '4')
+----
+4
 
-query error least\(\): expected '4' to be of type int, found type string
+query I
 SELECT LEAST(2, '4')
+----
+2
 
 query T
 SELECT GREATEST('foo', 'bar', 'foobar')
@@ -1190,35 +1142,51 @@ query error pq: cos\(\): cannot use "\*" in this context
 SELECT COS(*) FROM system.namespace
 
 # Don't panic with invalid names (#8045)
-query error rtrim\(\): cannot use "nonexistent.\*" in this context
+query error cannot use "nonexistent.\*" without a FROM clause
 SELECT TRIM(TRAILING nonexistent.*[1])
 
-query error rtrim\(\): cannot use "foo.\*" in this context
+query error rtrim\(\): cannot subscript type tuple
 SELECT TRIM(TRAILING foo.*[1]) FROM (VALUES (1)) AS foo(x)
 
 # Don't panic with invalid names (#8044)
-query error cannot use "nonexistent.\*" in this context
+query error cannot use "nonexistent.\*" without a FROM clause
 SELECT OVERLAY(nonexistent.* PLACING 'string' FROM 'string')
 
-query error cannot use "foo.\*" in this context
+query error unknown signature
 SELECT OVERLAY(foo.* PLACING 'string' FROM 'string') FROM (VALUES (1)) AS foo(x)
 
 # Don't panic with invalid names (#8023)
-query error cannot use "nonexistent.\*" in this context
+query error cannot use "nonexistent.\*" without a FROM clause
 SELECT nonexistent.* IS NOT TRUE
 
-query error cannot use "foo.\*" in this context
+query error unsupported comparison operator: <tuple{int}> IS NOT <bool>
 SELECT foo.* IS NOT TRUE FROM (VALUES (1)) AS foo(x)
 
 query T
 SELECT CURRENT_SCHEMAS(true)
 ----
-{test,pg_catalog}
+{"test","pg_catalog"}
 
 query T
 SELECT CURRENT_SCHEMAS(false)
 ----
-{test}
+{"test"}
+
+statement ok
+SET SEARCH_PATH=test,pg_catalog
+
+query T
+SELECT CURRENT_SCHEMAS(true)
+----
+{"test","pg_catalog"}
+
+query T
+SELECT CURRENT_SCHEMAS(false)
+----
+{"test","pg_catalog"}
+
+statement ok
+RESET SEARCH_PATH
 
 query error pq: unknown signature: current_schemas()
 SELECT CURRENT_SCHEMAS()
@@ -1373,6 +1341,20 @@ SELECT array_upper(ARRAY[ARRAY[1, 2]], 2)
 ----
 2
 
+query error only 'hex' format is supported for ENCODE
+SELECT ENCODE('abc', 'escape')
+
+query error only 'hex' format is supported for DECODE
+SELECT DECODE('abc', 'escape')
+
+query error invalid UTF-8
+SELECT ENCODE('\xa7', 'hex')
+
+query TT
+SELECT ENCODE('\x616263', 'hex'), DECODE('abc', 'hex')
+----
+abc 616263
+
 query T
 SELECT FROM_IP(b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x01\x02\x03\x04')
 ----
@@ -1405,6 +1387,11 @@ query R
 select ln(4.0786335175292462e+34::decimal)
 ----
 79.693655171940461633
+
+query IB
+SELECT LENGTH(GEN_RANDOM_UUID()::BYTES), GEN_RANDOM_UUID() = GEN_RANDOM_UUID()
+----
+16 false
 
 query TTTTTT
 SELECT TO_UUID('63616665-6630-3064-6465-616462656566'),
@@ -1481,6 +1468,27 @@ timestamp with time zone
 record
 
 query T
+VALUES (format_type('anyelement'::regtype, NULL)),
+       (format_type('bool'::regtype, NULL)),
+       (format_type('bytea'::regtype, NULL)),
+       (format_type('date'::regtype, NULL)),
+       (format_type('numeric'::regtype, NULL)),
+       (format_type('interval'::regtype, NULL)),
+       (format_type('timestamp'::regtype, NULL)),
+       (format_type('timestamptz'::regtype, NULL)),
+       (format_type('record'::regtype, NULL))
+----
+anyelement
+boolean
+bytea
+date
+numeric
+interval
+timestamp without time zone
+timestamp with time zone
+record
+
+query T
 SELECT format_type(oid, -1) FROM pg_type WHERE typname='text' LIMIT 1
 ----
 text
@@ -1528,6 +1536,42 @@ CREATE INDEX pg_indexdef_idx ON test.pg_indexdef_test (a ASC)
 
 query error pq: unknown signature: pg_get_indexdef\(int, int, bool\)
 SELECT pg_catalog.pg_get_indexdef(0, 0, true)
+
+query T
+SELECT pg_catalog.pg_get_viewdef(0)
+----
+NULL
+
+statement ok
+CREATE TABLE test.pg_viewdef_test (a int, b int, c int)
+
+statement ok
+CREATE VIEW test.pg_viewdef_view AS SELECT a, b FROM test.pg_viewdef_test
+
+query T
+SELECT pg_catalog.pg_get_viewdef('pg_viewdef_view'::regclass::oid)
+----
+SELECT a, b FROM test.pg_viewdef_test
+
+query T
+SELECT pg_catalog.pg_get_viewdef(0, true)
+----
+NULL
+
+query T
+SELECT pg_catalog.pg_get_viewdef(0, false)
+----
+NULL
+
+query T
+SELECT pg_catalog.pg_get_viewdef('pg_viewdef_view'::regclass::oid, true)
+----
+SELECT a, b FROM test.pg_viewdef_test
+
+query T
+SELECT pg_catalog.pg_get_viewdef('pg_viewdef_view'::regclass::oid, false)
+----
+SELECT a, b FROM test.pg_viewdef_test
 
 # These functions always return NULL since we don't support comments.
 query TTTT
@@ -1585,7 +1629,6 @@ SELECT i FROM (VALUES
   (sha512('3m'::interval::string)),
   (sha512('2016-11-12'::date::string)),
   (sha512('2015-08-24 23:45:45.53453'::timestamptz::string)),
-  (sha512(b'bar':::bytes::string)),
   (sha512(b'bar'::bytes))
 ) AS a(i)
 ----
@@ -1599,4 +1642,10 @@ f7fbba6e0636f890e56fbbf3283e524c6fa3204ae298382d624741d0dc6638326e282c41be5e4254
 b2d173023893f71caadf7cb2f9557355462570de2c9c971b9cfa5494936e28df8e13d0db4d550aab66d5e7a002f678ddb02def092c069ce473cf5fb293953986
 960b0fed9378be1e9adefd91e1be6ac9c1de7208008dfec438ff845135727bebea0f7458a5181079f61288176e0168cfea501b900c3e495b3ab9bbe4d372486d
 d82c4eb5261cb9c8aa9855edd67d1bd10482f41529858d925094d173fa662aa91ff39bc5b188615273484021dfb16fd8284cf684ccf0fc795be3aa2fc1e6c181
-d82c4eb5261cb9c8aa9855edd67d1bd10482f41529858d925094d173fa662aa91ff39bc5b188615273484021dfb16fd8284cf684ccf0fc795be3aa2fc1e6c181
+
+# We only support one encoding, UTF8, which is hardcoded to id 6 just like in
+# Postgres.
+query TT
+SELECT pg_catalog.pg_encoding_to_char(6), pg_catalog.pg_encoding_to_char(7)
+----
+UTF8  NULL

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer@cockroachlabs.com)
 
 package storage_test
 
@@ -31,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
@@ -94,7 +93,16 @@ func TestNodeLiveness(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := nl.Heartbeat(context.Background(), l); err != nil {
+		for {
+			err := nl.Heartbeat(context.Background(), l)
+			if err == nil {
+				break
+			}
+			if err == storage.ErrEpochIncremented {
+				log.Warningf(context.Background(), "retrying after %s", err)
+				continue
+			}
+
 			t.Fatal(err)
 		}
 	}
@@ -236,6 +244,9 @@ func TestNodeHeartbeatCallback(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// NB: since the heartbeat callback is invoked synchronously in
+	// `Heartbeat()` which this goroutine invoked, we don't need to wrap this in
+	// a retry.
 	if err := verifyUptimes(); err != nil {
 		t.Fatal(err)
 	}
@@ -362,9 +373,14 @@ func TestNodeLivenessRestart(t *testing.T) {
 	})
 }
 
-// TestNodeLivenessSelf verifies that a node keeps its own most
-// recent liveness heartbeat info in preference to anything which
-// might be received belatedly through gossip.
+// TestNodeLivenessSelf verifies that a node keeps its own most recent liveness
+// heartbeat info in preference to anything which might be received belatedly
+// through gossip.
+//
+// Note that this test originally injected a Gossip update with a higher Epoch
+// and semantics have since changed to make the "self" record less special. It
+// is updated like any other node's record, with appropriate safeguards against
+// clobbering in place.
 func TestNodeLivenessSelf(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	mtc := &multiTestContext{}
@@ -387,10 +403,10 @@ func TestNodeLivenessSelf(t *testing.T) {
 		atomic.AddInt32(&count, 1)
 	})
 	testutils.SucceedsSoon(t, func() error {
-		if err := g.AddInfoProto(key, &storage.Liveness{
-			NodeID: 1,
-			Epoch:  2,
-		}, 0); err != nil {
+		fakeBehindLiveness := *liveness
+		fakeBehindLiveness.Epoch-- // almost certainly results in zero
+
+		if err := g.AddInfoProto(key, &fakeBehindLiveness, 0); err != nil {
 			t.Fatal(err)
 		}
 		if atomic.LoadInt32(&count) < 2 {
@@ -399,7 +415,7 @@ func TestNodeLivenessSelf(t *testing.T) {
 		return nil
 	})
 
-	// Self should not see new epoch.
+	// Self should not see the fake liveness, but have kept the real one.
 	l := mtc.nodeLivenesses[0]
 	lGet, err := l.GetLiveness(g.NodeID.Get())
 	if err != nil {
@@ -434,9 +450,16 @@ func TestNodeLivenessGetIsLiveMap(t *testing.T) {
 	// Advance the clock but only heartbeat node 0.
 	mtc.manualClock.Increment(mtc.nodeLivenesses[0].GetLivenessThreshold().Nanoseconds() + 1)
 	liveness, _ := mtc.nodeLivenesses[0].GetLiveness(mtc.gossips[0].NodeID.Get())
-	if err := mtc.nodeLivenesses[0].Heartbeat(context.Background(), liveness); err != nil {
-		t.Fatal(err)
-	}
+
+	testutils.SucceedsSoon(t, func() error {
+		if err := mtc.nodeLivenesses[0].Heartbeat(context.Background(), liveness); err != nil {
+			if err == storage.ErrEpochIncremented {
+				return err
+			}
+			t.Fatal(err)
+		}
+		return nil
+	})
 
 	// Now verify only node 0 is live.
 	lMap = mtc.nodeLivenesses[0].GetIsLiveMap()
@@ -736,12 +759,14 @@ func testNodeLivenessSetDecommissioning(t *testing.T, decommissionNodeIdx int) {
 
 	// Verify success on failed update of a liveness record that already has the
 	// given decommissioning setting.
-	if err := callerNodeLiveness.SetDecommissioningInternal(ctx, nodeID, &storage.Liveness{}, false); err != nil {
+	if _, err := callerNodeLiveness.SetDecommissioningInternal(ctx, nodeID, &storage.Liveness{}, false); err != nil {
 		t.Fatal(err)
 	}
 
 	// Set a node to decommissioning state.
-	callerNodeLiveness.SetDecommissioning(ctx, nodeID, true)
+	if _, err := callerNodeLiveness.SetDecommissioning(ctx, nodeID, true); err != nil {
+		t.Fatal(err)
+	}
 	verifyNodeIsDecommissioning(t, mtc, nodeID)
 
 	// Stop and restart the store to verify that a restarted server retains the

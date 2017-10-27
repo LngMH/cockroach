@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package acceptance
 
@@ -32,15 +30,19 @@ import (
 func TestDebugRemote(t *testing.T) {
 	s := log.Scope(t)
 	defer s.Close(t)
+	// TODO(tschottdorf): hard to run this as RunLocal since we need to access
+	// the ui endpoint from a non-local address.
+	RunDocker(t, testDebugRemote)
+}
 
-	SkipUnlessLocal(t)
+func testDebugRemote(t *testing.T) {
 	cfg := cluster.TestConfig{
 		Name:     "TestDebugRemote",
 		Duration: *flagDuration,
-		Nodes:    []cluster.NodeConfig{{Count: 1, Stores: []cluster.StoreConfig{{Count: 1}}}},
+		Nodes:    []cluster.NodeConfig{{Stores: []cluster.StoreConfig{{}}}},
 	}
 	ctx := context.Background()
-	l := StartCluster(ctx, t, cfg).(*cluster.LocalCluster)
+	l := StartCluster(ctx, t, cfg).(*cluster.DockerCluster)
 	defer l.AssertAndStop(ctx, t)
 
 	db, err := gosql.Open("postgres", l.PGUrl(ctx, 0))
@@ -73,8 +75,7 @@ func TestDebugRemote(t *testing.T) {
 				"/debug/requests",
 				"/debug/range?id=1",
 				"/debug/certificates",
-				"/debug/network",
-				"/debug/nodes",
+				"/debug/logspy?duration=1ns",
 			} {
 				t.Run(url, func(t *testing.T) {
 					resp, err := cluster.HTTPClient.Get(l.URL(ctx, 0) + url)

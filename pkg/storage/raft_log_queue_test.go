@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package storage
 
@@ -264,7 +262,7 @@ func TestProactiveRaftLogTruncate(t *testing.T) {
 		valueSize int
 	}{
 		// Lots of small KVs.
-		{RaftLogQueueStaleThreshold * 2, 5},
+		{RaftLogQueueStaleSize / 100, 5},
 		// One big KV.
 		{1, RaftLogQueueStaleSize},
 	}

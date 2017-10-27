@@ -11,15 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 // Cannot be proto3 because we use nullable primitives.
 syntax = "proto2";
 package cockroach.sql.sqlbase;
 option go_package = "sqlbase";
 
-import "cockroach/pkg/roachpb/data.proto";
 import "cockroach/pkg/util/hlc/timestamp.proto";
 import "cockroach/pkg/sql/sqlbase/privilege.proto";
 import "gogoproto/gogo.proto";
@@ -55,15 +52,9 @@ message ColumnType {
     NULL = 13;
 
     UUID = 14;
+    ARRAY = 15;
+    INET = 16;
 
-    // Array and vector types.
-    //
-    // TODO(cuongdo): Fix this before allowing persistence of array/vector types
-    // It would be cleaner if when array_dimensions are specified, Kind is
-    // simply the parameterized type of the array. However, because Kind is used
-    // to determine type information elsewhere, it isn't possible to take the
-    // cleaner approach without an extensive refactoring.
-    INT_ARRAY = 100;
     INT2VECTOR = 200;
   }
 
@@ -91,6 +82,8 @@ message ColumnType {
   // the user specification. Examples are INT4, FLOAT4, etc. Mostly for Postgres
   // compatibility.
   optional VisibleType visible_type = 6 [(gogoproto.nullable) = false];
+  // Only used if the kind is ARRAY.
+  optional SemanticType array_contents = 7;
 }
 
 enum ConstraintValidity {
@@ -99,6 +92,14 @@ enum ConstraintValidity {
 }
 
 message ForeignKeyReference {
+  enum Action {
+    NO_ACTION = 0;
+    RESTRICT = 1;
+    SET_NULL = 2;
+    SET_DEFAULT = 3;
+    CASCADE = 4;
+  }
+
   optional uint32 table = 1 [(gogoproto.nullable) = false, (gogoproto.casttype) = "ID"];
   optional uint32 index = 2 [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexID"];
   optional string name = 3 [(gogoproto.nullable) = false];
@@ -106,6 +107,8 @@ message ForeignKeyReference {
   // If this FK only uses a prefix of the columns in its index, we record how
   // many to avoid spuriously counting the additional cols as used by this FK.
   optional int32 shared_prefix_len = 5 [(gogoproto.nullable) = false];
+  optional Action on_delete = 6 [(gogoproto.nullable) = false];
+  optional Action on_update = 7 [(gogoproto.nullable) = false];
 }
 
 message ColumnDescriptor {
@@ -171,8 +174,8 @@ message InterleaveDescriptor {
     // SharedPrefixLen is how many fields are shared between a parent and child
     // being interleaved, excluding any fields shared between parent and
     // grandparent. Thus, the sum of SharedPrefixLens in the components of an
-    // InterleaveDescriptor is always strictly less than the number of fields
-    // in the index being interleaved.
+    // InterleaveDescriptor is never more than the number of fields in the index
+    // being interleaved.
     optional uint32 shared_prefix_len = 3 [(gogoproto.nullable) = false,
         (gogoproto.customname) = "SharedPrefixLen"];
   }
@@ -181,6 +184,49 @@ message InterleaveDescriptor {
   // an encoded key. This means they are always in the far-to-near ancestor
   // order (e.g. grand-grand-parent, grand-parent, parent).
   repeated Ancestor ancestors = 1 [(gogoproto.nullable) = false];
+}
+
+// PartitioningDescriptor represents the partitioning of an index into spans
+// of keys addressable by a zone config. The key encoding is unchanged. Each
+// partition may optionally be itself divided into further partitions, called
+// subpartitions.
+message PartitioningDescriptor {
+  // List represents a list partitioning, which maps individual tuples to
+  // partitions.
+  message List {
+    // Name is the partition name.
+    optional string name = 1 [(gogoproto.nullable) = false];
+    // Values is an unordered set of the tuples included in this partition. Each
+    // tuple is encoded with the EncDatum value encoding. DEFAULT is encoded as
+    // NOT NULL.
+    repeated bytes values = 2;
+    // Subpartitioning represents a further partitioning of this list partition.
+    optional PartitioningDescriptor subpartitioning = 3 [(gogoproto.nullable) = false];
+  }
+
+  // Range represents a range partitioning, which maps ranges of tuples to
+  // partitions by specifying exclusive upper bounds. The range partitions in a
+  // PartitioningDescriptor are required be sorted by values_less_than.
+  message Range {
+    // Name is the partition name.
+    optional string name = 1 [(gogoproto.nullable) = false];
+    // UpperBound is exclusive upper bound of this range partition. It is
+    // encoded with the EncDatum value encoding. MAXVALUE is encoded as NOT NULL.
+    optional bytes upper_bound = 2;
+    // Subpartitioning represents a further partitioning of this range partition.
+    optional PartitioningDescriptor subpartitioning = 3 [(gogoproto.nullable) = false];
+  }
+
+  // NumColumns is how large of a prefix of the columns in an index are used in
+  // the function mapping column values to partitiong. If this is a
+  // subpartition, this is offset to start from the end of the parent
+  // partition's columns. If NumColumns is 0, then there is no partitioning.
+  optional uint32 num_columns = 1 [(gogoproto.nullable) = false];
+
+  // Exactly one of List or Range is required to be non-empty if NumColumns is
+  // non-zero.
+  repeated List list = 2 [(gogoproto.nullable) = false];
+  repeated Range range = 3 [(gogoproto.nullable) = false];
 }
 
 // IndexDescriptor describes an index (primary or secondary).
@@ -298,6 +344,10 @@ message IndexDescriptor {
   // InterleavedBy contains a reference to every table/index that is interleaved
   // into this one.
   repeated ForeignKeyReference interleaved_by = 12  [(gogoproto.nullable) = false];
+
+  // Partitioning, if it's not the zero value, describes how this index's data
+  // is partitioned into spans of keys each addressable by zone configs.
+  optional PartitioningDescriptor partitioning = 15 [(gogoproto.nullable) = false];
 }
 
 // A DescriptorMutation represents a column or an index that
@@ -361,13 +411,7 @@ message DescriptorMutation {
   // unique constraint index.
   optional uint32 mutation_id = 5 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "MutationID", (gogoproto.casttype) = "MutationID"];
-
-  // A schema change can involve running multiple processors backfilling
-  // or deleting data. They occasionally checkpoint Spans so that the
-  // processing can resume in the event of a node failure. The spans are
-  // non-overlapping contiguous areas of the KV space that still need to
-  // be processed.
-  repeated roachpb.Span resume_spans = 6 [(gogoproto.nullable) = false];
+  reserved 6;
 }
 
 // A TableDescriptor represents a table or view and is stored in a

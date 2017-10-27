@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package storage
 
@@ -23,7 +21,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
@@ -33,11 +30,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
@@ -58,13 +57,13 @@ const (
 	// larger than the heartbeat interval used by the coordinator.
 	txnCleanupThreshold = time.Hour
 
-	// abortCacheAgeThreshold is the duration after which abort cache entries
+	// abortSpanAgeThreshold is the duration after which AbortSpan entries
 	// of transactions are garbage collected.
 	// It's important that this is kept aligned with the (maximum) heartbeat
 	// interval used by transaction coordinators throughout the cluster to make
 	// sure that no coordinator can run with a transaction which has been
-	// aborted and whose abort cache entry is being deleted.
-	abortCacheAgeThreshold = 5 * base.DefaultHeartbeatInterval
+	// aborted and whose AbortSpan entry is being deleted.
+	abortSpanAgeThreshold = 5 * base.DefaultHeartbeatInterval
 
 	// Thresholds used to decide whether to queue for GC based
 	// on keys and intents.
@@ -86,7 +85,7 @@ const (
 //  - GC of version data via TTL expiration (and more complex schemes
 //    as implemented going forward).
 //  - Resolve extant write intents (pushing their transactions).
-//  - GC of old transaction and abort cache entries. This should include
+//  - GC of old transaction and AbortSpan entries. This should include
 //    most committed entries almost immediately and, after a threshold on
 //    inactivity, all others.
 //
@@ -116,7 +115,7 @@ func newGCQueue(store *Store, gossip *gossip.Gossip) *gcQueue {
 }
 
 type pushFunc func(hlc.Timestamp, *roachpb.Transaction, roachpb.PushTxnType)
-type resolveFunc func([]roachpb.Intent, bool, bool) error
+type resolveFunc func([]roachpb.Intent, ResolveOptions) error
 
 // gcQueueScore holds details about the score returned by makeGCQueueScoreImpl for
 // testing and logging. The fields in this struct are documented in
@@ -169,8 +168,8 @@ func makeGCQueueScore(
 	ctx context.Context, repl *Replica, now hlc.Timestamp, sysCfg config.SystemConfig,
 ) gcQueueScore {
 	repl.mu.Lock()
-	ms := repl.mu.state.Stats
-	gcThreshold := repl.mu.state.GCThreshold
+	ms := *repl.mu.state.Stats
+	gcThreshold := *repl.mu.state.GCThreshold
 	repl.mu.Unlock()
 
 	desc := repl.Desc()
@@ -369,7 +368,7 @@ func processLocalKeyRange(
 	txnMap map[uuid.UUID]*roachpb.Transaction,
 	cutoff hlc.Timestamp,
 	infoMu *lockableGCInfo,
-	resolveIntents resolveFunc,
+	resolveIntentsFn resolveFunc,
 ) ([]roachpb.GCRequest_GCKey, error) {
 	infoMu.Lock()
 	defer infoMu.Unlock()
@@ -386,7 +385,7 @@ func processLocalKeyRange(
 			return nil
 		}
 
-		txnID := *txn.ID
+		txnID := txn.ID
 
 		// The transaction record should be considered for removal.
 		switch txn.Status {
@@ -407,25 +406,36 @@ func processLocalKeyRange(
 			// but instead by the coordinator - those will not have any intents
 			// persisted, though they still might exist in the system.
 			infoMu.TransactionSpanGCAborted++
-			func() {
+			if err := func() error {
 				infoMu.Unlock() // intentional
 				defer infoMu.Lock()
-				if err := resolveIntents(roachpb.AsIntents(txn.Intents, &txn),
-					true /* wait */, false /* !poison */); err != nil {
-					log.Warningf(ctx, "failed to resolve intents of aborted txn on gc: %s", err)
+				return resolveIntentsFn(roachpb.AsIntents(txn.Intents, &txn),
+					ResolveOptions{Wait: true, Poison: false})
+			}(); err != nil {
+				// Ignore above error, but if context is expired, no point in keeping going.
+				if ctx.Err() != nil {
+					return errors.Wrap(err, "context timed out during local key range processing after")
 				}
-			}()
+				log.Warningf(ctx, "failed to resolve intents of aborted txn on gc (removing anyway): %s", err)
+				// Keep going.
+			}
 		case roachpb.COMMITTED:
 			// It's committed, so it doesn't need a push but we can only
 			// GC it after its intents are resolved.
 			if err := func() error {
 				infoMu.Unlock() // intentional
 				defer infoMu.Lock()
-				return resolveIntents(roachpb.AsIntents(txn.Intents, &txn), true /* wait */, false /* !poison */)
+				return resolveIntentsFn(roachpb.AsIntents(txn.Intents, &txn), ResolveOptions{Wait: true, Poison: false})
 			}(); err != nil {
-				log.Warningf(ctx, "unable to resolve intents of committed txn on gc: %s", err)
 				// Returning the error here would abort the whole GC run, and
 				// we don't want that. Instead, we simply don't GC this entry.
+				if ctx.Err() != nil {
+					// ... but if our context is expired, no need to keep going.
+					return errors.Wrap(err, "context timed out during local key range processing after")
+				}
+				log.Warningf(ctx, "unable to resolve intents of committed txn on gc; skipping: %s", err)
+				// Do not keep going, or we'll still remove this transaction, and we're not
+				// allowed to unless the intents are certifiably removed.
 				return nil
 			}
 			infoMu.TransactionSpanGCCommitted++
@@ -466,13 +476,13 @@ func processLocalKeyRange(
 
 	_, err := engine.MVCCIterate(ctx, snap, startKey, endKey,
 		hlc.Timestamp{}, true /* consistent */, nil, /* txn */
-		false /* !reverse */, func(kv roachpb.KeyValue) (bool, error) {
+		false /* reverse */, func(kv roachpb.KeyValue) (bool, error) {
 			return false, handleOne(kv)
 		})
 	return gcKeys, err
 }
 
-// processAbortCache iterates through the local abort cache entries
+// processAbortSpan iterates through the local AbortSpan entries
 // and collects entries which indicate that a client which was running
 // this transaction must have realized that it has been aborted (due to
 // heartbeating having failed). The parameter minAge is typically a
@@ -481,7 +491,7 @@ func processLocalKeyRange(
 // TODO(tschottdorf): this could be done in Replica.GC itself, but it's
 // handy to have it here for stats (though less performant due to sending
 // all of the keys over the wire).
-func processAbortCache(
+func processAbortSpan(
 	ctx context.Context,
 	snap engine.Reader,
 	rangeID roachpb.RangeID,
@@ -490,10 +500,10 @@ func processAbortCache(
 	pushTxn pushFunc,
 ) []roachpb.GCRequest_GCKey {
 	var gcKeys []roachpb.GCRequest_GCKey
-	abortCache := NewAbortCache(rangeID)
+	abortSpan := abortspan.New(rangeID)
 	infoMu.Lock()
 	defer infoMu.Unlock()
-	abortCache.Iterate(ctx, snap, func(key []byte, v roachpb.AbortCacheEntry) {
+	abortSpan.Iterate(ctx, snap, func(key []byte, v roachpb.AbortSpanEntry) {
 		infoMu.AbortSpanTotal++
 		if v.Timestamp.Less(threshold) {
 			infoMu.AbortSpanGCNum++
@@ -506,15 +516,15 @@ func processAbortCache(
 // process iterates through all keys in a replica's range, calling the garbage
 // collector for each key and associated set of values. GC'd keys are batched
 // into GC calls. Extant intents are resolved if intents are older than
-// intentAgeThreshold. The transaction and abort cache records are also
+// intentAgeThreshold. The transaction and AbortSpan records are also
 // scanned and old entries evicted. During normal operation, both of these
 // records are cleaned up when their respective transaction finishes, so the
 // amount of work done here is expected to be small.
 //
 // Some care needs to be taken to avoid cyclic recreation of entries during GC:
 // * a Push initiated due to an intent may recreate a transaction entry
-// * resolving an intent may write a new abort cache entry
-// * obtaining the transaction for a abort cache entry requires a Push
+// * resolving an intent may write a new AbortSpan entry
+// * obtaining the transaction for a AbortSpan entry requires a Push
 //
 // The following order is taken below:
 // 1) collect all intents with sufficiently old txn record
@@ -522,8 +532,8 @@ func processAbortCache(
 // 3) scan the transaction table, collecting abandoned or completed txns
 // 4) push all of these transactions (possibly recreating entries)
 // 5) resolve all intents (unless the txn is still PENDING), which will recreate
-//    abort cache entries (but with the txn timestamp; i.e. likely gc'able)
-// 6) scan the abort cache table for old entries
+//    AbortSpan entries (but with the txn timestamp; i.e. likely gc'able)
+// 6) scan the AbortSpan table for old entries
 // 7) push these transactions (again, recreating txn entries).
 // 8) send a GCRequest.
 func (gcq *gcQueue) process(ctx context.Context, repl *Replica, sysCfg config.SystemConfig) error {
@@ -591,8 +601,8 @@ func (gcq *gcQueue) processImpl(
 		func(now hlc.Timestamp, txn *roachpb.Transaction, typ roachpb.PushTxnType) {
 			pushTxn(ctx, gcq.store.DB(), now, txn, typ)
 		},
-		func(intents []roachpb.Intent, poison bool, wait bool) error {
-			return repl.store.intentResolver.resolveIntents(ctx, intents, poison, wait)
+		func(intents []roachpb.Intent, opts ResolveOptions) error {
+			return repl.store.intentResolver.resolveIntents(ctx, intents, opts)
 		})
 
 	if err != nil {
@@ -648,13 +658,13 @@ type GCInfo struct {
 	// TxnSpanGCThreshold is the cutoff for transaction span GC. Transactions
 	// with a smaller LastActive() were considered for GC.
 	TxnSpanGCThreshold hlc.Timestamp
-	// AbortSpanTotal is the total number of transactions present in the abort cache.
+	// AbortSpanTotal is the total number of transactions present in the AbortSpan.
 	AbortSpanTotal int
-	// AbortSpanConsidered is the number of abort cache entries old enough to be
+	// AbortSpanConsidered is the number of AbortSpan entries old enough to be
 	// considered for removal. An "entry" corresponds to one transaction;
 	// more than one key-value pair may be associated with it.
 	AbortSpanConsidered int
-	// AbortSpanGCNum is the number of abort cache entries fit for removal (due
+	// AbortSpanGCNum is the number of AbortSpan entries fit for removal (due
 	// to their transactions having terminated).
 	AbortSpanGCNum int
 	// PushTxn is the total number of pushes attempted in this cycle.
@@ -713,7 +723,7 @@ func RunGC(
 
 	{
 		realResolveIntentsFn := resolveIntentsFn
-		resolveIntentsFn = func(intents []roachpb.Intent, poison bool, wait bool) (err error) {
+		resolveIntentsFn = func(intents []roachpb.Intent, opts ResolveOptions) (err error) {
 			defer func() {
 				infoMu.Lock()
 				infoMu.ResolveTotal += len(intents)
@@ -722,7 +732,7 @@ func RunGC(
 				}
 				infoMu.Unlock()
 			}()
-			return realResolveIntentsFn(intents, poison, wait)
+			return realResolveIntentsFn(intents, opts)
 		}
 		realPushTxnFn := pushTxnFn
 		pushTxnFn = func(ts hlc.Timestamp, txn *roachpb.Transaction, typ roachpb.PushTxnType) {
@@ -738,7 +748,7 @@ func RunGC(
 	intentExp.WallTime -= intentAgeThreshold.Nanoseconds()
 	txnExp := now
 	txnExp.WallTime -= txnCleanupThreshold.Nanoseconds()
-	abortSpanGCThreshold := now.Add(-int64(abortCacheAgeThreshold), 0)
+	abortSpanGCThreshold := now.Add(-int64(abortSpanAgeThreshold), 0)
 
 	gc := engine.MakeGarbageCollector(now, policy)
 	infoMu.Threshold = gc.Threshold
@@ -761,7 +771,7 @@ func RunGC(
 		// If there's more than a single value for the key, possibly send for GC.
 		if len(keys) > 1 {
 			meta := &enginepb.MVCCMetadata{}
-			if err := proto.Unmarshal(vals[0], meta); err != nil {
+			if err := protoutil.Unmarshal(vals[0], meta); err != nil {
 				log.Errorf(ctx, "unable to unmarshal MVCC metadata for key %q: %s", keys[0], err)
 			} else {
 				// In the event that there's an active intent, send for
@@ -770,8 +780,8 @@ func RunGC(
 				if meta.Txn != nil {
 					// Keep track of intent to resolve if older than the intent
 					// expiration threshold.
-					if meta.Timestamp.Less(intentExp) {
-						txnID := *meta.Txn.ID
+					if hlc.Timestamp(meta.Timestamp).Less(intentExp) {
+						txnID := meta.Txn.ID
 						txn := &roachpb.Transaction{
 							TxnMeta: *meta.Txn,
 						}
@@ -841,6 +851,14 @@ func RunGC(
 	gcKeys = append(gcKeys, localRangeKeys...)
 
 	// Process push transactions in parallel.
+	//
+	// TODO(tschottdorf): we first push all transactions before resolving intents.
+	// If we have too many transactions, that can lead to the case in which our context
+	// expires and we can't actually clean up any of the intents. Since we have hopefully
+	// succeeded in pushing a lot of transactions, the next time around we should have
+	// less work here and manage to get to the intents, but it would be better to let
+	// another goroutine resolve intents for transactions we've handled so that work that
+	// is prepared is executed right away.
 	log.Eventf(ctx, "pushing up to %d transactions (concurrency %d)", len(txnMap), gcTaskLimit)
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, gcTaskLimit)
@@ -857,10 +875,18 @@ func RunGC(
 				<-sem
 				wg.Done()
 			}()
+			if ctx.Err() != nil {
+				return // don't bother if already expired
+			}
 			pushTxnFn(now, txnCopy, roachpb.PUSH_ABORT)
 		}()
 	}
 	wg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		// Don't bother if already expired.
+		return nil, GCInfo{}, err
+	}
 
 	// Resolve all intents.
 	log.Eventf(ctx, "resolving up to %d intents", len(txnMap))
@@ -873,13 +899,13 @@ func RunGC(
 		}
 	}
 
-	if err := resolveIntentsFn(intents, true /* wait */, false /* !poison */); err != nil {
+	if err := resolveIntentsFn(intents, ResolveOptions{Wait: true, Poison: false}); err != nil {
 		return nil, GCInfo{}, err
 	}
 
-	// Clean up the abort cache.
-	log.Event(ctx, "processing abort cache")
-	gcKeys = append(gcKeys, processAbortCache(
+	// Clean up the AbortSpan.
+	log.Event(ctx, "processing AbortSpan")
+	gcKeys = append(gcKeys, processAbortSpan(
 		ctx, snap, desc.RangeID, abortSpanGCThreshold, &infoMu, pushTxnFn)...)
 	return gcKeys, infoMu.GCInfo, nil
 }

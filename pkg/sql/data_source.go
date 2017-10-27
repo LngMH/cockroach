@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
@@ -28,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 // To understand dataSourceInfo below it is crucial to understand the
@@ -127,9 +126,11 @@ type dataSourceInfo struct {
 	// them using AS.
 	sourceAliases sourceAliases
 
-	// viewDesc is nothing more than an annotation used to indicate that the
-	// columns are defined as part of a view.
-	viewDesc *sqlbase.TableDescriptor
+	// colOffset is the offset of the first column in this dataSourceInfo in the
+	// multiSourceInfo array it is part of.
+	// The value is populated and used during name resolution, and shouldn't get
+	// touched by anything but the nameResolutionVisitor without care.
+	colOffset int
 }
 
 // planDataSource contains the data source information for data
@@ -142,16 +143,14 @@ type planDataSource struct {
 	plan planNode
 }
 
-// columnRange identifies a non-empty set of columns in a
-// selection. This is used by dataSourceInfo.sourceAliases to map
-// table names to column ranges.
-type columnRange []int
-
 // sourceAlias associates a table name (alias) to a set of columns in the result
 // row of a data source.
 type sourceAlias struct {
-	name        parser.TableName
-	columnRange columnRange
+	name parser.TableName
+	// columnSet identifies a non-empty set of columns in a
+	// selection. This is used by dataSourceInfo.sourceAliases to map
+	// table names to column ranges.
+	columnSet util.FastIntSet
 }
 
 func (src *dataSourceInfo) String() string {
@@ -178,11 +177,8 @@ func (src *dataSourceInfo) String() string {
 			if i > 0 {
 				buf.WriteByte('\t')
 			}
-			for _, j := range a.columnRange {
-				if i == j {
-					buf.WriteString("x")
-					break
-				}
+			if a.columnSet.Contains(i) {
+				buf.WriteString("x")
 			}
 		}
 		if a.name == anonymousTable {
@@ -190,7 +186,7 @@ func (src *dataSourceInfo) String() string {
 		} else {
 			fmt.Fprintf(&buf, "\t'%s'", a.name.String())
 		}
-		fmt.Fprintf(&buf, " - %q\n", a.columnRange)
+		fmt.Fprintf(&buf, " - %s\n", a.columnSet)
 	}
 	return buf.String()
 }
@@ -208,14 +204,14 @@ func (s sourceAliases) srcIdx(name parser.TableName) (srcIdx int, found bool) {
 	return -1, false
 }
 
-// columnRange looks up a source by name and returns the column range (and
+// columnSet looks up a source by name and returns the column set (and
 // whether we found the name).
-func (s sourceAliases) columnRange(name parser.TableName) (colRange columnRange, found bool) {
+func (s sourceAliases) columnSet(name parser.TableName) (_ util.FastIntSet, found bool) {
 	idx, ok := s.srcIdx(name)
 	if !ok {
-		return nil, false
+		return util.FastIntSet{}, false
 	}
-	return s[idx].columnRange, true
+	return s[idx].columnSet, true
 }
 
 // anonymousTable is the empty table name, used when a data source
@@ -224,10 +220,10 @@ var anonymousTable = parser.TableName{}
 
 // fillColumnRange creates a single range that refers to all the
 // columns between firstIdx and lastIdx, inclusive.
-func fillColumnRange(firstIdx, lastIdx int) columnRange {
-	res := make(columnRange, lastIdx-firstIdx+1)
-	for i := range res {
-		res[i] = i + firstIdx
+func fillColumnRange(firstIdx, lastIdx int) util.FastIntSet {
+	var res util.FastIntSet
+	for i := firstIdx; i <= lastIdx; i++ {
+		res.Add(i)
 	}
 	return res
 }
@@ -237,10 +233,9 @@ func fillColumnRange(firstIdx, lastIdx int) columnRange {
 func newSourceInfoForSingleTable(
 	tn parser.TableName, columns sqlbase.ResultColumns,
 ) *dataSourceInfo {
-	norm := tn.NormalizedTableName()
 	return &dataSourceInfo{
 		sourceColumns: columns,
-		sourceAliases: sourceAliases{{name: norm, columnRange: fillColumnRange(0, len(columns)-1)}},
+		sourceAliases: sourceAliases{{name: tn, columnSet: fillColumnRange(0, len(columns)-1)}},
 	}
 }
 
@@ -250,7 +245,7 @@ func (p *planner) getSources(
 ) (planDataSource, error) {
 	switch len(sources) {
 	case 0:
-		plan := &emptyNode{results: true}
+		plan := &unaryNode{}
 		return planDataSource{
 			info: newSourceInfoForSingleTable(anonymousTable, planColumns(plan)),
 			plan: plan,
@@ -301,7 +296,7 @@ func (p *planner) getVirtualDataSource(
 		//
 		// Meanwhile the root user probably would be inconvenienced by
 		// this.
-		prefix := tn.PrefixName.Normalize()
+		prefix := string(tn.PrefixName)
 		if !tn.PrefixOriginallySpecified {
 			prefix = p.session.Database
 			if prefix == "" && p.session.User != security.RootUser {
@@ -329,6 +324,42 @@ func (p *planner) getVirtualDataSource(
 		}, true, nil
 	}
 	return planDataSource{}, false, nil
+}
+
+// getDataSourceAsOneColumn builds a planDataSource from a data source
+// clause and ensures that it returns one column. If the plan would
+// return zero or more than one column, the columns are grouped into
+// a tuple. This is needed for SRF substitution (e.g. `SELECT
+// pg_get_keywords()`).
+func (p *planner) getDataSourceAsOneColumn(
+	ctx context.Context, src *parser.FuncExpr,
+) (planDataSource, error) {
+	ds, err := p.getDataSource(ctx, src, nil, publicColumns)
+	if err != nil {
+		return ds, err
+	}
+	if len(ds.info.sourceColumns) == 1 {
+		return ds, nil
+	}
+
+	// Zero or more than one column: make a tuple.
+
+	// We use the name of the function to determine the name of the
+	// rendered column.
+	fd, err := src.Func.Resolve(p.session.SearchPath)
+	if err != nil {
+		return planDataSource{}, err
+	}
+	newPlan, err := p.makeTupleRender(ctx, ds, fd.Name)
+	if err != nil {
+		return planDataSource{}, err
+	}
+
+	tn := parser.TableName{TableName: parser.Name(fd.Name)}
+	return planDataSource{
+		info: newSourceInfoForSingleTable(tn, planColumns(newPlan)),
+		plan: newPlan,
+	}, nil
 }
 
 // getDataSource builds a planDataSource from a single data source clause
@@ -388,22 +419,17 @@ func (p *planner) getDataSource(
 	case *parser.ParenTableExpr:
 		return p.getDataSource(ctx, t.Expr, hints, scanVisibility)
 
+	case *parser.TableRef:
+		return p.getTableScanByRef(ctx, t, hints, scanVisibility)
+
 	case *parser.AliasedTableExpr:
 		// Alias clause: source AS alias(cols...)
-
-		var src planDataSource
-		var err error
 
 		if t.Hints != nil {
 			hints = t.Hints
 		}
 
-		if tref, ok := t.Expr.(*parser.TableRef); ok {
-			// Special case: operand is a numeric table reference.
-			src, err = p.getTableScanByRef(ctx, tref, hints, scanVisibility)
-		} else {
-			src, err = p.getDataSource(ctx, t.Expr, hints, scanVisibility)
-		}
+		src, err := p.getDataSource(ctx, t.Expr, hints, scanVisibility)
 		if err != nil {
 			return src, err
 		}
@@ -416,43 +442,7 @@ func (p *planner) getDataSource(
 			src = p.wrapOrdinality(src)
 		}
 
-		var tableAlias parser.TableName
-		if t.As.Alias != "" {
-			// If an alias was specified, use that.
-			tableAlias.TableName = parser.Name(t.As.Alias.Normalize())
-			src.info.sourceAliases = sourceAliases{{
-				name:        tableAlias,
-				columnRange: fillColumnRange(0, len(src.info.sourceColumns)-1),
-			}}
-		}
-		colAlias := t.As.Cols
-
-		if len(colAlias) > 0 {
-			// Make a copy of the slice since we are about to modify the contents.
-			src.info.sourceColumns = append(sqlbase.ResultColumns(nil), src.info.sourceColumns...)
-
-			// The column aliases can only refer to explicit columns.
-			for colIdx, aliasIdx := 0, 0; aliasIdx < len(colAlias); colIdx++ {
-				if colIdx >= len(src.info.sourceColumns) {
-					var srcName string
-					if tableAlias.DatabaseName != "" {
-						srcName = tableAlias.String()
-					} else {
-						srcName = tableAlias.TableName.String()
-					}
-
-					return planDataSource{}, errors.Errorf(
-						"source %q has %d columns available but %d columns specified",
-						srcName, aliasIdx, len(colAlias))
-				}
-				if src.info.sourceColumns[colIdx].Hidden {
-					continue
-				}
-				src.info.sourceColumns[colIdx].Name = string(colAlias[aliasIdx])
-				aliasIdx++
-			}
-		}
-		return src, nil
+		return renameSource(src, t.As, false)
 
 	default:
 		return planDataSource{}, errors.Errorf("unsupported FROM type %T", src)
@@ -474,20 +464,25 @@ func (p *planner) QualifyWithDatabase(
 	return tn, nil
 }
 
+func (p *planner) getTableDescByID(
+	ctx context.Context, tableID sqlbase.ID,
+) (*sqlbase.TableDescriptor, error) {
+	descFunc := p.session.tables.getTableVersionByID
+	if p.avoidCachedDescriptors {
+		descFunc = sqlbase.GetTableDescFromID
+	}
+	return descFunc(ctx, p.txn, tableID)
+}
+
 func (p *planner) getTableScanByRef(
 	ctx context.Context,
 	tref *parser.TableRef,
 	hints *parser.IndexHints,
 	scanVisibility scanVisibility,
 ) (planDataSource, error) {
-	tableID := sqlbase.ID(tref.TableID)
-	descFunc := p.session.tables.getTableVersionByID
-	if p.avoidCachedDescriptors {
-		descFunc = sqlbase.GetTableDescFromID
-	}
-	desc, err := descFunc(ctx, p.txn, tableID)
+	desc, err := p.getTableDescByID(ctx, sqlbase.ID(tref.TableID))
 	if err != nil {
-		return planDataSource{}, err
+		return planDataSource{}, errors.Errorf("%s: %v", parser.ErrString(tref), err)
 	}
 
 	tn := parser.TableName{
@@ -503,7 +498,70 @@ func (p *planner) getTableScanByRef(
 		DBNameOriginallyOmitted: true,
 	}
 
-	return p.getPlanForDesc(ctx, desc, &tn, hints, scanVisibility, tref.Columns)
+	src, err := p.getPlanForDesc(ctx, desc, &tn, hints, scanVisibility, tref.Columns)
+	if err != nil {
+		return src, err
+	}
+
+	return renameSource(src, tref.As, true)
+}
+
+// renameSource applies an AS clause to a data source.
+func renameSource(
+	src planDataSource, as parser.AliasClause, includeHidden bool,
+) (planDataSource, error) {
+	var tableAlias parser.TableName
+	colAlias := as.Cols
+
+	if as.Alias != "" {
+		// Special case for Postgres compatibility: if a data source does
+		// not currently have a name, and it is a set-generating function
+		// with just one column, and the AS clause doesn't specify column
+		// names, then use the specified table name both as the
+		// column name and table name.
+		isAnonymousTable := (len(src.info.sourceAliases) == 0 ||
+			(len(src.info.sourceAliases) == 1 && src.info.sourceAliases[0].name == anonymousTable))
+		noColNameSpecified := len(colAlias) == 0
+		if vg, ok := src.plan.(*valueGenerator); ok && isAnonymousTable && noColNameSpecified {
+			if tType, ok := vg.expr.ResolvedType().(parser.TTable); ok && len(tType.Cols) == 1 {
+				colAlias = parser.NameList{as.Alias}
+			}
+		}
+
+		// If an alias was specified, use that.
+		tableAlias.TableName = as.Alias
+		src.info.sourceAliases = sourceAliases{{
+			name:      tableAlias,
+			columnSet: fillColumnRange(0, len(src.info.sourceColumns)-1),
+		}}
+	}
+
+	if len(colAlias) > 0 {
+		// Make a copy of the slice since we are about to modify the contents.
+		src.info.sourceColumns = append(sqlbase.ResultColumns(nil), src.info.sourceColumns...)
+
+		// The column aliases can only refer to explicit columns.
+		for colIdx, aliasIdx := 0, 0; aliasIdx < len(colAlias); colIdx++ {
+			if colIdx >= len(src.info.sourceColumns) {
+				var srcName string
+				if tableAlias.DatabaseName != "" {
+					srcName = parser.ErrString(&tableAlias)
+				} else {
+					srcName = parser.ErrString(tableAlias.TableName)
+				}
+
+				return planDataSource{}, errors.Errorf(
+					"source %q has %d columns available but %d columns specified",
+					srcName, aliasIdx, len(colAlias))
+			}
+			if !includeHidden && src.info.sourceColumns[colIdx].Hidden {
+				continue
+			}
+			src.info.sourceColumns[colIdx].Name = string(colAlias[aliasIdx])
+			aliasIdx++
+		}
+	}
+	return src, nil
 }
 
 // getTableScanOrViewPlan builds a planDataSource from a single data source
@@ -517,26 +575,30 @@ func (p *planner) getTableScanOrViewPlan(
 ) (planDataSource, error) {
 	if tn.PrefixOriginallySpecified {
 		// Prefixes are currently only supported for virtual tables.
-		return planDataSource{}, parser.NewInvalidTableNameError(tn.String())
+		return planDataSource{}, parser.NewInvalidNameErrorf(
+			"invalid table name: %q", parser.ErrString(tn))
 	}
 
-	var desc *sqlbase.TableDescriptor
-	var err error
-	if p.avoidCachedDescriptors {
-		// AS OF SYSTEM TIME queries need to fetch the table descriptor at the
-		// specified time, and never lease anything. The proto transaction already
-		// has its timestamps set correctly so getTableOrViewDesc will fetch with
-		// the correct timestamp.
-		desc, err = mustGetTableOrViewDesc(
-			ctx, p.txn, p.getVirtualTabler(), tn, false /*allowAdding*/)
-	} else {
-		desc, err = p.session.tables.getTableVersion(ctx, p.txn, p.getVirtualTabler(), tn)
-	}
+	desc, err := p.getTableDesc(ctx, tn)
 	if err != nil {
 		return planDataSource{}, err
 	}
 
 	return p.getPlanForDesc(ctx, desc, tn, hints, scanVisibility, nil)
+}
+
+func (p *planner) getTableDesc(
+	ctx context.Context, tn *parser.TableName,
+) (*sqlbase.TableDescriptor, error) {
+	if p.avoidCachedDescriptors {
+		// AS OF SYSTEM TIME queries need to fetch the table descriptor at the
+		// specified time, and never lease anything. The proto transaction already
+		// has its timestamps set correctly so getTableOrViewDesc will fetch with
+		// the correct timestamp.
+		return MustGetTableOrViewDesc(
+			ctx, p.txn, p.getVirtualTabler(), tn, false /*allowAdding*/)
+	}
+	return p.session.tables.getTableVersion(ctx, p.txn, p.getVirtualTabler(), tn)
 }
 
 func (p *planner) getPlanForDesc(
@@ -554,8 +616,8 @@ func (p *planner) getPlanForDesc(
 		}
 		return p.getViewPlan(ctx, tn, desc)
 	} else if !desc.IsTable() {
-		return planDataSource{},
-			errors.Errorf("unexpected table descriptor of type %s for %q", desc.TypeName(), tn)
+		return planDataSource{}, errors.Errorf(
+			"unexpected table descriptor of type %s for %q", desc.TypeName(), parser.ErrString(tn))
 	}
 
 	// This name designates a real table.
@@ -598,15 +660,27 @@ func (p *planner) getViewPlan(
 		defer func() { p.skipSelectPrivilegeChecks = false }()
 	}
 
+	// Register the dependency to the planner, if requested.
+	if p.planDeps != nil {
+		usedColumns := make([]sqlbase.ColumnID, len(desc.Columns))
+		for i := range desc.Columns {
+			usedColumns[i] = desc.Columns[i].ID
+		}
+		deps := p.planDeps[desc.ID]
+		deps.desc = desc
+		deps.deps = append(deps.deps, sqlbase.TableDescriptor_Reference{ColumnIDs: usedColumns})
+		p.planDeps[desc.ID] = deps
+
+		// We are only interested in the dependency to this view descriptor. Any
+		// further dependency by the view's query should not be tracked in this planner.
+		defer func(prev planDependencies) { p.planDeps = prev }(p.planDeps)
+		p.planDeps = nil
+	}
+
 	// TODO(a-robinson): Support ORDER BY and LIMIT in views. Is it as simple as
 	// just passing the entire select here or will inserting an ORDER BY in the
 	// middle of a query plan break things?
-	plan, err := p.getSubqueryPlan(ctx, *tn, sel.Select, sqlbase.ResultColumnsFromColDescs(desc.Columns))
-	if err != nil {
-		return plan, err
-	}
-	plan.info.viewDesc = desc
-	return plan, nil
+	return p.getSubqueryPlan(ctx, *tn, sel.Select, sqlbase.ResultColumnsFromColDescs(desc.Columns))
 }
 
 // getSubqueryPlan builds a planDataSource for a select statement, including
@@ -646,7 +720,8 @@ func (src *dataSourceInfo) expandStar(
 	v parser.VarName, ivarHelper parser.IndexedVarHelper,
 ) (columns sqlbase.ResultColumns, exprs []parser.TypedExpr, err error) {
 	if len(src.sourceColumns) == 0 {
-		return nil, nil, fmt.Errorf("cannot use %q without a FROM clause", v)
+		return nil, nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError,
+			"cannot use %q without a FROM clause", parser.ErrString(v))
 	}
 
 	colSel := func(idx int) {
@@ -658,7 +733,7 @@ func (src *dataSourceInfo) expandStar(
 		}
 	}
 
-	tableName := parser.TableName{}
+	tableName := parser.TableName{DBNameOriginallyOmitted: true}
 	if a, ok := v.(*parser.AllColumnsSelector); ok {
 		tableName = a.TableName
 	}
@@ -667,18 +742,16 @@ func (src *dataSourceInfo) expandStar(
 			colSel(i)
 		}
 	} else {
-		norm := tableName.NormalizedTableName()
-
-		qualifiedTn, err := src.checkDatabaseName(norm)
+		qualifiedTn, err := src.checkDatabaseName(tableName)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		colRange, ok := src.sourceAliases.columnRange(qualifiedTn)
+		colSet, ok := src.sourceAliases.columnSet(qualifiedTn)
 		if !ok {
-			return nil, nil, fmt.Errorf("table %q not found", tableName.String())
+			return nil, nil, sqlbase.NewUndefinedRelationError(&tableName)
 		}
-		for _, i := range colRange {
+		for i, ok := colSet.Next(0); ok; i, ok = colSet.Next(i + 1) {
 			colSel(i)
 		}
 	}
@@ -687,6 +760,22 @@ func (src *dataSourceInfo) expandStar(
 }
 
 type multiSourceInfo []*dataSourceInfo
+
+func newUnknownSourceError(tn *parser.TableName) error {
+	return pgerror.NewErrorf(pgerror.CodeUndefinedTableError,
+		"source name %q not found in FROM clause", parser.ErrString(tn))
+}
+
+func newAmbiguousSourceError(t parser.Name, dbContext parser.Name) error {
+	if dbContext == "" {
+		return pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
+			"ambiguous source name: %q", parser.ErrString(t))
+
+	}
+	return pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
+		"ambiguous source name: %q (within database %q)",
+		parser.ErrString(t), parser.ErrString(dbContext))
+}
 
 // checkDatabaseName checks whether the given TableName is unambiguous
 // for the set of sources and if it is, qualifies the missing database name.
@@ -698,7 +787,7 @@ func (sources multiSourceInfo) checkDatabaseName(tn parser.TableName) (parser.Ta
 			for _, alias := range src.sourceAliases {
 				if alias.name.TableName == tn.TableName {
 					if found {
-						return parser.TableName{}, fmt.Errorf("ambiguous source name: %q", tn.TableName)
+						return parser.TableName{}, newAmbiguousSourceError(tn.TableName, "")
 					}
 					tn.DatabaseName = alias.name.DatabaseName
 					found = true
@@ -706,7 +795,7 @@ func (sources multiSourceInfo) checkDatabaseName(tn parser.TableName) (parser.Ta
 			}
 		}
 		if !found {
-			return parser.TableName{}, fmt.Errorf("source name %q not found in FROM clause", tn.TableName)
+			return parser.TableName{}, newUnknownSourceError(&tn)
 		}
 		return tn, nil
 	}
@@ -716,14 +805,13 @@ func (sources multiSourceInfo) checkDatabaseName(tn parser.TableName) (parser.Ta
 	for _, src := range sources {
 		if _, ok := src.sourceAliases.srcIdx(tn); ok {
 			if found {
-				return parser.TableName{}, fmt.Errorf("ambiguous source name: %q (within database %q)",
-					tn.TableName, tn.DatabaseName)
+				return parser.TableName{}, newAmbiguousSourceError(tn.TableName, tn.DatabaseName)
 			}
 			found = true
 		}
 	}
 	if !found {
-		return parser.TableName{}, fmt.Errorf("table %q not selected in FROM clause", &tn)
+		return parser.TableName{}, newUnknownSourceError(&tn)
 	}
 	return tn, nil
 }
@@ -737,23 +825,38 @@ func (src *dataSourceInfo) checkDatabaseName(tn parser.TableName) (parser.TableN
 		for _, alias := range src.sourceAliases {
 			if alias.name.TableName == tn.TableName {
 				if found {
-					return parser.TableName{}, fmt.Errorf("ambiguous source name: %q", tn.TableName)
+					return parser.TableName{}, newAmbiguousSourceError(tn.TableName, "")
 				}
 				found = true
 				tn.DatabaseName = alias.name.DatabaseName
 			}
 		}
 		if !found {
-			return parser.TableName{}, fmt.Errorf("source name %q not found in FROM clause", tn.TableName)
+			return parser.TableName{}, newUnknownSourceError(&tn)
 		}
 		return tn, nil
 	}
 
 	// Database given.
 	if _, found := src.sourceAliases.srcIdx(tn); !found {
-		return parser.TableName{}, fmt.Errorf("table %q not selected in FROM clause", &tn)
+		return parser.TableName{}, newUnknownSourceError(&tn)
 	}
 	return tn, nil
+}
+
+func findColHelper(
+	src *dataSourceInfo, c *parser.ColumnItem, colName string, iSrc, srcIdx, colIdx, idx int,
+) (int, int, error) {
+	col := src.sourceColumns[idx]
+	if col.Name == colName {
+		if colIdx != invalidColIdx {
+			return invalidSrcIdx, invalidColIdx, pgerror.NewErrorf(pgerror.CodeAmbiguousColumnError,
+				"column reference %q is ambiguous", parser.ErrString(c))
+		}
+		srcIdx = iSrc
+		colIdx = idx
+	}
+	return srcIdx, colIdx, nil
 }
 
 // findColumn looks up the column specified by a ColumnItem. The
@@ -768,12 +871,10 @@ func (sources multiSourceInfo) findColumn(
 		return invalidSrcIdx, invalidColIdx, pgerror.UnimplementedWithIssueErrorf(8318, "compound types not supported yet: %q", c)
 	}
 
-	colName := c.ColumnName.Normalize()
+	colName := string(c.ColumnName)
 	var tableName parser.TableName
 	if c.TableName.Table() != "" {
-		tableName = c.TableName.NormalizedTableName()
-
-		tn, err := sources.checkDatabaseName(tableName)
+		tn, err := sources.checkDatabaseName(c.TableName)
 		if err != nil {
 			return invalidSrcIdx, invalidColIdx, err
 		}
@@ -784,28 +885,16 @@ func (sources multiSourceInfo) findColumn(
 		c.TableName.DatabaseName = tableName.DatabaseName
 	}
 
-	findColHelper := func(src *dataSourceInfo, iSrc, srcIdx, colIdx int, idx int) (int, int, error) {
-		col := src.sourceColumns[idx]
-		if parser.ReNormalizeName(col.Name) == colName {
-			if colIdx != invalidColIdx {
-				return invalidSrcIdx, invalidColIdx, fmt.Errorf("column reference %q is ambiguous", c)
-			}
-			srcIdx = iSrc
-			colIdx = idx
-		}
-		return srcIdx, colIdx, nil
-	}
-
 	colIdx = invalidColIdx
 	for iSrc, src := range sources {
-		colRange, ok := src.sourceAliases.columnRange(tableName)
+		colSet, ok := src.sourceAliases.columnSet(tableName)
 		if !ok {
 			// The data source "src" has no column for table tableName.
-			// Try again with the net one.
+			// Try again with the next one.
 			continue
 		}
-		for _, idx := range colRange {
-			srcIdx, colIdx, err = findColHelper(src, iSrc, srcIdx, colIdx, idx)
+		for idx, ok := colSet.Next(0); ok; idx, ok = colSet.Next(idx + 1) {
+			srcIdx, colIdx, err = findColHelper(src, c, colName, iSrc, srcIdx, colIdx, idx)
 			if err != nil {
 				return srcIdx, colIdx, err
 			}
@@ -817,7 +906,7 @@ func (sources multiSourceInfo) findColumn(
 		// columns, not just columns of the anonymous table.
 		for iSrc, src := range sources {
 			for idx := 0; idx < len(src.sourceColumns); idx++ {
-				srcIdx, colIdx, err = findColHelper(src, iSrc, srcIdx, colIdx, idx)
+				srcIdx, colIdx, err = findColHelper(src, c, colName, iSrc, srcIdx, colIdx, idx)
 				if err != nil {
 					return srcIdx, colIdx, err
 				}
@@ -826,7 +915,9 @@ func (sources multiSourceInfo) findColumn(
 	}
 
 	if colIdx == invalidColIdx {
-		return invalidSrcIdx, invalidColIdx, fmt.Errorf("column name %q not found", c)
+		return invalidSrcIdx, invalidColIdx,
+			pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
+				"column name %q not found", parser.ErrString(c))
 	}
 
 	return srcIdx, colIdx, nil
@@ -836,10 +927,8 @@ func (sources multiSourceInfo) findColumn(
 // index given as argument. The index must be valid.
 func (src *dataSourceInfo) findTableAlias(colIdx int) (parser.TableName, bool) {
 	for _, alias := range src.sourceAliases {
-		for _, idx := range alias.columnRange {
-			if colIdx == idx {
-				return alias.name, true
-			}
+		if alias.columnSet.Contains(colIdx) {
+			return alias.name, true
 		}
 	}
 	return anonymousTable, false

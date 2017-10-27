@@ -11,19 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package log
 
 import (
 	"bytes"
 	"fmt"
-	"path/filepath"
 	"strconv"
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	otlog "github.com/opentracing/opentracing-go/log"
 )
@@ -143,14 +141,11 @@ func addStructured(ctx context.Context, s Severity, depth int, format string, ar
 	msg := MakeMessage(ctx, format, args)
 
 	if s == Severity_FATAL {
-		// we send the `format` str, not the formatted message, as args may be not
-		// be okay to share.
-		reportable := format
-		if reportable == "" && len(args) > 0 {
-			reportable = fmt.Sprintf("%T", args[0])
+		// We load the ReportingSettings from the a global singleton in this
+		// call path. See the singleton's comment for a rationale.
+		if sv := settings.TODO(); sv != nil {
+			SendCrashReport(ctx, sv, depth+2, format, args)
 		}
-		reportable = fmt.Sprintf("%s:%d %s", filepath.Base(file), line, reportable)
-		sendCrashReport(ctx, reportable, depth+1)
 	}
 	// MakeMessage already added the tags when forming msg, we don't want
 	// eventInternal to prepend them again.

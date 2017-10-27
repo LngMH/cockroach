@@ -11,14 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
 import (
 	"bytes"
 	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 )
 
 // Function names are used in expressions in the FuncExpr node.
@@ -95,7 +95,8 @@ type functionName struct {
 // normalizeFunctionName transforms an UnresolvedName to a functionName.
 func (n UnresolvedName) normalizeFunctionName() (functionName, error) {
 	if len(n) == 0 {
-		return functionName{}, fmt.Errorf("invalid function name: %s", n)
+		return functionName{}, pgerror.NewErrorf(
+			pgerror.CodeInvalidNameError, "invalid function name: %s", n)
 	}
 
 	// Find the first array subscript, if any.
@@ -109,7 +110,8 @@ func (n UnresolvedName) normalizeFunctionName() (functionName, error) {
 
 	// There must be something before the array subscript.
 	if i == 0 {
-		return functionName{}, fmt.Errorf("invalid function name: %s", n)
+		return functionName{}, pgerror.NewErrorf(
+			pgerror.CodeInvalidNameError, "invalid function name: %s", n)
 	}
 
 	// The function name, together with its prefix, must /look/ like a
@@ -118,7 +120,8 @@ func (n UnresolvedName) normalizeFunctionName() (functionName, error) {
 	tn, err := n[:i].normalizeTableNameAsValue()
 	if err != nil {
 		// Override the error, so as to not confuse the user.
-		return functionName{}, fmt.Errorf("invalid function name: %s", n)
+		return functionName{}, pgerror.NewErrorf(
+			pgerror.CodeInvalidNameError, "invalid function name: %s", n)
 	}
 
 	// Everything afterwards is the selector.

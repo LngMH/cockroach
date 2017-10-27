@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package cli
 
@@ -104,7 +102,7 @@ func TestClockOffsetFlagValue(t *testing.T) {
 			t.Fatal(err)
 		}
 		if td.expected != time.Duration(serverCfg.MaxOffset) {
-			t.Errorf("%d. MaxOffset expected %v, but got %v", i, td.expected, serverCfg.RaftTickInterval)
+			t.Errorf("%d. MaxOffset expected %v, but got %v", i, td.expected, serverCfg.MaxOffset)
 		}
 	}
 }
@@ -176,7 +174,7 @@ func TestClientConnSettings(t *testing.T) {
 
 	// For some reason, when run under stress all these test cases fail due to the
 	// `--host` flag being unknown to quitCmd. Just skip this under stress.
-	if testutils.Stress() {
+	if testutils.NightlyStress() {
 		t.Skip()
 	}
 

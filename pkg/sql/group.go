@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
@@ -112,9 +110,30 @@ func (p *planner) groupBy(
 			// below. We do however need to resolveNames so the
 			// AssertNoAggregationOrWindowing call below can find resolved
 			// FunctionDefs in the AST (instead of UnresolvedNames).
-			resolvedExpr, _, err := p.resolveNames(expr, r.sourceInfo, r.ivarHelper)
-			if err != nil {
-				return nil, nil, err
+
+			// While doing so, we must be careful not to expand top-level
+			// stars, because this is handled specially by
+			// computeRenderAllowingStars below.
+			skipResolve := false
+			if vName, ok := expr.(parser.VarName); ok {
+				v, err := vName.NormalizeVarName()
+				if err != nil {
+					return nil, nil, err
+				}
+				switch v.(type) {
+				case parser.UnqualifiedStar, *parser.AllColumnsSelector:
+					skipResolve = true
+				}
+			}
+
+			resolvedExpr := expr
+			if !skipResolve {
+				var hasStar bool
+				resolvedExpr, _, hasStar, err = p.resolveNames(expr, r.sourceInfo, r.ivarHelper)
+				if err != nil {
+					return nil, nil, err
+				}
+				p.hasStar = p.hasStar || hasStar
 			}
 			groupByExprs[i] = resolvedExpr
 		}
@@ -157,7 +176,11 @@ func (p *planner) groupBy(
 	// Add the group-by expressions.
 
 	// groupStrs maps a GROUP BY expression string to the index of the column in
-	// the underlying renderNode.
+	// the underlying renderNode. This is used as an optimization when analyzing
+	// the arguments of aggregate functions: if an argument is already grouped,
+	// and thus rendered, the rendered expression can be used as argument to
+	// the aggregate function directly; there is no need to add a render. See
+	// extractAggregatesVisitor below.
 	groupStrs := make(groupByStrMap, len(groupByExprs))
 	for _, g := range groupByExprs {
 		cols, exprs, hasStar, err := p.computeRenderAllowingStars(
@@ -166,13 +189,23 @@ func (p *planner) groupBy(
 		if err != nil {
 			return nil, nil, err
 		}
-		r.isStar = r.isStar || hasStar
+		p.hasStar = p.hasStar || hasStar
+
+		// GROUP BY (a, b) -> GROUP BY a, b
+		cols, exprs = flattenTuples(cols, exprs)
+
 		colIdxs := r.addOrReuseRenders(cols, exprs, true /* reuseExistingRender */)
-		if !hasStar {
+		if len(colIdxs) == 1 {
+			// We only remember the render if there is a 1:1 correspondence with
+			// the expression written after GROUP BY and the computed renders.
+			// This may not be true e.g. when there is a star expansion like
+			// GROUP BY kv.*.
 			groupStrs[symbolicExprStr(g)] = colIdxs[0]
-		} else {
-			// We use a special value to indicate a star (e.g. GROUP BY t.*).
-			groupStrs[symbolicExprStr(g)] = -1
+		}
+		// Also remember all the rendered sub-expressions, if there was an
+		// expansion. This enables reuse of all the actual grouping expressions.
+		for i, e := range exprs {
+			groupStrs[symbolicExprStr(e)] = colIdxs[i]
 		}
 	}
 	group.numGroupCols = len(r.render)
@@ -187,7 +220,6 @@ func (p *planner) groupBy(
 	// also treated as aggregate expressions (with identAggregate).
 	if typedHaving != nil {
 		havingNode = &filterNode{
-			p:      r.planner,
 			source: planDataSource{plan: plan, info: &dataSourceInfo{}},
 		}
 		plan = havingNode
@@ -245,7 +277,7 @@ func (p *planner) groupBy(
 		if err != nil {
 			return nil, nil, err
 		}
-		postRender.addRenderColumn(renderExpr, origColumns[i])
+		postRender.addRenderColumn(renderExpr, symbolicExprStr(renderExpr), origColumns[i])
 	}
 
 	postRender.source.info = newSourceInfoForSingleTable(anonymousTable, group.columns)
@@ -305,20 +337,23 @@ func (n *groupNode) Values() parser.Datums {
 	return n.values
 }
 
-func (n *groupNode) Start(ctx context.Context) error {
-	return n.plan.Start(ctx)
+func (n *groupNode) Start(params runParams) error {
+	return n.plan.Start(params)
 }
 
-func (n *groupNode) Next(ctx context.Context) (bool, error) {
+func (n *groupNode) Next(params runParams) (bool, error) {
 	var scratch []byte
 	// We're going to consume n.plan until it's exhausted (feeding all the rows to
 	// n.funcs), and then call n.setupOutput.
 	// Subsequent calls to next will skip the first part and just return a result.
 	for !n.populated {
 		next := false
+		if err := params.p.cancelChecker.Check(); err != nil {
+			return false, err
+		}
 		if !(n.needOnlyOneRow && n.gotOneRow) {
 			var err error
-			next, err = n.plan.Next(ctx)
+			next, err = n.plan.Next(params)
 			if err != nil {
 				return false, err
 			}
@@ -357,7 +392,7 @@ func (n *groupNode) Next(ctx context.Context) (bool, error) {
 				value = values[f.argRenderIdx]
 			}
 
-			if err := f.add(ctx, n.planner.session, bucket, value); err != nil {
+			if err := f.add(params.ctx, n.planner.session, bucket, value); err != nil {
 				return false, err
 			}
 		}
@@ -525,13 +560,6 @@ func (v *extractAggregatesVisitor) VisitPre(expr parser.Expr) (recurse bool, new
 	if groupIdx, ok := v.groupStrs[symbolicExprStr(expr)]; ok {
 		// This expression is in the GROUP BY; it is already being rendered by the
 		// renderNode.
-		if groupIdx == -1 {
-			// We use this special value to indicate a star GROUP BY.
-			// TODO(radu): to support this we need to store all the render indices in
-			// groupStrs, and create a tuple of IndexedVars. Also see #15750.
-			v.err = errors.New("star expressions not supported with grouping")
-			return false, expr
-		}
 		f := v.groupNode.newAggregateFuncHolder(
 			v.preRender.render[groupIdx], groupIdx, true /* ident */, parser.NewIdentAggregate,
 		)
@@ -572,7 +600,7 @@ func (v *extractAggregatesVisitor) VisitPre(expr parser.Expr) (recurse bool, new
 
 			default:
 				// TODO: #10495
-				v.err = pgerror.UnimplementedWithIssueErrorf(10495, "aggregate functions with multiple arguments are not supported yet")
+				v.err = pgerror.UnimplementedWithIssueError(10495, "aggregate functions with multiple arguments are not supported yet")
 				return false, expr
 			}
 

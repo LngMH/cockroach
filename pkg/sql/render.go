@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
@@ -50,19 +48,22 @@ type renderNode struct {
 	ivarHelper parser.IndexedVarHelper
 
 	// Rendering expressions for rows and corresponding output columns.
-	// populated by addOrMergeRenders()
+	// populated by addOrReuseRenders()
 	// as invoked initially by initTargets() and initWhere().
 	// sortNode peeks into the render array defined by initTargets() as an optimization.
 	// sortNode adds extra renderNode renders for sort columns not requested as select targets.
 	// groupNode copies/extends the render array defined by initTargets() and
 	// will add extra renderNode renders for the aggregation sources.
 	// windowNode also adds additional renders for the window functions.
-	render  []parser.TypedExpr
-	columns sqlbase.ResultColumns
+	render []parser.TypedExpr
 
-	// A piece of metadata to indicate whether a star expression was expanded
-	// during rendering.
-	isStar bool
+	// renderStrings stores the symbolic representations of the expressions in
+	// render, in the same order. It's used to prevent recomputation of the
+	// symbolic representations.
+	renderStrings []string
+
+	// columns is the set of result columns.
+	columns sqlbase.ResultColumns
 
 	// The number of initial columns - before adding any internal render
 	// targets for grouping, filtering or ordering. The original columns
@@ -75,7 +76,7 @@ type renderNode struct {
 	// ordering indicates the order of returned rows.
 	// initially suggested by the GROUP BY and ORDER BY clauses;
 	// modified by index selection.
-	ordering orderingInfo
+	props physicalProps
 
 	// The current source row, with one value per source column.
 	// populated by Next(), used by renderRow().
@@ -97,12 +98,12 @@ func (r *renderNode) Values() parser.Datums {
 	return r.row
 }
 
-func (r *renderNode) Start(ctx context.Context) error {
-	return r.source.plan.Start(ctx)
+func (r *renderNode) Start(params runParams) error {
+	return r.source.plan.Start(params)
 }
 
-func (r *renderNode) Next(ctx context.Context) (bool, error) {
-	if next, err := r.source.plan.Next(ctx); !next {
+func (r *renderNode) Next(params runParams) (bool, error) {
+	if next, err := r.source.plan.Next(params); !next {
 		return false, err
 	}
 
@@ -340,7 +341,7 @@ func (r *renderNode) initTargets(
 			return err
 		}
 
-		r.isStar = r.isStar || hasStar
+		r.planner.hasStar = r.planner.hasStar || hasStar
 		_ = r.addOrReuseRenders(cols, exprs, false)
 	}
 	// `groupBy` or `orderBy` may internally add additional columns which we
@@ -351,6 +352,34 @@ func (r *renderNode) initTargets(
 		panic(fmt.Sprintf("%d renders but %d columns!", len(r.render), len(r.columns)))
 	}
 	return nil
+}
+
+// makeTupleRender creates a new renderNode which makes a single tuple
+// columns from all the columns in its source. Used by
+// getDataSourceAsOneColumn().
+func (p *planner) makeTupleRender(
+	ctx context.Context, src planDataSource, name string,
+) (*renderNode, error) {
+	// Make a simple renderNode that renders all the columns in its
+	// source.
+	r := &renderNode{
+		planner:    p,
+		source:     src,
+		sourceInfo: multiSourceInfo{src.info},
+	}
+	r.ivarHelper = parser.MakeIndexedVarHelper(r, len(src.info.sourceColumns))
+
+	tExpr := &parser.Tuple{
+		Exprs: make(parser.Exprs, len(src.info.sourceColumns)),
+	}
+	for i := range src.info.sourceColumns {
+		tExpr.Exprs[i] = r.ivarHelper.IndexedVar(i)
+	}
+	if err := r.initTargets(ctx,
+		parser.SelectExprs{parser.SelectExpr{Expr: tExpr}}, nil); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // srfExtractionVisitor replaces the innermost set-returning function in an
@@ -426,22 +455,34 @@ func (r *renderNode) rewriteSRFs(
 
 	// We rewrote exactly one SRF; cross-join it with our sources and return the
 	// new render expression.
-	src, err := r.planner.getDataSource(ctx, v.srf, nil, publicColumns)
+	src, err := r.planner.getDataSourceAsOneColumn(ctx, v.srf)
 	if err != nil {
 		return target, err
 	}
-	src, err = r.planner.makeJoin(ctx, "CROSS JOIN", r.source, src, nil)
-	if err != nil {
-		return target, err
+
+	if !isUnarySource(r.source) {
+		// The FROM clause specifies something. Replace with a cross-join.
+		src, err = r.planner.makeJoin(ctx, "CROSS JOIN", r.source, src, nil)
+		if err != nil {
+			return target, err
+		}
 	}
+
 	r.source = src
 	r.sourceInfo = multiSourceInfo{r.source.info}
 
 	return parser.SelectExpr{Expr: expr}, nil
 }
 
+// A unary source is the special source used with empty FROM clauses:
+// a pseudo-table with zero columns and exactly one row.
+func isUnarySource(src planDataSource) bool {
+	_, ok := src.plan.(*unaryNode)
+	return ok && len(src.info.sourceColumns) == 0
+}
+
 func (r *renderNode) initWhere(ctx context.Context, whereExpr parser.Expr) (*filterNode, error) {
-	f := &filterNode{p: r.planner, source: r.source}
+	f := &filterNode{source: r.source}
 	f.ivarHelper = parser.MakeIndexedVarHelper(f, len(r.sourceInfo[0].sourceColumns))
 
 	if whereExpr != nil {
@@ -514,8 +555,11 @@ func getRenderColName(searchPath parser.SearchPath, target parser.SelectExpr) (s
 
 // appendRenderColumn adds a new render expression at the end of the current list.
 // The expression must be normalized already.
-func (r *renderNode) addRenderColumn(expr parser.TypedExpr, col sqlbase.ResultColumn) {
+func (r *renderNode) addRenderColumn(
+	expr parser.TypedExpr, exprStr string, col sqlbase.ResultColumn,
+) {
 	r.render = append(r.render, expr)
+	r.renderStrings = append(r.renderStrings, exprStr)
 	r.columns = append(r.columns, col)
 }
 
@@ -527,6 +571,9 @@ func (r *renderNode) resetRenderColumns(exprs []parser.TypedExpr, cols sqlbase.R
 		panic(fmt.Sprintf("resetRenderColumns used with arrays of different sizes: %d != %d", len(exprs), len(cols)))
 	}
 	r.render = exprs
+	// This clears all of the cached render strings. They'll get created again
+	// when necessary.
+	r.renderStrings = make([]string, len(cols))
 	r.columns = cols
 }
 
@@ -545,27 +592,17 @@ func (r *renderNode) renderRow() error {
 	return nil
 }
 
-// Searches for a render target that matches the given column reference.
-func (r *renderNode) findRenderIndexForCol(colIdx int) (idx int, ok bool) {
-	for i, r := range r.render {
-		if ivar, ok := r.(*parser.IndexedVar); ok && ivar.Idx == colIdx {
-			return i, true
-		}
-	}
-	return invalidColIdx, false
-}
-
 // Computes ordering information for the render node, given ordering information for the "from"
 // node.
 //
 //    SELECT a, b FROM t@abc ...
-//      the ordering is: first by column 0 (a), then by column 1 (b)
+//      the ordering is: first by column 0 (a), then by column 1 (b).
 //
 //    SELECT a, b FROM t@abc WHERE a = 1 ...
-//      the ordering is: exact match column (a), ordered by column 1 (b)
+//      the ordering is: exact match column (a), ordered by column 1 (b).
 //
 //    SELECT b, a FROM t@abc ...
-//      the ordering is: first by column 1 (a), then by column 0 (a)
+//      the ordering is: first by column 1 (a), then by column 0 (a).
 //
 //    SELECT a, c FROM t@abc ...
 //      the ordering is: just by column 0 (a). Here we don't have b as a render target so we
@@ -576,51 +613,33 @@ func (r *renderNode) findRenderIndexForCol(colIdx int) (idx int, ok bool) {
 //         SELECT a, c FROM t@abc ORDER by a,b,c
 //      we internally add b as a render target. The same holds for any targets required for
 //      grouping.
-func (r *renderNode) computeOrdering(fromOrder orderingInfo) {
-	r.ordering = orderingInfo{}
+//
+//    SELECT a, b, a FROM t@abc ...
+//      we have an equivalency group between columns 0 and 2 and the ordering is
+//      first by column 0 (a), then by column 1.
+func (r *renderNode) computePhysicalProps(fromOrder physicalProps) {
+	// See physicalProps.project for a description of the projection map.
+	projMap := make([]int, len(r.render))
+	for i, expr := range r.render {
+		if ivar, ok := expr.(*parser.IndexedVar); ok {
+			// Column ivar.Idx of the source becomes column i of the render node.
+			projMap[i] = ivar.Idx
+		} else {
+			projMap[i] = -1
+		}
+	}
+	r.props = fromOrder.project(projMap)
 
 	// Detect constants.
 	for col, expr := range r.render {
-		_, hasRowDependentValues, err := r.resolveNames(expr)
+		_, hasRowDependentValues, _, err := r.resolveNames(expr)
 		if err != nil {
 			// If we get an error here, the expression must contain an unresolved name
 			// or invalid indexed var; ignore.
 			continue
 		}
 		if !hasRowDependentValues && !r.columns[col].Omitted {
-			r.ordering.addExactMatchColumn(col)
+			r.props.addConstantColumn(col)
 		}
 	}
-
-	// See if any of the "exact match" columns have render targets. We can ignore any columns that
-	// don't have render targets. For example, assume we are using an ascending index on (k, v) with
-	// the query:
-	//
-	//   SELECT v FROM t WHERE k = 1
-	//
-	// The rows from the index are ordered by k then by v, but since k is an exact match
-	// column the results are also ordered just by v.
-	for colIdx := range fromOrder.exactMatchCols {
-		if renderIdx, ok := r.findRenderIndexForCol(colIdx); ok {
-			r.ordering.addExactMatchColumn(renderIdx)
-		}
-	}
-	// Find the longest prefix of columns that have render targets. Once we find a column that is
-	// not part of the output, the rest of the ordered columns aren't useful.
-	//
-	// For example, assume we are using an ascending index on (k, v) with the query:
-	//
-	//   SELECT v FROM t WHERE k > 1
-	//
-	// The rows from the index are ordered by k then by v. We cannot make any use of this
-	// ordering as an ordering on v.
-	for _, colOrder := range fromOrder.ordering {
-		renderIdx, ok := r.findRenderIndexForCol(colOrder.ColIdx)
-		if !ok {
-			return
-		}
-		r.ordering.addColumn(renderIdx, colOrder.Direction)
-	}
-	// We added all columns in fromOrder; we can copy the distinct flag.
-	r.ordering.unique = fromOrder.unique
 }

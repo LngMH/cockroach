@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package sql_test
 
@@ -119,6 +117,7 @@ func TestSystemTableLiterals(t *testing.T) {
 		{keys.UITableID, sqlbase.UITableSchema, sqlbase.UITable},
 		{keys.JobsTableID, sqlbase.JobsTableSchema, sqlbase.JobsTable},
 		{keys.SettingsTableID, sqlbase.SettingsTableSchema, sqlbase.SettingsTable},
+		{keys.WebSessionsTableID, sqlbase.WebSessionsTableSchema, sqlbase.WebSessionsTable},
 	} {
 		gen, err := sql.CreateTestTableDescriptor(
 			context.TODO(),

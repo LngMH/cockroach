@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
@@ -27,7 +25,7 @@ import (
 func testInitDummySelectNode(desc *sqlbase.TableDescriptor) *renderNode {
 	p := makeTestPlanner()
 	scan := &scanNode{p: p}
-	scan.desc = *desc
+	scan.desc = desc
 	// Note: scan.initDescDefaults only returns an error if its 2nd argument is not nil.
 	_ = scan.initDescDefaults(publicColumns, nil)
 
@@ -59,7 +57,7 @@ func TestRetryResolveNames(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		newExpr, _, err := s.resolveNames(expr)
+		newExpr, _, _, err := s.resolveNames(expr)
 		if err != nil {
 			t.Fatal(err)
 		}

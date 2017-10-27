@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package sqlbase
 
@@ -23,8 +20,9 @@ import (
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
 
 const (
@@ -72,6 +70,10 @@ type RowContainer struct {
 	// memAcc tracks the current memory consumption of this
 	// RowContainer.
 	memAcc mon.BoundAccount
+
+	// We should not copy this structure around; each copy would have a different
+	// memAcc (among other things like aliasing chunks).
+	noCopy util.NoCopy
 }
 
 // ColTypeInfo is a type that allows multiple representations of column type
@@ -90,6 +92,15 @@ func ColTypeInfoFromResCols(resCols ResultColumns) ColTypeInfo {
 // ColTypeInfoFromColTypes creates a ColTypeInfo from []ColumnType.
 func ColTypeInfoFromColTypes(colTypes []ColumnType) ColTypeInfo {
 	return ColTypeInfo{colTypes: colTypes}
+}
+
+// ColTypeInfoFromColDescs creates a ColTypeInfo from []ColumnDescriptor.
+func ColTypeInfoFromColDescs(colDescs []ColumnDescriptor) ColTypeInfo {
+	colTypes := make([]ColumnType, len(colDescs))
+	for i, colDesc := range colDescs {
+		colTypes[i] = colDesc.Type
+	}
+	return ColTypeInfoFromColTypes(colTypes)
 }
 
 // NumColumns returns the number of columns in the type.
@@ -130,21 +141,19 @@ func (ti ColTypeInfo) Type(idx int) parser.Type {
 // column selections could cause unchecked and potentially dangerous
 // memory growth.
 func NewRowContainer(acc mon.BoundAccount, ti ColTypeInfo, rowCapacity int) *RowContainer {
-	c := MakeRowContainer(acc, ti, rowCapacity)
-	return &c
+	c := &RowContainer{}
+	c.Init(acc, ti, rowCapacity)
+	return c
 }
 
-// MakeRowContainer is the non-pointer version of NewRowContainer, suitable to
-// avoid unnecessary indirections when RowContainer is already part of an on-heap
-// structure.
-func MakeRowContainer(acc mon.BoundAccount, ti ColTypeInfo, rowCapacity int) RowContainer {
+// Init can be used instead of NewRowContainer if we have a RowContainer that is
+// already part of an on-heap structure.
+func (c *RowContainer) Init(acc mon.BoundAccount, ti ColTypeInfo, rowCapacity int) {
 	nCols := ti.NumColumns()
 
-	c := RowContainer{
-		numCols:        nCols,
-		memAcc:         acc,
-		preallocChunks: 1,
-	}
+	c.numCols = nCols
+	c.memAcc = acc
+	c.preallocChunks = 1
 
 	if nCols != 0 {
 		c.rowsPerChunk = (targetChunkSize + nCols - 1) / nCols
@@ -170,8 +179,6 @@ func MakeRowContainer(acc mon.BoundAccount, ti ColTypeInfo, rowCapacity int) Row
 	// chunk and the slice pointing at the chunk.
 	c.chunkMemSize = SizeOfDatum * int64(c.rowsPerChunk*c.numCols)
 	c.chunkMemSize += SizeOfDatums
-
-	return c
 }
 
 // Clear resets the container and releases the associated memory. This allows
@@ -295,10 +302,20 @@ func (c *RowContainer) PopFirst() {
 	if c.numCols != 0 {
 		c.deletedRows++
 		if c.deletedRows == c.rowsPerChunk {
-			c.deletedRows = 0
+			// We release the memory for rows in chunks. This includes the
+			// chunk slice (allocated by allocChunks) and the Datums.
+			size := c.chunkMemSize
+			for i, pos := 0, 0; i < c.rowsPerChunk; i, pos = i+1, pos+c.numCols {
+				size += c.rowSize(c.chunks[0][pos : pos+c.numCols])
+			}
 			// Reset the pointer so the slice can be garbage collected.
 			c.chunks[0] = nil
+			c.deletedRows = 0
 			c.chunks = c.chunks[1:]
+
+			// We don't have a context plumbed here, but that's ok: it's not actually
+			// used in the shrink paths.
+			c.memAcc.Shrink(context.TODO(), size)
 		}
 	}
 }

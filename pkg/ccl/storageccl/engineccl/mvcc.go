@@ -49,7 +49,6 @@ type MVCCIncrementalIterator struct {
 	endTime   hlc.Timestamp
 	err       error
 	valid     bool
-	nextkey   bool
 
 	// For allocation avoidance.
 	meta enginepb.MVCCMetadata
@@ -75,8 +74,7 @@ func (i *MVCCIncrementalIterator) Seek(startKey engine.MVCCKey) {
 	i.iter.Seek(startKey)
 	i.err = nil
 	i.valid = true
-	i.nextkey = false
-	i.NextKey()
+	i.advance()
 }
 
 // Close frees up resources held by the iterator.
@@ -88,9 +86,8 @@ func (i *MVCCIncrementalIterator) Close() {
 // call, Valid() will be true if the iterator was not positioned at the last
 // key.
 func (i *MVCCIncrementalIterator) Next() {
-	// TODO(dan): Implement Next. We'll need this for `RESTORE ... AS OF SYSTEM
-	// TIME`.
-	panic("unimplemented")
+	i.iter.Next()
+	i.advance()
 }
 
 // NextKey advances the iterator to the next MVCC key. This operation is
@@ -98,6 +95,11 @@ func (i *MVCCIncrementalIterator) Next() {
 // the next key if the iterator is currently located at the last version for a
 // key.
 func (i *MVCCIncrementalIterator) NextKey() {
+	i.iter.NextKey()
+	i.advance()
+}
+
+func (i *MVCCIncrementalIterator) advance() {
 	for {
 		if !i.valid {
 			return
@@ -108,16 +110,10 @@ func (i *MVCCIncrementalIterator) NextKey() {
 			return
 		}
 
-		if i.nextkey {
-			i.nextkey = false
-			i.iter.NextKey()
-			continue
-		}
-
 		unsafeMetaKey := i.iter.UnsafeKey()
 		if unsafeMetaKey.IsValue() {
 			i.meta.Reset()
-			i.meta.Timestamp = unsafeMetaKey.Timestamp
+			i.meta.Timestamp = hlc.LegacyTimestamp(unsafeMetaKey.Timestamp)
 		} else {
 			if i.err = i.iter.ValueProto(&i.meta); i.err != nil {
 				i.valid = false
@@ -134,8 +130,9 @@ func (i *MVCCIncrementalIterator) NextKey() {
 			return
 		}
 
+		metaTimestamp := hlc.Timestamp(i.meta.Timestamp)
 		if i.meta.Txn != nil {
-			if !i.endTime.Less(i.meta.Timestamp) {
+			if !i.endTime.Less(metaTimestamp) {
 				i.err = &roachpb.WriteIntentError{
 					Intents: []roachpb.Intent{{
 						Span:   roachpb.Span{Key: i.iter.Key().Key},
@@ -150,22 +147,15 @@ func (i *MVCCIncrementalIterator) NextKey() {
 			continue
 		}
 
-		if i.endTime.Less(i.meta.Timestamp) {
+		if i.endTime.Less(metaTimestamp) {
 			i.iter.Next()
 			continue
 		}
-		if !i.startTime.Less(i.meta.Timestamp) {
+		if !i.startTime.Less(metaTimestamp) {
 			i.iter.NextKey()
 			continue
 		}
 
-		// Skip tombstone (len=0) records when startTime is zero (non-incremental).
-		if (i.startTime == hlc.Timestamp{}) && len(i.iter.UnsafeValue()) == 0 {
-			i.iter.NextKey()
-			continue
-		}
-
-		i.nextkey = true
 		break
 	}
 }

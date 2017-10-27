@@ -15,13 +15,15 @@ import (
 	"os"
 	"testing"
 
-	"github.com/rlmcpherson/s3gof3r"
-
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
+
+func initNone(_ *cluster.Settings) {}
 
 // The tests in this file talk to remote APIs which require credentials.
 // To run these tests, you need to supply credentials via env vars (the tests
@@ -34,7 +36,7 @@ import (
 // only run if the AWS_S3_BUCKET environment var is set.
 func TestCloudBackupRestoreS3(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s3Keys, err := s3gof3r.EnvKeys()
+	creds, err := credentials.NewEnvCredentials().Get()
 	if err != nil {
 		t.Skipf("No AWS env keys (%v)", err)
 	}
@@ -43,17 +45,23 @@ func TestCloudBackupRestoreS3(t *testing.T) {
 		t.Skip("AWS_S3_BUCKET env var must be set")
 	}
 
+	// TODO(dt): this prevents leaking an http conn goroutine.
+	defer func(disableKeepAlives bool) {
+		http.DefaultTransport.(*http.Transport).DisableKeepAlives = disableKeepAlives
+	}(http.DefaultTransport.(*http.Transport).DisableKeepAlives)
+	http.DefaultTransport.(*http.Transport).DisableKeepAlives = true
+
 	// TODO(dan): Actually invalidate the descriptor cache and delete this line.
 	defer sql.TestDisableTableLeases()()
 	const numAccounts = 1000
 
-	ctx, _, _, sqlDB, cleanupFn := backupRestoreTestSetup(t, 1, numAccounts)
+	ctx, _, _, sqlDB, cleanupFn := backupRestoreTestSetup(t, 1, numAccounts, initNone)
 	defer cleanupFn()
 	prefix := fmt.Sprintf("TestBackupRestoreS3-%d", timeutil.Now().UnixNano())
 	uri := url.URL{Scheme: "s3", Host: bucket, Path: prefix}
 	values := uri.Query()
-	values.Add(storageccl.S3AccessKeyParam, s3Keys.AccessKey)
-	values.Add(storageccl.S3SecretParam, s3Keys.SecretKey)
+	values.Add(storageccl.S3AccessKeyParam, creds.AccessKeyID)
+	values.Add(storageccl.S3SecretParam, creds.SecretAccessKey)
 	uri.RawQuery = values.Encode()
 
 	backupAndRestore(ctx, t, sqlDB, uri.String(), numAccounts)
@@ -80,7 +88,7 @@ func TestCloudBackupRestoreGoogleCloudStorage(t *testing.T) {
 	}(http.DefaultTransport.(*http.Transport).DisableKeepAlives)
 	http.DefaultTransport.(*http.Transport).DisableKeepAlives = true
 
-	ctx, _, _, sqlDB, cleanupFn := backupRestoreTestSetup(t, 1, numAccounts)
+	ctx, _, _, sqlDB, cleanupFn := backupRestoreTestSetup(t, 1, numAccounts, initNone)
 	defer cleanupFn()
 	prefix := fmt.Sprintf("TestBackupRestoreGoogleCloudStorage-%d", timeutil.Now().UnixNano())
 	uri := url.URL{Scheme: "gs", Host: bucket, Path: prefix}
@@ -112,7 +120,7 @@ func TestCloudBackupRestoreAzure(t *testing.T) {
 	}(http.DefaultTransport.(*http.Transport).DisableKeepAlives)
 	http.DefaultTransport.(*http.Transport).DisableKeepAlives = true
 
-	ctx, _, _, sqlDB, cleanupFn := backupRestoreTestSetup(t, 1, numAccounts)
+	ctx, _, _, sqlDB, cleanupFn := backupRestoreTestSetup(t, 1, numAccounts, initNone)
 	defer cleanupFn()
 	prefix := fmt.Sprintf("TestBackupRestoreAzure-%d", timeutil.Now().UnixNano())
 	uri := url.URL{Scheme: "azure", Host: bucket, Path: prefix}

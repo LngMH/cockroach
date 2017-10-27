@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package sql
 
@@ -32,6 +30,7 @@ import (
 // execution.
 // It is used as the top-level node for SHOW TRACE FOR statements.
 type traceNode struct {
+	// plan is the wrapped execution plan that will be traced.
 	plan    planNode
 	columns sqlbase.ResultColumns
 	p       *planner
@@ -40,6 +39,13 @@ type traceNode struct {
 
 	traceRows []traceRow
 	curRow    int
+	// If set, the trace will also include "KV trace" messages - verbose messages
+	// around the interaction of SQL with KV. Some of the messages are per-row.
+	kvTracingEnabled bool
+
+	// recording is set if this node started tracing on the session. If it did,
+	// then Close() needs to stop the recording.
+	recording bool
 }
 
 var sessionTraceTableName = parser.TableName{
@@ -47,31 +53,45 @@ var sessionTraceTableName = parser.TableName{
 	TableName:    parser.Name("session_trace"),
 }
 
-func (p *planner) makeTraceNode(plan planNode) (planNode, error) {
+// makeTraceNode creates a new traceNode.
+//
+// Args:
+// plan: The wrapped execution plan to be traced.
+// kvTrancingEnabled: If set, the trace will also include "KV trace" messages -
+//   verbose messages around the interaction of SQL with KV. Some of the
+//   messages are per-row.
+func (p *planner) makeTraceNode(plan planNode, kvTracingEnabled bool) (planNode, error) {
 	desc, err := p.getVirtualTabler().getVirtualTableDesc(&sessionTraceTableName)
 	if err != nil {
 		return nil, err
 	}
 	return &traceNode{
-		plan:    plan,
-		p:       p,
-		columns: sqlbase.ResultColumnsFromColDescs(desc.Columns),
+		plan:             plan,
+		p:                p,
+		columns:          sqlbase.ResultColumnsFromColDescs(desc.Columns),
+		kvTracingEnabled: kvTracingEnabled,
 	}, nil
 }
 
-var errTracingAlreadyEnabled = errors.New("cannot run SHOW TRACE FOR while session tracing is enabled - did you mean SHOW SESSION TRACE?")
+var errTracingAlreadyEnabled = errors.New(
+	"cannot run SHOW TRACE FOR on statement while session tracing is enabled" +
+		" - did you mean SHOW TRACE FOR SESSION?")
 
-func (n *traceNode) Start(ctx context.Context) error {
+func (n *traceNode) Start(params runParams) error {
 	if n.p.session.Tracing.Enabled() {
 		return errTracingAlreadyEnabled
 	}
-	if err := n.p.session.Tracing.StartTracing(tracing.SnowballRecording, true); err != nil {
+	if err := n.p.session.Tracing.StartTracing(
+		tracing.SnowballRecording, n.kvTracingEnabled,
+	); err != nil {
 		return err
 	}
+	n.recording = true
 
-	startCtx, sp := tracing.ChildSpan(ctx, "starting plan")
+	startCtx, sp := tracing.ChildSpan(params.ctx, "starting plan")
 	defer sp.Finish()
-	return n.plan.Start(startCtx)
+	params.ctx = startCtx
+	return n.plan.Start(params)
 }
 
 func (n *traceNode) Close(ctx context.Context) {
@@ -79,21 +99,20 @@ func (n *traceNode) Close(ctx context.Context) {
 		n.plan.Close(ctx)
 	}
 	n.traceRows = nil
-	if n.p.session.Tracing.Enabled() {
-		// Start has already ran and enabled tracing. Stop it.
+	if n.recording {
 		if err := stopTracing(n.p.session); err != nil {
 			log.Errorf(ctx, "error stopping tracing at end of SHOW TRACE FOR: %v", err)
 		}
 	}
 }
 
-func (n *traceNode) Next(ctx context.Context) (bool, error) {
+func (n *traceNode) Next(params runParams) (bool, error) {
 	if !n.execDone {
 		// We need to run the entire statement upfront. Subsequent
 		// invocations of Next() will merely return the trace.
 
 		func() {
-			consumeCtx, sp := tracing.ChildSpan(ctx, "consuming rows")
+			consumeCtx, sp := tracing.ChildSpan(params.ctx, "consuming rows")
 			defer sp.Finish()
 
 			slowPath := true
@@ -105,7 +124,7 @@ func (n *traceNode) Next(ctx context.Context) (bool, error) {
 			}
 			if slowPath {
 				for {
-					hasNext, err := n.plan.Next(ctx)
+					hasNext, err := n.plan.Next(params)
 					if err != nil {
 						log.VEventf(consumeCtx, 2, "execution failed: %v", err)
 						break
@@ -115,7 +134,9 @@ func (n *traceNode) Next(ctx context.Context) (bool, error) {
 					}
 
 					values := n.plan.Values()
-					log.VEventf(consumeCtx, 2, "output row: %s", values)
+					if n.kvTracingEnabled {
+						log.VEventf(consumeCtx, 2, "output row: %s", values)
+					}
 				}
 			}
 			log.VEventf(consumeCtx, 2, "plan completed execution")
@@ -127,6 +148,7 @@ func (n *traceNode) Next(ctx context.Context) (bool, error) {
 			log.VEventf(consumeCtx, 2, "resources released, stopping trace")
 		}()
 
+		n.recording = false
 		if err := stopTracing(n.p.session); err != nil {
 			return false, err
 		}

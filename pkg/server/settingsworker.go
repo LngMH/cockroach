@@ -31,7 +31,7 @@ import (
 
 // RefreshSettings starts a settings-changes listener.
 func (s *Server) refreshSettings() {
-	tbl := sqlbase.SettingsTable
+	tbl := &sqlbase.SettingsTable
 
 	a := &sqlbase.DatumAlloc{}
 	settingsTablePrefix := keys.MakeTablePrefix(uint32(tbl.ID))
@@ -45,15 +45,16 @@ func (s *Server) refreshSettings() {
 		var k, v, t string
 		// First we need to decode the setting name field from the index key.
 		{
-			nameRow := []sqlbase.EncDatum{{Type: tbl.Columns[0].Type}}
-			_, matches, err := sqlbase.DecodeIndexKey(a, &tbl, tbl.PrimaryIndex.ID, nameRow, nil, kv.Key)
+			types := []sqlbase.ColumnType{tbl.Columns[0].Type}
+			nameRow := make([]sqlbase.EncDatum, 1)
+			_, matches, err := sqlbase.DecodeIndexKey(tbl, &tbl.PrimaryIndex, types, nameRow, nil, kv.Key)
 			if err != nil {
 				return errors.Wrap(err, "failed to decode key")
 			}
 			if !matches {
 				return errors.Errorf("unexpected non-settings KV with settings prefix: %v", kv.Key)
 			}
-			if err := nameRow[0].EnsureDecoded(a); err != nil {
+			if err := nameRow[0].EnsureDecoded(&types[0], a); err != nil {
 				return err
 			}
 			k = string(parser.MustBeDString(nameRow[0].Datum))
@@ -108,12 +109,11 @@ func (s *Server) refreshSettings() {
 	s.stopper.RunWorker(ctx, func(ctx context.Context) {
 		gossipUpdateC := s.gossip.RegisterSystemConfigChannel()
 		// No new settings can be defined beyond this point.
-		settings.Freeze()
 		for {
 			select {
 			case <-gossipUpdateC:
 				cfg, _ := s.gossip.GetSystemConfig()
-				u := settings.MakeUpdater()
+				u := s.st.MakeUpdater()
 				ok := true
 				for _, kv := range cfg.Values {
 					if err := processKV(ctx, kv, u); err != nil {
@@ -125,7 +125,7 @@ func (s *Server) refreshSettings() {
 					}
 				}
 				if ok {
-					u.Done()
+					u.ResetRemaining()
 				}
 			case <-s.stopper.ShouldStop():
 				return

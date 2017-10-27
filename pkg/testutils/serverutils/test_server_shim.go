@@ -12,9 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 //
-// Author: Radu Berinde (radu@cockroachlabs.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
-//
 // This file provides generic interfaces that allow tests to set up test servers
 // without importing the server package (avoiding circular dependencies).
 // To be used, the binary needs to call
@@ -30,8 +27,6 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -39,9 +34,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
@@ -55,8 +52,14 @@ type TestServerInterface interface {
 	// NodeID returns the ID of this node within its cluster.
 	NodeID() roachpb.NodeID
 
-	// ServingAddr returns the server's address.
+	// ServingAddr returns the server's advertised address.
 	ServingAddr() string
+
+	// HTTPAddr returns the server's http address.
+	HTTPAddr() string
+
+	// Addr returns the server's address.
+	Addr() string
 
 	// KVClient() returns a *client.DB instance for talking to this KV server,
 	// as an interface{}.
@@ -71,6 +74,9 @@ type TestServerInterface interface {
 	// LeaseManager() returns the *sql.LeaseManager as an interface{}.
 	LeaseManager() interface{}
 
+	// Executor() returns the *sql.Executor as an interface{}.
+	Executor() interface{}
+
 	// Gossip returns the gossip used by the TestServer.
 	Gossip() *gossip.Gossip
 
@@ -82,6 +88,9 @@ type TestServerInterface interface {
 
 	// DistSQLServer returns the *distsqlrun.ServerImpl as an interface{}.
 	DistSQLServer() interface{}
+
+	// JobRegistry returns the *jobs.Registry as an interface{}.
+	JobRegistry() interface{}
 
 	// SetDistSQLSpanResolver changes the SpanResolver used for DistSQL inside the
 	// server's executor. The argument must be a distsqlplan.SpanResolver
@@ -98,9 +107,12 @@ type TestServerInterface interface {
 
 	// AdminURL returns the URL for the admin UI.
 	AdminURL() string
-	// GetHTTPClient returns an http client connected to the server. It uses the
-	// context client TLS config.
+	// GetHTTPClient returns an http client configured with the client TLS
+	// config required by the TestServer's configuration.
 	GetHTTPClient() (http.Client, error)
+	// GetAuthenticatedHTTPClient returns an http client which has been
+	// authenticated to access Admin API methods (via a cookie).
+	GetAuthenticatedHTTPClient() (http.Client, error)
 
 	// MustGetSQLCounter returns the value of a counter metric from the server's
 	// SQL Executor. Runs in O(# of metrics) time, which is fine for test code.
@@ -120,6 +132,10 @@ type TestServerInterface interface {
 	// GetStores returns the collection of stores from this TestServer's node.
 	// The return value is of type *storage.Stores.
 	GetStores() interface{}
+
+	// ClusterSettings returns the ClusterSettings shared by all components of
+	// this server.
+	ClusterSettings() *cluster.Settings
 
 	// SplitRange splits the range containing splitKey.
 	SplitRange(
@@ -186,8 +202,8 @@ func StartServerRaw(args base.TestServerArgs) (TestServerInterface, error) {
 
 // GetJSONProto uses the supplied client to GET the URL specified by the parameters
 // and unmarshals the result into response.
-func GetJSONProto(ts TestServerInterface, path string, response proto.Message) error {
-	httpClient, err := ts.GetHTTPClient()
+func GetJSONProto(ts TestServerInterface, path string, response protoutil.Message) error {
+	httpClient, err := ts.GetAuthenticatedHTTPClient()
 	if err != nil {
 		return err
 	}
@@ -196,8 +212,8 @@ func GetJSONProto(ts TestServerInterface, path string, response proto.Message) e
 
 // PostJSONProto uses the supplied client to POST request to the URL specified by
 // the parameters and unmarshals the result into response.
-func PostJSONProto(ts TestServerInterface, path string, request, response proto.Message) error {
-	httpClient, err := ts.GetHTTPClient()
+func PostJSONProto(ts TestServerInterface, path string, request, response protoutil.Message) error {
+	httpClient, err := ts.GetAuthenticatedHTTPClient()
 	if err != nil {
 		return err
 	}

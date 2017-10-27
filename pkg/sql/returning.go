@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@cockroachlabs.com)
 
 package sql
 
@@ -53,7 +51,7 @@ func (p *planner) newReturningHelper(
 	ctx context.Context,
 	r parser.ReturningClause,
 	desiredTypes []parser.Type,
-	alias string,
+	tn *parser.TableName,
 	tablecols []sqlbase.ColumnDescriptor,
 ) (*returningHelper, error) {
 	rh := &returningHelper{
@@ -78,9 +76,8 @@ func (p *planner) newReturningHelper(
 	}
 
 	rh.columns = make(sqlbase.ResultColumns, 0, len(rExprs))
-	aliasTableName := parser.TableName{TableName: parser.Name(alias)}
 	rh.source = newSourceInfoForSingleTable(
-		aliasTableName, sqlbase.ResultColumnsFromColDescs(tablecols),
+		*tn, sqlbase.ResultColumnsFromColDescs(tablecols),
 	)
 	rh.exprs = make([]parser.TypedExpr, 0, len(rExprs))
 	ivarHelper := parser.MakeIndexedVarHelper(rh, len(tablecols))

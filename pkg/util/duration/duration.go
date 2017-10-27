@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Daniel Harrison (daniel.harrison@gmail.com)
 
 package duration
 
@@ -375,4 +373,15 @@ func AddMicros(t time.Time, d int64) time.Time {
 		d -= maxMicroDur
 	}
 	return t.Add(negMult * time.Duration(d) * time.Microsecond)
+}
+
+// Truncate returns a new duration obtained from the first argument
+// by discarding the portions at finer resolution than that given by the
+// second argument.
+// Example: Truncate(time.Second+1, time.Second) == time.Second.
+func Truncate(d time.Duration, r time.Duration) time.Duration {
+	if r == 0 {
+		panic("zero passed as resolution")
+	}
+	return d - (d % r)
 }

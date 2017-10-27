@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package keys
 
@@ -53,15 +51,15 @@ func TestMakeKey(t *testing.T) {
 	}
 }
 
-func TestAbortCacheEncodeDecode(t *testing.T) {
+func TestAbortSpanEncodeDecode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	const rangeID = 123
 	testTxnID, err := uuid.FromString("0ce61c17-5eb4-4587-8c36-dcf4062ada4c")
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := AbortCacheKey(rangeID, testTxnID)
-	txnID, err := DecodeAbortCacheKey(key, nil)
+	key := AbortSpanKey(rangeID, testTxnID)
+	txnID, err := DecodeAbortSpanKey(key, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +97,7 @@ func TestKeyAddressError(t *testing.T) {
 			StoreGossipKey(),
 		},
 		"local range ID key .* is not addressable": {
-			AbortCacheKey(0, uuid.MakeV4()),
+			AbortSpanKey(0, uuid.MakeV4()),
 			RaftTombstoneKey(0),
 			RaftAppliedIndexKey(0),
 			RaftTruncatedStateKey(0),
@@ -256,14 +254,16 @@ func TestMetaScanBounds(t *testing.T) {
 		},
 	}
 	for i, test := range testCases {
-		resStart, resEnd, err := MetaScanBounds(test.key)
+		res, err := MetaScanBounds(test.key)
 
 		if !testutils.IsError(err, test.expError) {
 			t.Errorf("expected error: %s ; got %v", test.expError, err)
 		}
 
-		if !resStart.Equal(test.expStart) || !resEnd.Equal(test.expEnd) {
-			t.Errorf("%d: range bounds %q-%q don't match expected bounds %q-%q for key %q", i, resStart, resEnd, test.expStart, test.expEnd, test.key)
+		expected := roachpb.RSpan{Key: test.expStart, EndKey: test.expEnd}
+		if !res.Equal(expected) {
+			t.Errorf("%d: range bounds %s don't match expected bounds %s for key %s",
+				i, res, expected, roachpb.Key(test.key))
 		}
 	}
 }
@@ -324,14 +324,16 @@ func TestMetaReverseScanBounds(t *testing.T) {
 		},
 	}
 	for i, test := range testCases {
-		resStart, resEnd, err := MetaReverseScanBounds(roachpb.RKey(test.key))
+		res, err := MetaReverseScanBounds(roachpb.RKey(test.key))
 
 		if !testutils.IsError(err, test.expError) {
 			t.Errorf("expected error %q ; got %v", test.expError, err)
 		}
 
-		if !resStart.Equal(test.expStart) || !resEnd.Equal(test.expEnd) {
-			t.Errorf("%d: range bounds %q-%q don't match expected bounds %q-%q for key %q", i, resStart, resEnd, test.expStart, test.expEnd, test.key)
+		expected := roachpb.RSpan{Key: test.expStart, EndKey: test.expEnd}
+		if !res.Equal(expected) {
+			t.Errorf("%d: range bounds %s don't match expected bounds %s for key %s",
+				i, res, expected, roachpb.Key(test.key))
 		}
 	}
 }
@@ -464,7 +466,7 @@ func TestMakeFamilyKey(t *testing.T) {
 	const maxFamID = math.MaxUint32
 	key := MakeFamilyKey(nil, maxFamID)
 	if expected, n := 6, len(key); expected != n {
-		t.Errorf("expected %d bytes, but got %d: [% x]", expected, n, []byte(key))
+		t.Errorf("expected %d bytes, but got %d: [% x]", expected, n, key)
 	}
 }
 
@@ -497,6 +499,16 @@ func TestEnsureSafeSplitKey(t *testing.T) {
 		if !d.expected.Equal(out) {
 			t.Fatalf("%d: %s: expected %s, but got %s", i, d.in, d.expected, out)
 		}
+
+		prefixLen, err := GetRowPrefixLength(d.in)
+		if err != nil {
+			t.Fatalf("%d: %s: unexpected error: %v", i, d.in, err)
+		}
+		suffix := d.in[prefixLen:]
+		expectedSuffix := d.in[len(d.expected):]
+		if !bytes.Equal(suffix, expectedSuffix) {
+			t.Fatalf("%d: %s: expected %s, but got %s", i, d.in, expectedSuffix, suffix)
+		}
 	}
 
 	errorData := []struct {
@@ -512,6 +524,9 @@ func TestEnsureSafeSplitKey(t *testing.T) {
 		{e(1, 200)[:2], "insufficient bytes to decode uvarint value"},
 		// The column ID suffix is invalid.
 		{e(1, 2, 200)[:3], "insufficient bytes to decode uvarint value"},
+		// Exercises a former overflow bug. We decode a uint(18446744073709551610) which, if casted
+		// to int carelessly, results in -6.
+		{encoding.EncodeVarintAscending(MakeTablePrefix(999), 322434), "malformed table key"},
 	}
 	for i, d := range errorData {
 		_, err := EnsureSafeSplitKey(d.in)

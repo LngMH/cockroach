@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package testcluster
 
@@ -34,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -213,11 +210,13 @@ func checkServerArgsForCluster(
 //
 // The new Server's copy of serverArgs might be changed according to the
 // cluster's ReplicationMode.
-func (tc *TestCluster) AddServer(t testing.TB, serverArgs base.TestServerArgs) error {
+func (tc *TestCluster) AddServer(t testing.TB, serverArgs base.TestServerArgs) {
 	if serverArgs.JoinAddr == "" && len(tc.Servers) > 0 {
 		serverArgs.JoinAddr = tc.Servers[0].ServingAddr()
 	}
-	return tc.doAddServer(t, serverArgs)
+	if err := tc.doAddServer(t, serverArgs); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (tc *TestCluster) doAddServer(t testing.TB, serverArgs base.TestServerArgs) error {
@@ -352,7 +351,7 @@ func (tc *TestCluster) AddReplicas(
 	}
 
 	// Wait for the replication to complete on all destination nodes.
-	if err := util.RetryForDuration(time.Second*5, func() error {
+	if err := retry.ForDuration(time.Second*5, func() error {
 		for _, target := range targets {
 			// Use LookupReplica(keys) instead of GetRange(rangeID) to ensure that the
 			// snapshot has been transferred and the descriptor initialized.
@@ -458,7 +457,7 @@ func (tc *TestCluster) FindRangeLeaseHolder(
 // startKey and then verifies that each replica in the range
 // descriptor has been created.
 func (tc *TestCluster) WaitForSplitAndReplication(startKey roachpb.Key) error {
-	return util.RetryForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
+	return retry.ForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
 		desc, err := tc.LookupRange(startKey)
 		if err != nil {
 			return errors.Wrapf(err, "unable to lookup range for %s", startKey)

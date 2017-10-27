@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package storage
 
@@ -22,9 +20,10 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/gogo/protobuf/proto"
-
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -47,7 +46,7 @@ func TrackRaftProtos() func() []reflect.Type {
 		funcName((*gossip.Gossip).AddInfoProto),
 		// Replica destroyed errors are written to disk, but they are
 		// deliberately per-replica values.
-		funcName((replicaStateLoader).setReplicaDestroyedError),
+		funcName((stateloader.StateLoader).SetReplicaDestroyedError),
 	}
 
 	belowRaftProtos := struct {
@@ -57,8 +56,23 @@ func TrackRaftProtos() func() []reflect.Type {
 		inner: make(map[reflect.Type]struct{}),
 	}
 
-	protoutil.Interceptor = func(pb proto.Message) {
+	// Hard-coded protos for which we don't want to change the encoding. These
+	// are not "below raft" in the normal sense, but instead are used as part of
+	// conditional put operations.
+	belowRaftProtos.Lock()
+	belowRaftProtos.inner[reflect.TypeOf(&roachpb.RangeDescriptor{})] = struct{}{}
+	belowRaftProtos.inner[reflect.TypeOf(&Liveness{})] = struct{}{}
+	belowRaftProtos.Unlock()
+
+	protoutil.Interceptor = func(pb protoutil.Message) {
 		t := reflect.TypeOf(pb)
+
+		// Special handling for MVCCMetadata: we expect MVCCMetadata to be
+		// marshalled below raft, but MVCCMetadata.Txn should always be nil in such
+		// cases.
+		if meta, ok := pb.(*enginepb.MVCCMetadata); ok && meta.Txn != nil {
+			protoutil.Interceptor(meta.Txn)
+		}
 
 		belowRaftProtos.Lock()
 		_, ok := belowRaftProtos.inner[t]
@@ -99,7 +113,7 @@ func TrackRaftProtos() func() []reflect.Type {
 	}
 
 	return func() []reflect.Type {
-		protoutil.Interceptor = func(_ proto.Message) {}
+		protoutil.Interceptor = func(_ protoutil.Message) {}
 
 		belowRaftProtos.Lock()
 		types := make([]reflect.Type, 0, len(belowRaftProtos.inner))

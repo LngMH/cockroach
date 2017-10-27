@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package distsqlrun
 
@@ -27,9 +24,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
@@ -49,44 +51,38 @@ type FlowID struct {
 type FlowCtx struct {
 	log.AmbientContext
 
+	Settings *cluster.Settings
+
 	stopper *stop.Stopper
 
 	// id is a unique identifier for a flow.
 	id FlowID
-	// evalCtx is used by all the processors in the flow to evaluate expressions.
-	evalCtx parser.EvalContext
+	// EvalCtx is used by all the processors in the flow to evaluate expressions.
+	EvalCtx parser.EvalContext
 	// rpcCtx is used by the Outboxes that may be present in the flow for
 	// connecting to other nodes.
 	rpcCtx *rpc.Context
-	// txnProto is the transaction in which kv operations performed by processors
-	// in the flow must be performed.
-	txnProto *roachpb.Transaction
+	// The transaction in which kv operations performed by processors in the flow
+	// must be performed. Processors in the Flow will use this txn concurrently.
+	txn *client.Txn
 	// clientDB is a handle to the cluster. Used for performing requests outside
 	// of the transaction in which the flow's query is running.
 	clientDB *client.DB
-	// remoteTxnDB is a handle to the cluster that bypasses the local
-	// TxnCoordSender. Used via setupTxn() for running requests on behalf of the
-	// query's transaction.
-	remoteTxnDB *client.DB
 	// nodeID is the ID of the node on which the processors using this FlowCtx
 	// run.
 	nodeID       roachpb.NodeID
 	testingKnobs TestingKnobs
 
-	// tempStorage is used by some DistSQL processors to store Rows when the
+	// TempStorage is used by some DistSQL processors to store Rows when the
 	// working set is larger than can be stored in memory.
-	tempStorage engine.Engine
-	// tempStorageIDGenerator is used to generate unique prefixes for each processor,
-	// so they use non-overlapping parts of the local store's keyspace.
-	tempStorageIDGenerator *TempStorageIDGenerator
-}
+	// This is not supposed to be used as a general engine.Engine and thus
+	// one should sparingly use the set of features offered by it.
+	TempStorage engine.Engine
+	// diskMonitor is used to monitor temporary storage disk usage.
+	diskMonitor *mon.BytesMonitor
 
-func (flowCtx *FlowCtx) setupTxn() *client.Txn {
-	txn := client.NewTxnWithProto(flowCtx.remoteTxnDB, *flowCtx.txnProto)
-	// DistSQL transactions get retryable errors that would otherwise be handled
-	// by the TxnCoordSender.
-	txn.AcceptUnhandledRetryableErrors()
-	return txn
+	// JobRegistry is used during backfill to load jobs which keep state.
+	JobRegistry *jobs.Registry
 }
 
 type flowStatus int
@@ -98,13 +94,19 @@ const (
 	FlowFinished
 )
 
+type startable interface {
+	start(ctx context.Context, wg *sync.WaitGroup, ctxCancel context.CancelFunc)
+}
+
 // Flow represents a flow which consists of processors and streams.
 type Flow struct {
 	FlowCtx
 
 	flowRegistry *flowRegistry
-	processors   []processor
-	outboxes     []*outbox
+	processors   []Processor
+	// startables are entities that must be started when the flow starts;
+	// currently these are outboxes and routers.
+	startables []startable
 	// syncFlowConsumer is a special outbox which instead of sending rows to
 	// another host, returns them directly (as a result to a SetupSyncFlow RPC,
 	// or to the local host).
@@ -125,6 +127,17 @@ type Flow struct {
 	doneFn func()
 
 	status flowStatus
+
+	// Context used for all execution within the flow.
+	// Created in Start(), cancelled in Cleanup().
+	ctx context.Context
+
+	// Cancel function for ctx. Call this to cancel the flow (safe to be called
+	// multiple times).
+	ctxCancel context.CancelFunc
+
+	// spec is the request that produced this flow. Only used for debugging.
+	spec *FlowSpec
 }
 
 func newFlow(flowCtx FlowCtx, flowReg *flowRegistry, syncFlowConsumer RowReceiver) *Flow {
@@ -189,7 +202,7 @@ func (f *Flow) setupOutboundStream(spec StreamEndpointSpec) (RowReceiver, error)
 
 	case StreamEndpointSpec_REMOTE:
 		outbox := newOutbox(&f.FlowCtx, spec.TargetAddr, f.id, sid)
-		f.outboxes = append(f.outboxes, outbox)
+		f.startables = append(f.startables, outbox)
 		return outbox, nil
 
 	case StreamEndpointSpec_LOCAL:
@@ -208,7 +221,10 @@ func (f *Flow) setupOutboundStream(spec StreamEndpointSpec) (RowReceiver, error)
 	}
 }
 
-func (f *Flow) setupRouter(spec *OutputRouterSpec) (RowReceiver, error) {
+// setupRouter initializes a router and the outbound streams.
+//
+// Pass-through routers are not supported; they should be handled separately.
+func (f *Flow) setupRouter(spec *OutputRouterSpec) (router, error) {
 	streams := make([]RowReceiver, len(spec.Streams))
 	for i := range spec.Streams {
 		var err error
@@ -230,22 +246,54 @@ func checkNumInOut(inputs []RowSource, outputs []RowReceiver, numIn, numOut int)
 	return nil
 }
 
-func (f *Flow) makeProcessor(ps *ProcessorSpec, inputs []RowSource) (processor, error) {
+func (f *Flow) makeProcessor(ps *ProcessorSpec, inputs []RowSource) (Processor, error) {
 	if len(ps.Output) != 1 {
 		return nil, errors.Errorf("only single-output processors supported")
 	}
 	outputs := make([]RowReceiver, len(ps.Output))
 	for i := range ps.Output {
-		var err error
-		outputs[i], err = f.setupRouter(&ps.Output[i])
+		spec := &ps.Output[i]
+		if spec.Type == OutputRouterSpec_PASS_THROUGH {
+			// There is no entity that corresponds to a pass-through router - we just
+			// use its output stream directly.
+			if len(spec.Streams) != 1 {
+				return nil, errors.Errorf("expected one stream for passthrough router")
+			}
+			var err error
+			outputs[i], err = f.setupOutboundStream(spec.Streams[0])
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		r, err := f.setupRouter(spec)
 		if err != nil {
 			return nil, err
 		}
+		outputs[i] = r
+		f.startables = append(f.startables, r)
 	}
-	return newProcessor(&f.FlowCtx, &ps.Core, &ps.Post, inputs, outputs)
+	proc, err := newProcessor(&f.FlowCtx, &ps.Core, &ps.Post, inputs, outputs)
+	if err != nil {
+		return nil, err
+	}
+	// Initialize any routers (the setupRouter case above) and outboxes.
+	types := proc.OutputTypes()
+	for _, o := range outputs {
+		switch o := o.(type) {
+		case router:
+			o.init(&f.FlowCtx, types)
+		case *outbox:
+			o.init(types)
+		}
+	}
+	return proc, nil
 }
 
 func (f *Flow) setup(ctx context.Context, spec *FlowSpec) error {
+	f.spec = spec
+
 	// First step: setup the input synchronizers for all processors.
 	inputSyncs := make([][]RowSource, len(spec.Processors))
 	for pIdx, ps := range spec.Processors {
@@ -285,7 +333,7 @@ func (f *Flow) setup(ctx context.Context, spec *FlowSpec) error {
 					streams[i] = rowChan
 				}
 				var err error
-				sync, err = makeOrderedSync(convertToColumnOrdering(is.Ordering), &f.evalCtx, streams)
+				sync, err = makeOrderedSync(convertToColumnOrdering(is.Ordering), &f.EvalCtx, streams)
 				if err != nil {
 					return err
 				}
@@ -297,7 +345,7 @@ func (f *Flow) setup(ctx context.Context, spec *FlowSpec) error {
 		}
 	}
 
-	f.processors = make([]processor, len(spec.Processors))
+	f.processors = make([]Processor, len(spec.Processors))
 
 	for i := range spec.Processors {
 		var err error
@@ -310,32 +358,67 @@ func (f *Flow) setup(ctx context.Context, spec *FlowSpec) error {
 }
 
 // Start starts the flow (each processor runs in their own goroutine).
-func (f *Flow) Start(ctx context.Context, doneFn func()) {
+//
+// Generally if errors are encountered during the setup part, they're returned.
+// But if the flow is a synchronous one, then no error is returned; instead the
+// setup error is pushed to the syncFlowConsumer. In this case, a subsequent
+// call to f.Wait() will not block.
+func (f *Flow) Start(ctx context.Context, doneFn func()) error {
 	f.doneFn = doneFn
 	log.VEventf(
-		ctx, 1, "starting (%d processors, %d outboxes)", len(f.outboxes), len(f.processors),
+		ctx, 1, "starting (%d processors, %d startables)", len(f.processors), len(f.startables),
 	)
 	f.status = FlowRunning
 
+	f.ctx, f.ctxCancel = contextutil.WithCancel(ctx)
+
 	// Once we call RegisterFlow, the inbound streams become accessible; we must
 	// set up the WaitGroup counter before.
-	f.waitGroup.Add(len(f.inboundStreams) + len(f.outboxes) + len(f.processors))
+	// The counter will be further incremented below to account for the
+	// processors.
+	f.waitGroup.Add(len(f.inboundStreams))
 
-	f.flowRegistry.RegisterFlow(ctx, f.id, f, f.inboundStreams, flowStreamDefaultTimeout)
+	if err := f.flowRegistry.RegisterFlow(
+		f.ctx, f.id, f, f.inboundStreams, flowStreamDefaultTimeout,
+	); err != nil {
+		if f.syncFlowConsumer != nil {
+			// For sync flows, the error goes to the consumer.
+			f.syncFlowConsumer.Push(nil /* row */, ProducerMetadata{Err: err})
+			f.syncFlowConsumer.ProducerDone()
+			return nil
+		}
+		return err
+	}
 	if log.V(1) {
-		log.Infof(ctx, "registered flow %s", f.id.Short())
+		log.Infof(f.ctx, "registered flow %s", f.id.Short())
 	}
-	for _, o := range f.outboxes {
-		o.start(ctx, &f.waitGroup)
+	for _, s := range f.startables {
+		s.start(f.ctx, &f.waitGroup, f.ctxCancel)
 	}
+	f.waitGroup.Add(len(f.processors))
 	for _, p := range f.processors {
-		go p.Run(ctx, &f.waitGroup)
+		go p.Run(f.ctx, &f.waitGroup)
 	}
+	return nil
 }
 
-// Wait waits for all the goroutines for this flow to exit.
+// Wait waits for all the goroutines for this flow to exit. If the context gets
+// cancelled before all goroutines exit, it calls f.cancel().
 func (f *Flow) Wait() {
-	f.waitGroup.Wait()
+	waitChan := make(chan struct{})
+
+	go func() {
+		f.waitGroup.Wait()
+		close(waitChan)
+	}()
+
+	select {
+	case <-f.ctx.Done():
+		f.cancel()
+		<-waitChan
+	case <-waitChan:
+		// Exit normally
+	}
 }
 
 // Cleanup should be called when the flow completes (after all processors and
@@ -345,8 +428,8 @@ func (f *Flow) Cleanup(ctx context.Context) {
 		panic("flow cleanup called twice")
 	}
 	// This closes the account and monitor opened in ServerImpl.setupFlow.
-	f.evalCtx.ActiveMemAcc.Close(ctx)
-	f.evalCtx.Stop(ctx)
+	f.EvalCtx.ActiveMemAcc.Close(ctx)
+	f.EvalCtx.Stop(ctx)
 	if log.V(1) {
 		log.Infof(ctx, "cleaning up")
 	}
@@ -356,6 +439,7 @@ func (f *Flow) Cleanup(ctx context.Context) {
 		f.flowRegistry.UnregisterFlow(f.id)
 	}
 	f.status = FlowFinished
+	f.ctxCancel()
 	f.doneFn()
 	f.doneFn = nil
 }
@@ -367,6 +451,41 @@ func (f *Flow) RunSync(ctx context.Context) {
 		p.Run(ctx, nil)
 	}
 	f.Cleanup(ctx)
+}
+
+// cancel iterates through all unconnected streams of this flow and marks them cancelled.
+// If the syncFlowConsumer is of type CancellableRowReceiver, mark it as cancelled.
+// This function is called in Wait() after the associated context has been cancelled.
+// In order to cancel a flow, call f.ctxCancel() instead of this function.
+//
+// For a detailed description of the distsql query cancellation mechanism,
+// read docs/RFCS/query_cancellation.md.
+func (f *Flow) cancel() {
+	f.flowRegistry.Lock()
+	defer f.flowRegistry.Unlock()
+
+	entry := f.flowRegistry.flows[f.id]
+	for streamID, is := range entry.inboundStreams {
+		// Connected, non-finished inbound streams will get an error
+		// returned in ProcessInboundStream(). Non-connected streams
+		// are handled below.
+		if !is.connected && !is.finished {
+			is.cancelled = true
+			// Stream has yet to be started; send an error to its
+			// receiver and prevent it from being connected.
+			is.receiver.Push(
+				nil, /* row */
+				ProducerMetadata{Err: sqlbase.NewQueryCanceledError()})
+			is.receiver.ProducerDone()
+			f.flowRegistry.finishInboundStreamLocked(f.id, streamID)
+		}
+	}
+
+	if f.syncFlowConsumer != nil {
+		if recv, ok := f.syncFlowConsumer.(CancellableRowReceiver); ok {
+			recv.SetCancelled()
+		}
+	}
 }
 
 var _ = (*Flow).RunSync

@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"time"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -25,12 +24,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // Load converts r into SSTables and backup descriptors. database is the name
@@ -53,7 +55,7 @@ func Load(
 	}
 
 	parse := parser.Parser{}
-	curTime := time.Unix(0, ts.WallTime).UTC()
+	curTime := timeutil.Unix(0, ts.WallTime)
 	evalCtx := parser.EvalContext{}
 	evalCtx.SetTxnTimestamp(curTime)
 	evalCtx.SetStmtTimestamp(curTime)
@@ -62,7 +64,7 @@ func Load(
 	if err != nil {
 		return BackupDescriptor{}, err
 	}
-	dir, err := storageccl.MakeExportStorage(ctx, conf)
+	dir, err := storageccl.MakeExportStorage(ctx, conf, cluster.NoSettings)
 	if err != nil {
 		return BackupDescriptor{}, errors.Wrap(err, "export storage from URI")
 	}
@@ -73,7 +75,7 @@ func Load(
 		SELECT
 			d.descriptor
 		FROM system.namespace n INNER JOIN system.descriptor d ON n.id = d.id
-		WHERE n.parentID = $1
+		WHERE n."parentID" = $1
 		AND n.name = $2`,
 		keys.RootNamespaceID,
 		database,
@@ -81,7 +83,7 @@ func Load(
 		return BackupDescriptor{}, errors.Wrap(err, "fetch database descriptor")
 	}
 	var dbDescWrapper sqlbase.Descriptor
-	if err := dbDescWrapper.Unmarshal(dbDescBytes); err != nil {
+	if err := protoutil.Unmarshal(dbDescBytes, &dbDescWrapper); err != nil {
 		return BackupDescriptor{}, errors.Wrap(err, "unmarshal database descriptor")
 	}
 	dbDesc := dbDescWrapper.GetDatabase()
@@ -148,7 +150,7 @@ func Load(
 			// only uses txn for resolving FKs and interleaved tables, neither of which
 			// are present here.
 			var txn *client.Txn
-			desc, err := sql.MakeTableDesc(ctx, txn, sql.NilVirtualTabler, nil, s, dbDesc.ID, 0 /* table ID */, privs, affected, dbDesc.Name, &evalCtx)
+			desc, err := sql.MakeTableDesc(ctx, txn, sql.NilVirtualTabler, parser.SearchPath{}, s, dbDesc.ID, 0 /* table ID */, ts, privs, affected, dbDesc.Name, &evalCtx)
 			if err != nil {
 				return BackupDescriptor{}, errors.Wrap(err, "make table desc")
 			}
@@ -159,7 +161,8 @@ func Load(
 				Union: &sqlbase.Descriptor_Table{Table: tableDesc},
 			})
 
-			ri, err = sqlbase.MakeRowInserter(nil, tableDesc, nil, tableDesc.Columns, true)
+			ri, err = sqlbase.MakeRowInserter(nil, tableDesc, nil, tableDesc.Columns,
+				true, &sqlbase.DatumAlloc{})
 			if err != nil {
 				return BackupDescriptor{}, errors.Wrap(err, "make row inserter")
 			}
@@ -174,7 +177,7 @@ func Load(
 			if tableDesc == nil {
 				return BackupDescriptor{}, errors.Errorf("expected previous CREATE TABLE %s statement", name)
 			}
-			if parser.ReNormalizeName(name) != parser.ReNormalizeName(tableName) {
+			if name != tableName {
 				return BackupDescriptor{}, errors.Errorf("unexpected INSERT for table %s after CREATE TABLE %s", name, tableName)
 			}
 			outOfOrder := false
@@ -216,7 +219,7 @@ func Load(
 		}
 	}
 
-	descBuf, err := backup.Marshal()
+	descBuf, err := protoutil.Marshal(&backup)
 	if err != nil {
 		return BackupDescriptor{}, errors.Wrap(err, "marshal backup descriptor")
 	}

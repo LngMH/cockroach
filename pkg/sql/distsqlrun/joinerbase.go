@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package distsqlrun
 
@@ -24,6 +22,8 @@ import (
 )
 
 type joinerBase struct {
+	processorBase
+
 	leftSource, rightSource RowSource
 
 	joinType    joinType
@@ -32,7 +32,15 @@ type joinerBase struct {
 	emptyRight  sqlbase.EncDatumRow
 	combinedRow sqlbase.EncDatumRow
 
-	out procOutputHelper
+	// eqCols contains the indices of the columns that are constrained to be
+	// equal. Specifically column eqCols[0][i] on the left side must match the
+	// column eqCols[1][i] on the right side.
+	eqCols [2]columns
+
+	// numMergedEqualityColumns specifies how many of the equality
+	// columns must be merged at the beginning of each result row. This
+	// is the desired behavior for USING and NATURAL JOIN.
+	numMergedEqualityColumns int
 }
 
 func (jb *joinerBase) init(
@@ -41,6 +49,9 @@ func (jb *joinerBase) init(
 	rightSource RowSource,
 	jType JoinType,
 	onExpr Expression,
+	leftEqColumns []uint32,
+	rightEqColumns []uint32,
+	numMergedColumns uint32,
 	post *PostProcessSpec,
 	output RowReceiver,
 ) error {
@@ -51,24 +62,39 @@ func (jb *joinerBase) init(
 	leftTypes := leftSource.Types()
 	jb.emptyLeft = make(sqlbase.EncDatumRow, len(leftTypes))
 	for i := range jb.emptyLeft {
-		jb.emptyLeft[i].Datum = parser.DNull
+		jb.emptyLeft[i] = sqlbase.DatumToEncDatum(leftTypes[i], parser.DNull)
 	}
 	rightTypes := rightSource.Types()
 	jb.emptyRight = make(sqlbase.EncDatumRow, len(rightTypes))
 	for i := range jb.emptyRight {
-		jb.emptyRight[i].Datum = parser.DNull
+		jb.emptyRight[i] = sqlbase.DatumToEncDatum(rightTypes[i], parser.DNull)
 	}
 
-	jb.combinedRow = make(sqlbase.EncDatumRow, 0, len(leftTypes)+len(rightTypes))
+	jb.eqCols[leftSide] = columns(leftEqColumns)
+	jb.eqCols[rightSide] = columns(rightEqColumns)
+	jb.numMergedEqualityColumns = int(numMergedColumns)
 
-	types := make([]sqlbase.ColumnType, 0, len(leftTypes)+len(rightTypes))
+	jb.combinedRow = make(sqlbase.EncDatumRow, 0, len(leftTypes)+len(rightTypes)+jb.numMergedEqualityColumns)
+
+	types := make([]sqlbase.ColumnType, 0, len(leftTypes)+len(rightTypes)+jb.numMergedEqualityColumns)
+	for idx := 0; idx < jb.numMergedEqualityColumns; idx++ {
+		ltype := leftTypes[jb.eqCols[leftSide][idx]]
+		rtype := rightTypes[jb.eqCols[rightSide][idx]]
+		var ctype sqlbase.ColumnType
+		if ltype.SemanticType != sqlbase.ColumnType_NULL {
+			ctype = ltype
+		} else {
+			ctype = rtype
+		}
+		types = append(types, ctype)
+	}
 	types = append(types, leftTypes...)
 	types = append(types, rightTypes...)
 
-	if err := jb.onCond.init(onExpr, types, &flowCtx.evalCtx); err != nil {
+	if err := jb.onCond.init(onExpr, types, &flowCtx.EvalCtx); err != nil {
 		return err
 	}
-	return jb.out.init(post, types, &flowCtx.evalCtx, output)
+	return jb.out.Init(post, types, &flowCtx.EvalCtx, output)
 }
 
 type joinSide uint8
@@ -93,7 +119,14 @@ func (jb *joinerBase) renderUnmatchedRow(
 	} else {
 		rrow = row
 	}
-	jb.combinedRow = append(jb.combinedRow[:0], lrow...)
+
+	// If there are merged columns, they take first positions in a row
+	// Values are taken from non-empty row
+	jb.combinedRow = jb.combinedRow[:0]
+	for idx := 0; idx < jb.numMergedEqualityColumns; idx++ {
+		jb.combinedRow = append(jb.combinedRow, row[jb.eqCols[side][idx]])
+	}
+	jb.combinedRow = append(jb.combinedRow, lrow...)
 	jb.combinedRow = append(jb.combinedRow, rrow...)
 	return jb.combinedRow
 }
@@ -131,7 +164,7 @@ func (jb *joinerBase) maybeEmitUnmatchedRow(
 	}
 
 	renderedRow := jb.renderUnmatchedRow(row, side)
-	consumerStatus, err := jb.out.emitRow(ctx, renderedRow)
+	consumerStatus, err := jb.out.EmitRow(ctx, renderedRow)
 	if err != nil {
 		jb.out.output.Push(nil /* row */, ProducerMetadata{Err: err})
 		return false
@@ -142,7 +175,15 @@ func (jb *joinerBase) maybeEmitUnmatchedRow(
 // render constructs a row with columns from both sides. The ON condition is
 // evaluated; if it fails, returns nil.
 func (jb *joinerBase) render(lrow, rrow sqlbase.EncDatumRow) (sqlbase.EncDatumRow, error) {
-	jb.combinedRow = append(jb.combinedRow[:0], lrow...)
+	jb.combinedRow = jb.combinedRow[:0]
+	for idx := 0; idx < jb.numMergedEqualityColumns; idx++ {
+		// this function is called only when lrow and rrow match on the equality
+		// columns which can never happen if there are any NULLs in these
+		// columns. So we know for sure the lrow value is not null
+		value := lrow[jb.eqCols[leftSide][idx]]
+		jb.combinedRow = append(jb.combinedRow, value)
+	}
+	jb.combinedRow = append(jb.combinedRow, lrow...)
 	jb.combinedRow = append(jb.combinedRow, rrow...)
 	res, err := jb.onCond.evalFilter(jb.combinedRow)
 	if !res || err != nil {

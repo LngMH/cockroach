@@ -19,17 +19,30 @@ package build_test
 import (
 	"bufio"
 	"bytes"
+	"fmt"
+	"go/ast"
 	"go/build"
+	"go/parser"
+	"go/token"
+	"go/types"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/ghemawat/stream"
+	"github.com/kisielk/gotool"
 	"github.com/pkg/errors"
 	"golang.org/x/tools/go/buildutil"
+	"golang.org/x/tools/go/loader"
+	"honnef.co/go/tools/lint"
+	"honnef.co/go/tools/simple"
+	"honnef.co/go/tools/staticcheck"
+	"honnef.co/go/tools/unused"
 )
 
 const cockroachDB = "github.com/cockroachdb/cockroach/pkg"
@@ -128,38 +141,72 @@ func TestStyle(t *testing.T) {
 
 	t.Run("TestEnvutil", func(t *testing.T) {
 		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `os\.(Getenv|LookupEnv)`, "--", "*.go")
-		if err != nil {
-			t.Fatal(err)
-		}
+		for _, tc := range []struct {
+			re       string
+			excludes []string
+		}{
+			{re: `\bos\.(Getenv|LookupEnv)\("COCKROACH`},
+			{
+				re: `\bos\.(Getenv|LookupEnv)\(`,
+				excludes: []string{
+					":!acceptance",
+					":!build/style_test.go",
+					":!ccl/acceptanceccl/backup_test.go",
+					":!ccl/sqlccl/backup_cloud_test.go",
+					":!ccl/storageccl/export_storage_test.go",
+					":!cmd",
+					":!util/envutil/env.go",
+					":!util/log/clog.go",
+					":!util/log/color.go",
+					":!util/sdnotify/sdnotify_unix.go",
+				},
+			},
+		} {
+			cmd, stderr, filter, err := dirCmd(
+				pkg.Dir,
+				"git",
+				append([]string{
+					"grep",
+					"-nE",
+					tc.re,
+					"--",
+					"*.go",
+				}, tc.excludes...)...,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-		if err := cmd.Start(); err != nil {
-			t.Fatal(err)
-		}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
 
-		if err := stream.ForEach(stream.Sequence(
-			filter,
-			stream.GrepNot(`^cmd(/.*)?/\w+\.go\b`),
-			stream.GrepNot(`^build/style_test\.go\b`),
-			stream.GrepNot(`^ccl/(sqlccl/backup_cloud|storageccl/export_storage|acceptanceccl/backup)_test\.go\b`),
-			stream.GrepNot(`^acceptance(/.*)?/\w+\.go\b`),
-			stream.GrepNot(`^util/(log|envutil|sdnotify)/\w+\.go\b`),
-		), func(s string) {
-			t.Errorf(`%s <- forbidden; use "envutil" instead`, s)
-		}); err != nil {
-			t.Error(err)
-		}
+			if err := stream.ForEach(filter, func(s string) {
+				t.Errorf(`%s <- forbidden; use "envutil" instead`, s)
+			}); err != nil {
+				t.Error(err)
+			}
 
-		if err := cmd.Wait(); err != nil {
-			if out := stderr.String(); len(out) > 0 {
-				t.Fatalf("err=%s, stderr=%s", err, out)
+			if err := cmd.Wait(); err != nil {
+				if out := stderr.String(); len(out) > 0 {
+					t.Fatalf("err=%s, stderr=%s", err, out)
+				}
 			}
 		}
 	})
 
 	t.Run("TestSyncutil", func(t *testing.T) {
 		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `sync\.(RW)?Mutex`, "--", "*.go")
+		cmd, stderr, filter, err := dirCmd(
+			pkg.Dir,
+			"git",
+			"grep",
+			"-nE",
+			`\bsync\.(RW)?Mutex`,
+			"--",
+			"*.go",
+			":!util/syncutil/mutex_sync.go",
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -168,10 +215,7 @@ func TestStyle(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := stream.ForEach(stream.Sequence(
-			filter,
-			stream.GrepNot(`^util/syncutil/mutex_sync\.go\b`),
-		), func(s string) {
+		if err := stream.ForEach(filter, func(s string) {
 			t.Errorf(`%s <- forbidden; use "syncutil.{,RW}Mutex" instead`, s)
 		}); err != nil {
 			t.Error(err)
@@ -186,7 +230,8 @@ func TestStyle(t *testing.T) {
 
 	t.Run("TestTodoStyle", func(t *testing.T) {
 		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `\sTODO\([^)]*\)[^:]`, "--", "*.go")
+		// TODO(tamird): enforce presence of name.
+		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `\sTODO\([^)]+\)[^:]`, "--", "*.go")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -210,7 +255,21 @@ func TestStyle(t *testing.T) {
 
 	t.Run("TestTimeutil", func(t *testing.T) {
 		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `time\.(Now|Since)`, "--", "*.go")
+		cmd, stderr, filter, err := dirCmd(
+			pkg.Dir,
+			"git",
+			"grep",
+			"-nE",
+			`\btime\.(Now|Since|Unix)\(`,
+			"--",
+			"*.go",
+			":!**/embedded.go",
+			":!util/timeutil/time.go",
+			":!util/timeutil/now_unix.go",
+			":!util/timeutil/now_windows.go",
+			":!util/tracing/tracer_span.go",
+			":!util/tracing/tracer.go",
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -219,10 +278,7 @@ func TestStyle(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := stream.ForEach(stream.Sequence(
-			filter,
-			stream.GrepNot(`^util/(log|syncutil|timeutil|tracing)/\w+\.go\b`),
-		), func(s string) {
+		if err := stream.ForEach(filter, func(s string) {
 			t.Errorf(`%s <- forbidden; use "timeutil" instead`, s)
 		}); err != nil {
 			t.Error(err)
@@ -237,7 +293,18 @@ func TestStyle(t *testing.T) {
 
 	t.Run("TestGrpc", func(t *testing.T) {
 		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `grpc.NewServer\([^)]*\)`, "--", "*.go")
+		cmd, stderr, filter, err := dirCmd(
+			pkg.Dir,
+			"git",
+			"grep",
+			"-nE",
+			`\bgrpc\.NewServer\(`,
+			"--",
+			"*.go",
+			":!rpc/context_test.go",
+			":!rpc/context.go",
+			":!util/grpcutil/grpc_util_test.go",
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -246,11 +313,33 @@ func TestStyle(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := stream.ForEach(stream.Sequence(
-			filter,
-			stream.GrepNot(`^rpc/context(_test)?\.go\b`),
-		), func(s string) {
+		if err := stream.ForEach(filter, func(s string) {
 			t.Errorf(`%s <- forbidden; use "rpc.NewServer" instead`, s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestPGErrors", func(t *testing.T) {
+		t.Parallel()
+		// TODO(justin): we should expand the packages this applies to as possible.
+		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `((fmt|errors).Errorf|errors.New)`, "--", "sql/parser/*.go", "util/ipaddr/*.go")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf(`%s <- forbidden; use "pgerror.NewErrorf" instead`, s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -264,7 +353,17 @@ func TestStyle(t *testing.T) {
 
 	t.Run("TestProtoClone", func(t *testing.T) {
 		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `\.Clone\([^)]+\)`, "--", "*.go")
+		cmd, stderr, filter, err := dirCmd(
+			pkg.Dir,
+			"git",
+			"grep",
+			"-nE",
+			`\.Clone\([^)]`,
+			"--",
+			"*.go",
+			":!util/protoutil/clone_test.go",
+			":!util/protoutil/clone.go",
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -275,8 +374,7 @@ func TestStyle(t *testing.T) {
 
 		if err := stream.ForEach(stream.Sequence(
 			filter,
-			stream.GrepNot(`protoutil\.Clone\([^)]+\)`),
-			stream.GrepNot(`^util/protoutil/clone(_test)?\.go\b`),
+			stream.GrepNot(`protoutil\.Clone\(`),
 		), func(s string) {
 			t.Errorf(`%s <- forbidden; use "protoutil.Clone" instead`, s)
 		}); err != nil {
@@ -292,7 +390,18 @@ func TestStyle(t *testing.T) {
 
 	t.Run("TestProtoMarshal", func(t *testing.T) {
 		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `\.Marshal\([^)]+\)`, "--", "*.go")
+		cmd, stderr, filter, err := dirCmd(
+			pkg.Dir,
+			"git",
+			"grep",
+			"-nE",
+			`\.Marshal\(`,
+			"--",
+			"*.go",
+			":!util/protoutil/marshal.go",
+			":!util/protoutil/marshaler.go",
+			":!settings/settings_test.go",
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -303,10 +412,110 @@ func TestStyle(t *testing.T) {
 
 		if err := stream.ForEach(stream.Sequence(
 			filter,
-			stream.GrepNot(`(json|yaml|protoutil|Field)\.Marshal`),
-			stream.GrepNot(`^util/protoutil/marshal(_test)?\.go\b`),
+			stream.GrepNot(`(json|yaml|protoutil|\.Field)\.Marshal\(`),
 		), func(s string) {
 			t.Errorf(`%s <- forbidden; use "protoutil.Marshal" instead`, s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestProtoUnmarshal", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkg.Dir,
+			"git",
+			"grep",
+			"-nE",
+			`\.Unmarshal\(`,
+			"--",
+			"*.go",
+			":!*.pb.go",
+			":!util/protoutil/marshal.go",
+			":!util/protoutil/marshaler.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(stream.Sequence(
+			filter,
+			stream.GrepNot(`(json|jsonpb|yaml|protoutil)\.Unmarshal\(`),
+		), func(s string) {
+			t.Errorf(`%s <- forbidden; use "protoutil.Unmarshal" instead`, s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestProtoMessage", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkg.Dir,
+			"git",
+			"grep",
+			"-nEw",
+			`proto\.Message`,
+			"--",
+			"*.go",
+			":!*.pb.go",
+			":!*.pb.gw.go",
+			":!util/protoutil/jsonpb_marshal.go",
+			":!util/protoutil/marshal.go",
+			":!util/protoutil/marshaler.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(stream.Sequence(
+			filter,
+		), func(s string) {
+			t.Errorf(`%s <- forbidden; use "protoutil.Message" instead`, s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestYaml", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `\byaml\.Unmarshal\(`, "--", "*.go")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf(`%s <- forbidden; use "yaml.UnmarshalStrict" instead`, s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -440,7 +649,7 @@ func TestStyle(t *testing.T) {
 		t.Parallel()
 		// `go tool vet` is a special snowflake that emits all its output on
 		// `stderr.
-		cmd := exec.Command("go", "tool", "vet", "-all", "-shadow", "-printfuncs",
+		cmd := exec.Command("go", "tool", "vet", "-source", "-all", "-shadow", "-printfuncs",
 			strings.Join([]string{
 				"Info:1",
 				"Infof:1",
@@ -463,6 +672,7 @@ func TestStyle(t *testing.T) {
 				"VEvent:2",
 				"VEventf:2",
 				"UnimplementedWithIssueErrorf:1",
+				"Wrapf:1",
 			}, ","),
 			".",
 		)
@@ -495,8 +705,52 @@ func TestStyle(t *testing.T) {
 		}
 	})
 
+	t.Run("TestAuthorTags", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-lE", "^// Author:")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf(`%s <- please remove the Author comment within`, s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
 	t.Run("TestForbiddenImports", func(t *testing.T) {
 		t.Parallel()
+
+		// forbiddenImportPkg -> permittedReplacementPkg
+		forbiddenImports := map[string]string{
+			"context": "golang.org/x/net/context",
+			"log":     "util/log",
+			"path":    "path/filepath",
+			"github.com/golang/protobuf/proto": "github.com/gogo/protobuf/proto",
+			"github.com/satori/go.uuid":        "util/uuid",
+			"golang.org/x/sync/singleflight":   "github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight",
+		}
+
+		// grepBuf creates a grep string that matches any forbidden import pkgs.
+		var grepBuf bytes.Buffer
+		grepBuf.WriteByte('(')
+		for forbiddenPkg := range forbiddenImports {
+			grepBuf.WriteByte('|')
+			grepBuf.WriteString(regexp.QuoteMeta(forbiddenPkg))
+		}
+		grepBuf.WriteString(")$")
+
 		filter := stream.FilterFunc(func(arg stream.Arg) error {
 			for _, useAllFiles := range []bool{false, true} {
 				buildContext := build.Default
@@ -533,30 +787,31 @@ func TestStyle(t *testing.T) {
 			filter,
 			stream.Sort(),
 			stream.Uniq(),
+			stream.Grep(`^`+settingsPkgPrefix+`: | `+grepBuf.String()),
 			stream.GrepNot(`cockroach/pkg/cmd/`),
-			stream.Grep(`^`+settingsPkgPrefix+`: | (github\.com/golang/protobuf/proto|github\.com/satori/go\.uuid|log|path|context|syscall)$`),
 			stream.GrepNot(`cockroach/pkg/(cli|security): syscall$`),
 			stream.GrepNot(`cockroach/pkg/(base|security|util/(log|randutil|stop)): log$`),
 			stream.GrepNot(`cockroach/pkg/(server/serverpb|ts/tspb): github\.com/golang/protobuf/proto$`),
 			stream.GrepNot(`cockroach/pkg/util/caller: path$`),
+			stream.GrepNot(`cockroach/pkg/ccl/storageccl: path$`),
 			stream.GrepNot(`cockroach/pkg/util/uuid: github\.com/satori/go\.uuid$`),
 		), func(s string) {
-			switch {
-			case strings.HasSuffix(s, " path"):
-				t.Errorf(`%s <- please use "path/filepath" instead of "path"`, s)
-			case strings.HasSuffix(s, " log"):
-				t.Errorf(`%s <- please use "util/log" instead of "log"`, s)
-			case strings.HasSuffix(s, " github.com/golang/protobuf/proto"):
-				t.Errorf(`%s <- please use "github.com/gogo/protobuf/proto" instead of "github.com/golang/protobuf/proto"`, s)
-			case strings.HasSuffix(s, " github.com/satori/go.uuid"):
-				t.Errorf(`%s <- please use "util/uuid" instead of "github.com/satori/go.uuid"`, s)
-			case strings.HasSuffix(s, " context"):
-				t.Errorf(`%s <- please use "golang.org/x/net/context" instead of "context"`, s)
-			case strings.HasSuffix(s, " syscall"):
-				t.Errorf(`%s <- please use "golang.org/x/sys" instead of "syscall"`, s)
-			case strings.HasPrefix(s, settingsPkgPrefix+": github.com/cockroachdb/cockroach"):
-				if !strings.HasSuffix(s, "testutils") && !strings.HasSuffix(s, "humanizeutil") &&
-					!strings.HasSuffix(s, settingsPkgPrefix) {
+			pkgStr := strings.Split(s, ": ")
+			importingPkg, importedPkg := pkgStr[0], pkgStr[1]
+
+			// Test that a disallowed package is not imported.
+			if replPkg, ok := forbiddenImports[importedPkg]; ok {
+				t.Errorf(`%s <- please use %q instead of %q`, s, replPkg, importedPkg)
+			}
+
+			// Test that the settings package does not import CRDB dependencies.
+			if importingPkg == settingsPkgPrefix && strings.HasPrefix(importedPkg, cockroachDB) {
+				switch {
+				case strings.HasSuffix(s, "humanizeutil"):
+				case strings.HasSuffix(s, "protoutil"):
+				case strings.HasSuffix(s, "testutils"):
+				case strings.HasSuffix(s, settingsPkgPrefix):
+				default:
 					t.Errorf("%s <- please don't add CRDB dependencies to settings pkg", s)
 				}
 			}
@@ -574,6 +829,9 @@ func TestStyle(t *testing.T) {
 	// TODO(tamird): replace this with errcheck.NewChecker() when
 	// https://github.com/dominikh/go-tools/issues/57 is fixed.
 	t.Run("TestErrCheck", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("short flag")
+		}
 		// errcheck uses 1GB of ram (as of 2017-02-18), so don't parallelize it.
 		cmd, stderr, filter, err := dirCmd(
 			pkg.Dir,
@@ -604,6 +862,9 @@ func TestStyle(t *testing.T) {
 	})
 
 	t.Run("TestReturnCheck", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("short flag")
+		}
 		// returncheck uses 1GB of ram (as of 2017-02-18), so don't parallelize it.
 		cmd, stderr, filter, err := dirCmd(pkg.Dir, "returncheck", pkgScope)
 		if err != nil {
@@ -638,10 +899,7 @@ func TestStyle(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := stream.ForEach(stream.Sequence(
-			filter,
-			stream.GrepNot(`((\.pb|\.pb\.gw|embedded|_string)\.go|sql/ir/irgen/parser/(yaccpar|irgen\.y):|sql/parser/(yaccpar|sql\.y):)`),
-		), func(s string) {
+		if err := stream.ForEach(filter, func(s string) {
 			t.Error(s)
 		}); err != nil {
 			t.Error(err)
@@ -654,57 +912,65 @@ func TestStyle(t *testing.T) {
 		}
 	})
 
-	t.Run("TestUnconvert", func(t *testing.T) {
+	t.Run("TestMegacheck", func(t *testing.T) {
 		if testing.Short() {
 			t.Skip("short flag")
 		}
 		t.Parallel()
-		cmd, stderr, filter, err := dirCmd(pkg.Dir, "unconvert", pkgScope)
+		noCopyRe, err := regexp.Compile(`^(field no|type No)Copy is unused \(U1000\)$`)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if err := cmd.Start(); err != nil {
+		ctx := gotool.DefaultContext
+		releaseTags := ctx.BuildContext.ReleaseTags
+		lastTag := releaseTags[len(releaseTags)-1]
+		dotIdx := strings.IndexByte(lastTag, '.')
+		goVersion, err := strconv.Atoi(lastTag[dotIdx+1:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		// NB: this doesn't use `pkgScope` because `honnef.co/go/unused`
+		// produces many false positives unless it inspects all our packages.
+		paths := ctx.ImportPaths([]string{cockroachDB + "/..."})
+		conf := loader.Config{
+			Build:      &ctx.BuildContext,
+			ParserMode: parser.ParseComments,
+			ImportPkgs: make(map[string]bool, len(paths)),
+		}
+		for _, path := range paths {
+			conf.ImportPkgs[path] = true
+		}
+		lprog, err := conf.Load()
+		if err != nil {
 			t.Fatal(err)
 		}
 
-		if err := stream.ForEach(stream.Sequence(
-			filter,
-			stream.GrepNot(`\.pb\.go:`),
-		), func(s string) {
-			t.Error(s)
-		}); err != nil {
-			t.Error(err)
+		unusedChecker := unused.NewChecker(unused.CheckAll)
+		unusedChecker.WholeProgram = true
+
+		checker := megaChecker{
+			checkers: []lint.Checker{
+				&timerChecker{},
+				simple.NewChecker(),
+				staticcheck.NewChecker(),
+				unused.NewLintChecker(unusedChecker),
+			},
 		}
 
-		if err := cmd.Wait(); err != nil {
-			if out := stderr.String(); len(out) > 0 {
-				t.Fatalf("err=%s, stderr=%s", err, out)
-			}
-		}
-	})
-
-	t.Run("TestMetacheck", func(t *testing.T) {
-		if testing.Short() {
-			t.Skip("short flag")
-		}
-		// metacheck uses 2.5GB of ram (as of 2017-02-18), so don't parallelize it.
-		cmd, stderr, filter, err := dirCmd(
-			pkg.Dir,
-			"metacheck",
-			"-ignore",
-
-			strings.Join([]string{
-				"github.com/cockroachdb/cockroach/pkg/security/securitytest/embedded.go:S1013",
-				"github.com/cockroachdb/cockroach/pkg/ui/embedded.go:S1013",
+		linter := lint.Linter{
+			Checker: &checker,
+			Ignores: []lint.Ignore{
+				{Pattern: "github.com/cockroachdb/cockroach/pkg/security/securitytest/embedded.go", Checks: []string{"S1013"}},
+				{Pattern: "github.com/cockroachdb/cockroach/pkg/ui/embedded.go", Checks: []string{"S1013"}},
 
 				// Intentionally compare an unsigned integer <= 0 to avoid knowledge
 				// of the type at the caller and for consistency with convention.
-				"github.com/cockroachdb/cockroach/pkg/storage/replica.go:SA4003",
+				{Pattern: "github.com/cockroachdb/cockroach/pkg/storage/replica.go", Checks: []string{"SA4003"}},
 				// Allow a comment to refer to an "unused" argument.
 				//
 				// TODO(bdarnell): remove when/if #8360 is fixed.
-				"github.com/cockroachdb/cockroach/pkg/storage/intent_resolver.go:SA4009",
+				{Pattern: "github.com/cockroachdb/cockroach/pkg/storage/intent_resolver.go", Checks: []string{"SA4009"}},
 				// The generated parser is full of `case` arms such as:
 				//
 				// case 1:
@@ -765,25 +1031,43 @@ func TestStyle(t *testing.T) {
 				// which results in the unused warning:
 				//
 				// sql/parser/yaccpar:362:3: this value of sqlDollar is never used (SA4006)
-				"github.com/cockroachdb/cockroach/pkg/sql/parser/sql.go:SA4006",
+				{Pattern: "github.com/cockroachdb/cockroach/pkg/sql/parser/sql.go", Checks: []string{"SA4006"}},
 				// sql/ir/irgen/parser/yaccpar:362:3: this value of irgenDollar is never used (SA4006)
-				"github.com/cockroachdb/cockroach/pkg/sql/ir/irgen/parser/irgen.go:SA4006",
+				{Pattern: "github.com/cockroachdb/cockroach/pkg/sql/ir/irgen/parser/irgen.go", Checks: []string{"SA4006"}},
 				// sql/parser/yaccpar:14:6: type sqlParser is unused (U1000)
 				// sql/parser/yaccpar:15:2: func sqlParser.Parse is unused (U1000)
 				// sql/parser/yaccpar:16:2: func sqlParser.Lookahead is unused (U1000)
 				// sql/parser/yaccpar:29:6: func sqlNewParser is unused (U1000)
 				// sql/parser/yaccpar:152:6: func sqlParse is unused (U1000)
-				"github.com/cockroachdb/cockroach/pkg/sql/parser/sql.go:U1000",
-				"github.com/cockroachdb/cockroach/pkg/sql/irgen/parser/irgen.go:U1000",
+				{Pattern: "github.com/cockroachdb/cockroach/pkg/sql/parser/sql.go", Checks: []string{"U1000"}},
+				{Pattern: "github.com/cockroachdb/cockroach/pkg/sql/irgen/parser/irgen.go", Checks: []string{"U1000"}},
 				// Generated file containing many unused postgres error codes.
-				"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror/codes.go:U1000",
+				{Pattern: "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror/codes.go", Checks: []string{"U1000"}},
 				// Deprecated database/sql/driver interfaces not compatible with 1.7.
-				"github.com/cockroachdb/cockroach/pkg/sql/*.go:SA1019",
-				"github.com/cockroachdb/cockroach/pkg/cli/sql_util.go:SA1019",
-			}, " "),
-			// NB: this doesn't use `pkgScope` because `honnef.co/go/unused`
-			// produces many false positives unless it inspects all our packages.
-			"./...",
+				{Pattern: "github.com/cockroachdb/cockroach/pkg/sql/*.go", Checks: []string{"SA1019"}},
+				{Pattern: "github.com/cockroachdb/cockroach/pkg/cli/sql_util.go", Checks: []string{"SA1019"}},
+
+				// IR templates.
+				{Pattern: "github.com/cockroachdb/cockroach/pkg/sql/ir/base/*.go", Checks: []string{"U1000"}},
+			},
+			GoVersion: goVersion,
+		}
+
+		ps := linter.Lint(lprog)
+		for _, p := range ps {
+			if !noCopyRe.MatchString(p.Text) {
+				pos := lprog.Fset.Position(p.Position)
+				t.Errorf("%s: %s", pos, p.Text)
+			}
+		}
+	})
+
+	// TestLogicTestsLint verifies that all the logic test files start with
+	// a LogicTest directive.
+	t.Run("TestLogicTestsLint", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkg.Dir, "git", "ls-files", "sql/logictest/testdata/logic_test/",
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -793,11 +1077,20 @@ func TestStyle(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := stream.ForEach(stream.Sequence(
-			filter,
-			stream.GrepNot(`: (field no|type No)Copy is unused \(U1000\)$`),
-		), func(s string) {
-			t.Error(s)
+		if err := stream.ForEach(filter, func(filename string) {
+			file, err := os.Open(filepath.Join(pkg.Dir, filename))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			firstLine, err := bufio.NewReader(file).ReadString('\n')
+			if err != nil {
+				t.Errorf("reading first line of %s: %s", filename, err)
+				return
+			}
+			if !strings.HasPrefix(firstLine, "# LogicTest:") {
+				t.Errorf("%s must start with a directive, e.g. `# LogicTest: default`", filename)
+			}
 		}); err != nil {
 			t.Error(err)
 		}
@@ -808,4 +1101,383 @@ func TestStyle(t *testing.T) {
 			}
 		}
 	})
+}
+
+// megaChecker implements lint.Checker by multiplexing its consitituent
+// checkers.
+type megaChecker struct {
+	checkers []lint.Checker
+}
+
+func (m *megaChecker) Init(program *lint.Program) {
+	for _, checker := range m.checkers {
+		checker.Init(program)
+	}
+}
+
+func (m *megaChecker) Funcs() map[string]lint.Func {
+	funcs := map[string]lint.Func{
+		"FloatToUnsigned": checkConvertFloatToUnsigned,
+		"Unconvert":       checkUnconvert,
+	}
+	for _, checker := range m.checkers {
+		for k, v := range checker.Funcs() {
+			if _, ok := funcs[k]; ok {
+				log.Fatalf("duplicate lint function %s", k)
+			} else {
+				funcs[k] = v
+			}
+		}
+	}
+	return funcs
+}
+
+func forAllFiles(j *lint.Job, fn func(node ast.Node) bool) {
+	for _, f := range j.Program.Files {
+		if !lint.IsGenerated(f) {
+			ast.Inspect(f, fn)
+		}
+	}
+}
+
+// @ianlancetaylor via golang-nuts[0]:
+//
+// For the record, the spec says, in https://golang.org/ref/spec#Conversions:
+// "In all non-constant conversions involving floating-point or complex
+// values, if the result type cannot represent the value the conversion
+// succeeds but the result value is implementation-dependent."  That is the
+// case that applies here: you are converting a negative floating point number
+// to uint64, which can not represent a negative value, so the result is
+// implementation-dependent.  The conversion to int64 works, of course. And
+// the conversion to int64 and then to uint64 succeeds in converting to int64,
+// and when converting to uint64 follows a different rule: "When converting
+// between integer types, if the value is a signed integer, it is sign
+// extended to implicit infinite precision; otherwise it is zero extended. It
+// is then truncated to fit in the result type's size."
+//
+// So, basically, don't convert a negative floating point number to an
+// unsigned integer type.
+//
+// [0] https://groups.google.com/d/msg/golang-nuts/LH2AO1GAIZE/PyygYRwLAwAJ
+//
+// TODO(tamird): upstream this.
+func checkConvertFloatToUnsigned(j *lint.Job) {
+	forAllFiles(j, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		castType, ok := j.Program.Info.TypeOf(call.Fun).(*types.Basic)
+		if !ok {
+			return true
+		}
+		if castType.Info()&types.IsUnsigned == 0 {
+			return true
+		}
+		for _, arg := range call.Args {
+			argType, ok := j.Program.Info.TypeOf(arg).(*types.Basic)
+			if !ok {
+				continue
+			}
+			if argType.Info()&types.IsFloat == 0 {
+				continue
+			}
+			j.Errorf(arg, "do not convert a floating point number to an unsigned integer type")
+		}
+		return true
+	})
+}
+
+func walkForStmts(n ast.Node, fn func(ast.Stmt) bool) bool {
+	fr, ok := n.(*ast.ForStmt)
+	if !ok {
+		return true
+	}
+	return walkStmts(fr.Body.List, fn)
+}
+
+func walkSelectStmts(n ast.Node, fn func(ast.Stmt) bool) bool {
+	sel, ok := n.(*ast.SelectStmt)
+	if !ok {
+		return true
+	}
+	return walkStmts(sel.Body.List, fn)
+}
+
+func walkStmts(stmts []ast.Stmt, fn func(ast.Stmt) bool) bool {
+	for _, stmt := range stmts {
+		if !fn(stmt) {
+			return false
+		}
+	}
+	return true
+}
+
+// timerChecker assures that timeutil.Timer objects are used correctly, to
+// avoid race conditions and deadlocks. These timers require callers to set
+// their Read field to true when their channel has been received on. If this
+// field is not set and the timer's Reset method is called, we will deadlock.
+// This lint assures that the Read field is set in the most common case where
+// Reset is used, within a for-loop where each iteration blocks on a select
+// statement. The timers are usually used as timeouts on these select
+// statements, and need to be reset after each iteration.
+//
+// for {
+//   timer.Reset(...)
+//   select {
+//     case <-timer.C:
+//       timer.Read = true   <--  lint verifies that this line is present
+//     case ...:
+//   }
+// }
+//
+type timerChecker struct {
+	timerType types.Type
+}
+
+const timerChanName = "C"
+
+func (m *timerChecker) Init(program *lint.Program) {
+	timeutilPkg := program.Prog.Package("github.com/cockroachdb/cockroach/pkg/util/timeutil")
+	if timeutilPkg == nil {
+		log.Fatal("timeutil package not found")
+	}
+	timerObject := timeutilPkg.Pkg.Scope().Lookup("Timer")
+	if timerObject == nil {
+		log.Fatal("timeutil.Timer type not found")
+	}
+	m.timerType = timerObject.Type()
+
+	func() {
+		if typ, ok := m.timerType.Underlying().(*types.Struct); ok {
+			for i := 0; i < typ.NumFields(); i++ {
+				if typ.Field(i).Name() == timerChanName {
+					return
+				}
+			}
+		}
+		log.Fatalf("no field called %q in type %s", timerChanName, m.timerType)
+	}()
+}
+
+func (m *timerChecker) Funcs() map[string]lint.Func {
+	return map[string]lint.Func{
+		"TimeutilTimerRead": m.checkSetTimeutilTimerRead,
+	}
+}
+
+func (m *timerChecker) selectorIsTimer(s *ast.SelectorExpr, info *types.Info) bool {
+	selTyp := info.TypeOf(s.X)
+	if ptr, ok := selTyp.(*types.Pointer); ok {
+		selTyp = ptr.Elem()
+	}
+	return selTyp == m.timerType
+}
+
+func (m *timerChecker) checkSetTimeutilTimerRead(j *lint.Job) {
+	forAllFiles(j, func(n ast.Node) bool {
+		return walkForStmts(n, func(s ast.Stmt) bool {
+			return walkSelectStmts(s, func(s ast.Stmt) bool {
+				comm, ok := s.(*ast.CommClause)
+				if !ok || comm.Comm == nil /* default: */ {
+					return true
+				}
+
+				// if receiving on a timer's C chan.
+				var unary ast.Expr
+				switch v := comm.Comm.(type) {
+				case *ast.AssignStmt:
+					// case `now := <-timer.C:`
+					unary = v.Rhs[0]
+				case *ast.ExprStmt:
+					// case `<-timer.C:`
+					unary = v.X
+				default:
+					return true
+				}
+				chanRead, ok := unary.(*ast.UnaryExpr)
+				if !ok || chanRead.Op != token.ARROW {
+					return true
+				}
+				selector, ok := chanRead.X.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				if !m.selectorIsTimer(selector, j.Program.Info) {
+					return true
+				}
+				selectorName := fmt.Sprint(selector.X)
+				if selector.Sel.String() != timerChanName {
+					return true
+				}
+
+				// Verify that the case body contains `timer.Read = true`.
+				noRead := walkStmts(comm.Body, func(s ast.Stmt) bool {
+					assign, ok := s.(*ast.AssignStmt)
+					if !ok || assign.Tok != token.ASSIGN {
+						return true
+					}
+					for i := range assign.Lhs {
+						l, r := assign.Lhs[i], assign.Rhs[i]
+
+						// if assignment to correct field in timer.
+						assignSelector, ok := l.(*ast.SelectorExpr)
+						if !ok {
+							return true
+						}
+						if !m.selectorIsTimer(assignSelector, j.Program.Info) {
+							return true
+						}
+						if fmt.Sprint(assignSelector.X) != selectorName {
+							return true
+						}
+						if assignSelector.Sel.String() != "Read" {
+							return true
+						}
+
+						// if assigning `true`.
+						val, ok := r.(*ast.Ident)
+						if !ok {
+							return true
+						}
+						if val.String() == "true" {
+							// returning false will short-circuit walkStmts and assign
+							// noRead to false instead of the default value of true.
+							return false
+						}
+					}
+					return true
+				})
+				if noRead {
+					j.Errorf(comm, "must set timer.Read = true after reading from timer.C (see timeutil/timer.go)")
+				}
+				return true
+			})
+		})
+	})
+}
+
+// Adapted from https://github.com/mdempsky/unconvert/blob/beb68d938016d2dec1d1b078054f4d3db25f97be/unconvert.go#L371-L414.
+func checkUnconvert(j *lint.Job) {
+	forAllFiles(j, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if len(call.Args) != 1 || call.Ellipsis != token.NoPos {
+			return true
+		}
+		ft, ok := j.Program.Info.Types[call.Fun]
+		if !ok {
+			j.Errorf(call.Fun, "missing type")
+			return true
+		}
+		if !ft.IsType() {
+			// Function call; not a conversion.
+			return true
+		}
+		at, ok := j.Program.Info.Types[call.Args[0]]
+		if !ok {
+			j.Errorf(call.Args[0], "missing type")
+			return true
+		}
+		if !types.Identical(ft.Type, at.Type) {
+			// A real conversion.
+			return true
+		}
+		if isUntypedValue(call.Args[0], j.Program.Info) {
+			// Workaround golang.org/issue/13061.
+			return true
+		}
+		// Adapted from https://github.com/mdempsky/unconvert/blob/beb68d938016d2dec1d1b078054f4d3db25f97be/unconvert.go#L416-L430.
+		//
+		// cmd/cgo generates explicit type conversions that
+		// are often redundant when introducing
+		// _cgoCheckPointer calls (issue #16).  Users can't do
+		// anything about these, so skip over them.
+		if ident, ok := call.Fun.(*ast.Ident); ok {
+			if ident.Name == "_cgoCheckPointer" {
+				return false
+			}
+		}
+		j.Errorf(n, "unnecessary conversion")
+		return true
+	})
+}
+
+// Cribbed from https://github.com/mdempsky/unconvert/blob/beb68d938016d2dec1d1b078054f4d3db25f97be/unconvert.go#L557-L607.
+func isUntypedValue(n ast.Expr, info *types.Info) bool {
+	switch n := n.(type) {
+	case *ast.BinaryExpr:
+		switch n.Op {
+		case token.SHL, token.SHR:
+			// Shifts yield an untyped value if their LHS is untyped.
+			return isUntypedValue(n.X, info)
+		case token.EQL, token.NEQ, token.LSS, token.GTR, token.LEQ, token.GEQ:
+			// Comparisons yield an untyped boolean value.
+			return true
+		case token.ADD, token.SUB, token.MUL, token.QUO, token.REM,
+			token.AND, token.OR, token.XOR, token.AND_NOT,
+			token.LAND, token.LOR:
+			return isUntypedValue(n.X, info) && isUntypedValue(n.Y, info)
+		}
+	case *ast.UnaryExpr:
+		switch n.Op {
+		case token.ADD, token.SUB, token.NOT, token.XOR:
+			return isUntypedValue(n.X, info)
+		}
+	case *ast.BasicLit:
+		// Basic literals are always untyped.
+		return true
+	case *ast.ParenExpr:
+		return isUntypedValue(n.X, info)
+	case *ast.SelectorExpr:
+		return isUntypedValue(n.Sel, info)
+	case *ast.Ident:
+		if obj, ok := info.Uses[n]; ok {
+			if obj.Pkg() == nil && obj.Name() == "nil" {
+				// The universal untyped zero value.
+				return true
+			}
+			if b, ok := obj.Type().(*types.Basic); ok && b.Info()&types.IsUntyped != 0 {
+				// Reference to an untyped constant.
+				return true
+			}
+		}
+	case *ast.CallExpr:
+		if b, ok := asBuiltin(n.Fun, info); ok {
+			switch b.Name() {
+			case "real", "imag":
+				return isUntypedValue(n.Args[0], info)
+			case "complex":
+				return isUntypedValue(n.Args[0], info) && isUntypedValue(n.Args[1], info)
+			}
+		}
+	}
+
+	return false
+}
+
+// Cribbed from https://github.com/mdempsky/unconvert/blob/beb68d938016d2dec1d1b078054f4d3db25f97be/unconvert.go#L609-L630.
+func asBuiltin(n ast.Expr, info *types.Info) (*types.Builtin, bool) {
+	for {
+		paren, ok := n.(*ast.ParenExpr)
+		if !ok {
+			break
+		}
+		n = paren.X
+	}
+
+	ident, ok := n.(*ast.Ident)
+	if !ok {
+		return nil, false
+	}
+
+	obj, ok := info.Uses[ident]
+	if !ok {
+		return nil, false
+	}
+
+	b, ok := obj.(*types.Builtin)
+	return b, ok
 }

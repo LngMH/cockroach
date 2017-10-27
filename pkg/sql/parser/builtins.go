@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
@@ -29,8 +27,8 @@ import (
 	"math"
 	"math/rand"
 	"net"
-	"regexp"
 	"regexp/syntax"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -52,14 +51,15 @@ import (
 )
 
 var (
-	errEmptyInputString = errors.New("the input string must not be empty")
-	errAbsOfMinInt64    = errors.New("abs of min integer value (-9223372036854775808) not defined")
-	errSqrtOfNegNumber  = errors.New("cannot take square root of a negative number")
-	errLogOfNegNumber   = errors.New("cannot take logarithm of a negative number")
-	errLogOfZero        = errors.New("cannot take logarithm of zero")
-	errInsufficientArgs = errors.New("unknown signature: concat_ws()")
-	errZeroIP           = errors.New("zero length IP")
+	errEmptyInputString = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "the input string must not be empty")
+	errAbsOfMinInt64    = pgerror.NewError(pgerror.CodeNumericValueOutOfRangeError, "abs of min integer value (-9223372036854775808) not defined")
+	errSqrtOfNegNumber  = pgerror.NewError(pgerror.CodeInvalidArgumentForPowerFunctionError, "cannot take square root of a negative number")
+	errLogOfNegNumber   = pgerror.NewError(pgerror.CodeInvalidArgumentForLogarithmError, "cannot take logarithm of a negative number")
+	errLogOfZero        = pgerror.NewError(pgerror.CodeInvalidArgumentForLogarithmError, "cannot take logarithm of zero")
+	errZeroIP           = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "zero length IP")
 )
+
+const errInsufficientArgsFmtString = "unknown signature: %s()"
 
 // FunctionClass specifies the class of the builtin function.
 type FunctionClass int
@@ -85,6 +85,7 @@ const (
 	categoryIDGeneration  = "ID Generation"
 	categoryMath          = "Math and Numeric"
 	categoryString        = "String and Byte"
+	categoryArray         = "Array"
 	categorySystemInfo    = "System Info"
 )
 
@@ -117,6 +118,15 @@ type Builtin struct {
 	// TODO(andrei): Get rid of the planner from the EvalContext and then we can
 	// get rid of this blacklist.
 	distsqlBlacklist bool
+
+	// Set to true when a function's definition can handle NULL arguments. When
+	// set, the function will be given the chance to see NULL arguments. When not,
+	// the function will evaluate directly to NULL in the presence of any NULL
+	// arguments.
+	//
+	// NOTE: when set, a function should be prepared for any of its arguments to
+	// be NULL and should act accordingly.
+	nullableArgs bool
 
 	// Set to true when a function may change at every row whether or
 	// not it is applied to an expression that contains row-dependent
@@ -247,6 +257,8 @@ func init() {
 		Builtins[uname] = def
 		funDefs[uname] = funDefs[name]
 	}
+
+	sort.Strings(AllBuiltinNames)
 }
 
 var digitNames = []string{"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"}
@@ -279,14 +291,14 @@ var Builtins = map[string][]Builtin{
 			return nil, err
 		}
 		return NewDString(strings.ToLower(s)), nil
-	}, TypeString, "Converts all characters in `val`to their lower-case equivalents.")},
+	}, TypeString, "Converts all characters in `val` to their lower-case equivalents.")},
 
 	"upper": {stringBuiltin1(func(evalCtx *EvalContext, s string) (Datum, error) {
 		if err := evalCtx.ActiveMemAcc.Grow(evalCtx.Ctx(), int64(len(s))); err != nil {
 			return nil, err
 		}
 		return NewDString(strings.ToUpper(s)), nil
-	}, TypeString, "Converts all characters in `val`to their to their upper-case equivalents.")},
+	}, TypeString, "Converts all characters in `val` to their to their upper-case equivalents.")},
 
 	"substr":    substringImpls,
 	"substring": substringImpls,
@@ -295,8 +307,9 @@ var Builtins = map[string][]Builtin{
 	// NULL arguments are ignored.
 	"concat": {
 		Builtin{
-			Types:      VariadicType{TypeString},
-			ReturnType: fixedReturnType(TypeString),
+			Types:        VariadicType{TypeString},
+			ReturnType:   fixedReturnType(TypeString),
+			nullableArgs: true,
 			fn: func(evalCtx *EvalContext, args Datums) (Datum, error) {
 				var buffer bytes.Buffer
 				for _, d := range args {
@@ -317,11 +330,12 @@ var Builtins = map[string][]Builtin{
 
 	"concat_ws": {
 		Builtin{
-			Types:      VariadicType{TypeString},
-			ReturnType: fixedReturnType(TypeString),
+			Types:        VariadicType{TypeString},
+			ReturnType:   fixedReturnType(TypeString),
+			nullableArgs: true,
 			fn: func(evalCtx *EvalContext, args Datums) (Datum, error) {
 				if len(args) == 0 {
-					return nil, errInsufficientArgs
+					return nil, pgerror.NewErrorf(pgerror.CodeUndefinedFunctionError, errInsufficientArgsFmtString, "concat_ws")
 				}
 				if args[0] == DNull {
 					return DNull, nil
@@ -347,8 +361,22 @@ var Builtins = map[string][]Builtin{
 				return NewDString(buf.String()), nil
 			},
 			Info: "Uses the first argument as a separator between the concatenation of the " +
-				"subsequent arguments. <br/><br/>For example `concat_ws('!','wow','great')` " +
+				"subsequent arguments. \n\nFor example `concat_ws('!','wow','great')` " +
 				"returns `wow!great`.",
+		},
+	},
+
+	"gen_random_uuid": {
+		Builtin{
+			Types:      ArgTypes{},
+			ReturnType: fixedReturnType(TypeUUID),
+			category:   categoryIDGeneration,
+			impure:     true,
+			fn: func(_ *EvalContext, _ Datums) (Datum, error) {
+				uv := uuid.MakeV4()
+				return NewDUuid(DUuid{uv}), nil
+			},
+			Info: "Generates a random UUID and returns it as a value of UUID type.",
 		},
 	},
 
@@ -386,6 +414,177 @@ var Builtins = map[string][]Builtin{
 		},
 	},
 
+	// The following functions are all part of the NET address functions. They can
+	// be found in the postgres reference at https://www.postgresql.org/docs/9.6/static/functions-net.html#CIDR-INET-FUNCTIONS-TABLE
+	// This includes:
+	// - abbrev
+	// - broadcast
+	// - family
+	// - host
+	// - hostmask
+	// - masklen
+	// - netmask
+	// - set_masklen
+	// - text(inet)
+	// - inet_same_family
+
+	"abbrev": {
+		Builtin{
+			Types:      ArgTypes{{"val", TypeINet}},
+			ReturnType: fixedReturnType(TypeString),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				dIPAddr := MustBeDIPAddr(args[0])
+				return NewDString(dIPAddr.IPAddr.String()), nil
+			},
+			Info: "Converts the combined IP address and prefix length to an abbreviated display format as text." +
+				"For INET types, this will omit the prefix length if it's not the default (32 or IPv4, 128 for IPv6)" +
+				"\n\nFor example, `abbrev('192.168.1.2/24')` returns `'192.168.1.2/24'`",
+		},
+	},
+
+	"broadcast": {
+		Builtin{
+			Types:      ArgTypes{{"val", TypeINet}},
+			ReturnType: fixedReturnType(TypeINet),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				dIPAddr := MustBeDIPAddr(args[0])
+				broadcastIPAddr := dIPAddr.IPAddr.Broadcast()
+				return &DIPAddr{IPAddr: broadcastIPAddr}, nil
+			},
+			Info: "Gets the broadcast address for the network address represented by the value." +
+				"\n\nFor example, `broadcast('192.168.1.2/24')` returns `'192.168.1.255/24'`",
+		},
+	},
+
+	"family": {
+		Builtin{
+			Types:      ArgTypes{{"val", TypeINet}},
+			ReturnType: fixedReturnType(TypeInt),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				dIPAddr := MustBeDIPAddr(args[0])
+				if dIPAddr.Family == ipaddr.IPv4family {
+					return NewDInt(DInt(4)), nil
+				}
+				return NewDInt(DInt(6)), nil
+			},
+			Info: "Extracts the IP family of the value; 4 for IPv4, 6 for IPv6." +
+				"\n\nFor example, `family('::1')` returns `6`",
+		},
+	},
+
+	"host": {
+		Builtin{
+			Types:      ArgTypes{{"val", TypeINet}},
+			ReturnType: fixedReturnType(TypeString),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				dIPAddr := MustBeDIPAddr(args[0])
+				s := dIPAddr.IPAddr.String()
+				if i := strings.IndexByte(s, '/'); i != -1 {
+					return NewDString(s[:i]), nil
+				}
+				return NewDString(s), nil
+			},
+			Info: "Extracts the address part of the combined address/prefixlen value as text." +
+				"\n\nFor example, `host('192.168.1.2/16')` returns `'192.168.1.2'`",
+		},
+	},
+
+	"hostmask": {
+		Builtin{
+			Types:      ArgTypes{{"val", TypeINet}},
+			ReturnType: fixedReturnType(TypeINet),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				dIPAddr := MustBeDIPAddr(args[0])
+				ipAddr := dIPAddr.IPAddr.Hostmask()
+				return &DIPAddr{ipAddr}, nil
+			},
+			Info: "Creates an IP host mask corresponding to the prefix length in the value." +
+				"\n\nFor example, `hostmask('192.168.1.2/16')` returns `'0.0.255.255'`",
+		},
+	},
+
+	"masklen": {
+		Builtin{
+			Types:      ArgTypes{{"val", TypeINet}},
+			ReturnType: fixedReturnType(TypeInt),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				dIPAddr := MustBeDIPAddr(args[0])
+				return NewDInt(DInt(dIPAddr.Mask)), nil
+			},
+			Info: "Retrieves the prefix length stored in the value." +
+				"\n\nFor example, `masklen('192.168.1.2/16')` returns `16`",
+		},
+	},
+
+	"netmask": {
+		Builtin{
+			Types:      ArgTypes{{"val", TypeINet}},
+			ReturnType: fixedReturnType(TypeINet),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				dIPAddr := MustBeDIPAddr(args[0])
+				ipAddr := dIPAddr.IPAddr.Netmask()
+				return &DIPAddr{ipAddr}, nil
+			},
+			Info: "Creates an IP network mask corresponding to the prefix length in the value." +
+				"\n\nFor example, `netmask('192.168.1.2/16')` returns `'255.255.0.0'`",
+		},
+	},
+
+	"set_masklen": {
+		Builtin{
+			Types: ArgTypes{
+				{"val", TypeINet},
+				{"prefixlen", TypeInt},
+			},
+			ReturnType: fixedReturnType(TypeINet),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				dIPAddr := MustBeDIPAddr(args[0])
+				mask := int(MustBeDInt(args[1]))
+
+				if !(dIPAddr.Family == ipaddr.IPv4family && mask >= 0 && mask <= 32) && !(dIPAddr.Family == ipaddr.IPv6family && mask >= 0 && mask <= 128) {
+					return nil, pgerror.NewErrorf(
+						pgerror.CodeInvalidParameterValueError, "invalid mask length: %d", mask)
+				}
+				return &DIPAddr{IPAddr: ipaddr.IPAddr{Family: dIPAddr.Family, Addr: dIPAddr.Addr, Mask: byte(mask)}}, nil
+			},
+			Info: "Sets the prefix length of `val` to `prefixlen`.\n\n" +
+				"For example, `set_masklen('192.168.1.2', 16)` returns `'192.168.1.2/16'`.",
+		},
+	},
+
+	"text": {
+		Builtin{
+			Types:      ArgTypes{{"val", TypeINet}},
+			ReturnType: fixedReturnType(TypeString),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				dIPAddr := MustBeDIPAddr(args[0])
+				s := dIPAddr.IPAddr.String()
+				// Ensure the string has a "/mask" suffix.
+				if strings.IndexByte(s, '/') == -1 {
+					s += "/" + strconv.Itoa(int(dIPAddr.Mask))
+				}
+				return NewDString(s), nil
+			},
+			Info: "Converts the IP address and prefix length to text.",
+		},
+	},
+
+	"inet_same_family": {
+		Builtin{
+			Types: ArgTypes{
+				{"val", TypeINet},
+				{"val", TypeINet},
+			},
+			ReturnType: fixedReturnType(TypeBool),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				first := MustBeDIPAddr(args[0])
+				other := MustBeDIPAddr(args[1])
+				return MakeDBool(DBool(first.Family == other.Family)), nil
+			},
+			Info: "Checks if two IP addresses are of the same IP family.",
+		},
+	},
+
 	"from_ip": {
 		Builtin{
 			Types:      ArgTypes{{"val", TypeBytes}},
@@ -415,7 +614,8 @@ var Builtins = map[string][]Builtin{
 				// If ipdstr could not be parsed to a valid IP,
 				// ip will be nil.
 				if ip == nil {
-					return nil, fmt.Errorf("invalid IP format: %s", ipdstr.String())
+					return nil, pgerror.NewErrorf(
+						pgerror.CodeInvalidParameterValueError, "invalid IP format: %s", ipdstr.String())
 				}
 				return NewDBytes(DBytes(ip)), nil
 			},
@@ -438,7 +638,8 @@ var Builtins = map[string][]Builtin{
 				field := int(MustBeDInt(args[2]))
 
 				if field <= 0 {
-					return nil, fmt.Errorf("field position %d must be greater than zero", field)
+					return nil, pgerror.NewErrorf(
+						pgerror.CodeInvalidParameterValueError, "field position %d must be greater than zero", field)
 				}
 
 				splits := strings.Split(text, sep)
@@ -448,7 +649,7 @@ var Builtins = map[string][]Builtin{
 				return NewDString(splits[field-1]), nil
 			},
 			Info: "Splits `input` on `delimiter` and return the value in the `return_index_pos`  " +
-				"position (starting at 1). <br/><br/>For example, `split_part('123.456.789.0','.',3)`" +
+				"position (starting at 1). \n\nFor example, `split_part('123.456.789.0','.',3)`" +
 				"returns `789`.",
 		},
 	},
@@ -462,17 +663,61 @@ var Builtins = map[string][]Builtin{
 				s := string(MustBeDString(args[0]))
 				count := int(MustBeDInt(args[1]))
 
-				if count < 0 {
+				ln := len(s) * count
+				// Use <= here instead of < to prevent a possible divide-by-zero in the next
+				// if block.
+				if count <= 0 {
 					count = 0
+				} else if ln/count != len(s) {
+					// Detect overflow and trigger an error.
+					return nil, pgerror.NewError(
+						pgerror.CodeProgramLimitExceededError, "requested length too large",
+					)
 				}
 
-				if err := evalCtx.ActiveMemAcc.Grow(evalCtx.Ctx(), int64(len(s)*count)); err != nil {
+				if err := evalCtx.ActiveMemAcc.Grow(evalCtx.Ctx(), int64(ln)); err != nil {
 					return nil, err
 				}
 				return NewDString(strings.Repeat(s, count)), nil
 			},
-			Info: "Concatenates `input` `repeat_counter` number of times.<br/><br/>For example, " +
+			Info: "Concatenates `input` `repeat_counter` number of times.\n\nFor example, " +
 				"`repeat('dog', 2)` returns `dogdog`.",
+		},
+	},
+
+	// https://www.postgresql.org/docs/10/static/functions-binarystring.html
+	"encode": {
+		Builtin{
+			Types:      ArgTypes{{"data", TypeBytes}, {"format", TypeString}},
+			ReturnType: fixedReturnType(TypeString),
+			fn: func(evalCtx *EvalContext, args Datums) (_ Datum, err error) {
+				data, format := string(*args[0].(*DBytes)), string(MustBeDString(args[1]))
+				if format != "hex" {
+					return nil, pgerror.NewError(pgerror.CodeInvalidParameterValueError, "only 'hex' format is supported for ENCODE")
+				}
+				if !utf8.ValidString(data) {
+					return nil, pgerror.NewError(pgerror.CodeCharacterNotInRepertoireError, "invalid UTF-8 sequence")
+				}
+				return NewDString(data), nil
+			},
+			Info: "Encodes `data` in the text format specified by `format` (only \"hex\" is supported).",
+		},
+	},
+
+	"decode": {
+		Builtin{
+			Types:      ArgTypes{{"text", TypeString}, {"format", TypeString}},
+			ReturnType: fixedReturnType(TypeString),
+			fn: func(evalCtx *EvalContext, args Datums) (_ Datum, err error) {
+				data, format := string(MustBeDString(args[0])), string(MustBeDString(args[1]))
+				if format != "hex" {
+					return nil, pgerror.NewError(pgerror.CodeInvalidParameterValueError, "only 'hex' format is supported for DECODE")
+				}
+				var buf bytes.Buffer
+				hexEncodeString(&buf, data)
+				return NewDString(buf.String()), nil
+			},
+			Info: "Decodes `data` as the format specified by `format` (only \"hex\" is supported).",
 		},
 	},
 
@@ -561,7 +806,7 @@ var Builtins = map[string][]Builtin{
 		}
 
 		return NewDInt(DInt(utf8.RuneCountInString(s[:index]) + 1)), nil
-	}, TypeInt, "Calculates the position where the string `find` begins in `input`. <br/><br/>For"+
+	}, TypeInt, "Calculates the position where the string `find` begins in `input`. \n\nFor"+
 		" example, `strpos('doggie', 'gie')` returns `4`.")},
 
 	"overlay": {
@@ -580,7 +825,7 @@ var Builtins = map[string][]Builtin{
 				return overlay(s, to, pos, size)
 			},
 			Info: "Replaces characters in `input` with `overlay_val` starting at `start_pos` " +
-				"(begins at 1). <br/><br/>For example, `overlay('doggie', 'CAT', 2)` returns " +
+				"(begins at 1). \n\nFor example, `overlay('doggie', 'CAT', 2)` returns " +
 				"`dCATie`.",
 		},
 		Builtin{
@@ -608,7 +853,7 @@ var Builtins = map[string][]Builtin{
 		stringBuiltin2("input", "trim_chars", func(_ *EvalContext, s, chars string) (Datum, error) {
 			return NewDString(strings.Trim(s, chars)), nil
 		}, TypeString, "Removes any characters included in `trim_chars` from the beginning or end"+
-			" of `input` (applies recursively). <br/><br/>For example, `btrim('doggie', 'eod')` "+
+			" of `input` (applies recursively). \n\nFor example, `btrim('doggie', 'eod')` "+
 			"returns `ggi`."),
 		stringBuiltin1(func(_ *EvalContext, s string) (Datum, error) {
 			return NewDString(strings.TrimSpace(s)), nil
@@ -620,7 +865,7 @@ var Builtins = map[string][]Builtin{
 		stringBuiltin2("input", "trim_chars", func(_ *EvalContext, s, chars string) (Datum, error) {
 			return NewDString(strings.TrimLeft(s, chars)), nil
 		}, TypeString, "Removes any characters included in `trim_chars` from the beginning "+
-			"(left-hand side) of `input` (applies recursively). <br/><br/>For example, "+
+			"(left-hand side) of `input` (applies recursively). \n\nFor example, "+
 			"`ltrim('doggie', 'od')` returns `ggie`."),
 		stringBuiltin1(func(_ *EvalContext, s string) (Datum, error) {
 			return NewDString(strings.TrimLeftFunc(s, unicode.IsSpace)), nil
@@ -632,7 +877,7 @@ var Builtins = map[string][]Builtin{
 		stringBuiltin2("input", "trim_chars", func(_ *EvalContext, s, chars string) (Datum, error) {
 			return NewDString(strings.TrimRight(s, chars)), nil
 		}, TypeString, "Removes any characters included in `trim_chars` from the end (right-hand "+
-			"side) of `input` (applies recursively). <br/><br/>For example, `rtrim('doggie', 'ei')` "+
+			"side) of `input` (applies recursively). \n\nFor example, `rtrim('doggie', 'ei')` "+
 			"returns `dogg`."),
 		stringBuiltin1(func(_ *EvalContext, s string) (Datum, error) {
 			return NewDString(strings.TrimRightFunc(s, unicode.IsSpace)), nil
@@ -693,7 +938,7 @@ var Builtins = map[string][]Builtin{
 			}
 			return NewDString(string(runes)), nil
 		}, TypeString, "In `input`, replaces the first character from `find` with the first "+
-			"character in `replace`; repeat for each character in `find`. <br/><br/>For example, "+
+			"character in `replace`; repeat for each character in `find`. \n\nFor example, "+
 			"`translate('doggie', 'dog', '123');` returns `1233ie`.")},
 
 	"regexp_extract": {
@@ -755,23 +1000,26 @@ var Builtins = map[string][]Builtin{
 				}
 				return result, nil
 			},
-			Info: "Replaces matches for the Regular Expression `regex` in `input` with the Regular " +
-				"Expression `replace` using `flags`.<br/><br/>CockroachDB supports the following " +
-				"flags:<br/><br/>&#8226; **c**: Case-sensitive matching<br/><br/>&#8226; **g**: " +
-				"Global matching (match each substring instead of only the first).<br/><br/>&#8226; " +
-				"**i**: Case-insensitive matching<br/><br/>&#8226; **m** or **n**: Newline-sensitive " +
-				"`.` and negated brackets (`[^...]`) do not match newline characters (preventing " +
-				"matching: matches from crossing newlines unless explicitly defined to); `^` and " +
-				"`$` match the space before and after newline characters respectively (so characters " +
-				"between newline characters are treated as if they're on a separate line).<br/>" +
-				"<br/>&#8226; **p**: Partial newline-sensitive matching: `.` and negated brackets " +
-				"(`[^...]`) do not match newline characters (preventing matches from crossing " +
-				"newlines unless explicitly defined to), but `^` and `$` still only match the " +
-				"beginning and end of `val`.<br/><br/>&#8226; **s**: Newline-insensitive " +
-				"matching *(default)*.<br/><br/>&#8226; **w**: Inverse partial newline-sensitive " +
-				"matching:`.` and negated brackets (`[^...]`) *do* match newline characters, but  `^` " +
-				"and `$` match the space before and after newline characters respectively (so " +
-				"characters between newline characters are treated as if they're on a separate line).",
+			Info: "Replaces matches for the regular expression `regex` in `input` with the regular " +
+				"expression `replace` using `flags`." + `
+
+CockroachDB supports the following flags:
+
+| Flag           | Description                                                       |
+|----------------|-------------------------------------------------------------------|
+| **c**          | Case-sensitive matching                                           |
+| **i**          | Global matching (match each substring instead of only the first). |
+| **m** or **n** | Newline-sensitive (see below)                                     |
+| **p**          | Partial newline-sensitive matching (see below)                    |
+| **s**          | Newline-insensitive (default)                                     |
+| **w**          | Inverse partial newline-sensitive matching (see below)            |
+
+| Mode | ` + "`.` and `[^...]` match newlines | `^` and `$` match line boundaries" + `|
+|------|----------------------------------|--------------------------------------|
+| s    | yes                              | no                                   |
+| w    | yes                              | yes                                  |
+| p    | no                               | no                                   |
+| m/n  | no                               | yes                                  |`,
 		},
 	},
 
@@ -894,23 +1142,24 @@ var Builtins = map[string][]Builtin{
 
 	"greatest": {
 		Builtin{
-			Types:      HomogeneousType{},
-			ReturnType: identityReturnType(0),
-			category:   categoryComparison,
+			Types:        HomogeneousType{},
+			ReturnType:   identityReturnType(0),
+			nullableArgs: true,
+			category:     categoryComparison,
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 				return pickFromTuple(ctx, true /* greatest */, args)
 			},
 			Info: "Returns the element with the greatest value.",
 		},
 	},
-
 	"least": {
 		Builtin{
-			Types:      HomogeneousType{},
-			ReturnType: identityReturnType(0),
-			category:   categoryComparison,
+			Types:        HomogeneousType{},
+			ReturnType:   identityReturnType(0),
+			nullableArgs: true,
+			category:     categoryComparison,
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
-				return pickFromTuple(ctx, false /* !greatest */, args)
+				return pickFromTuple(ctx, false /* greatest */, args)
 			},
 			Info: "Returns the element with the lowest value.",
 		},
@@ -922,6 +1171,7 @@ var Builtins = map[string][]Builtin{
 		Builtin{
 			Types:      ArgTypes{{"input", TypeTimestamp}, {"extract_format", TypeString}},
 			ReturnType: fixedReturnType(TypeString),
+			category:   categoryDateAndTime,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				fromTime := args[0].(*DTimestamp).Time
 				format := string(MustBeDString(args[1]))
@@ -937,8 +1187,9 @@ var Builtins = map[string][]Builtin{
 		Builtin{
 			Types:      ArgTypes{{"input", TypeDate}, {"extract_format", TypeString}},
 			ReturnType: fixedReturnType(TypeString),
+			category:   categoryDateAndTime,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
-				fromTime := time.Unix(int64(*args[0].(*DDate))*secondsInDay, 0).UTC()
+				fromTime := timeutil.Unix(int64(*args[0].(*DDate))*secondsInDay, 0)
 				format := string(MustBeDString(args[1]))
 				t, err := strtime.Strftime(fromTime, format)
 				if err != nil {
@@ -952,6 +1203,7 @@ var Builtins = map[string][]Builtin{
 		Builtin{
 			Types:      ArgTypes{{"input", TypeTimestampTZ}, {"extract_format", TypeString}},
 			ReturnType: fixedReturnType(TypeString),
+			category:   categoryDateAndTime,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				fromTime := args[0].(*DTimestampTZ).Time
 				format := string(MustBeDString(args[1]))
@@ -970,6 +1222,7 @@ var Builtins = map[string][]Builtin{
 		Builtin{
 			Types:      ArgTypes{{"input", TypeString}, {"format", TypeString}},
 			ReturnType: fixedReturnType(TypeTimestampTZ),
+			category:   categoryDateAndTime,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				toParse := string(MustBeDString(args[0]))
 				format := string(MustBeDString(args[1]))
@@ -1087,10 +1340,9 @@ var Builtins = map[string][]Builtin{
 				timeSpan := strings.ToLower(string(MustBeDString(args[0])))
 				return extractStringFromTimestamp(ctx, fromTS.Time, timeSpan)
 			},
-			Info: "Extracts `element` from `input`. Compatible `elements` are: <br/>&#8226; " +
-				"year<br/>&#8226; quarter<br/>&#8226; month<br/>&#8226; week<br/>&#8226; " +
-				"dayofweek<br/>&#8226; dayofyear<br/>&#8226; hour<br/>&#8226; minute<br/>&#8226; " +
-				"second<br/>&#8226; millisecond<br/>&#8226; microsecond<br/>&#8226; epoch",
+			Info: "Extracts `element` from `input`.\n\n" +
+				"Compatible elements: year, quarter, month, week, dayofweek, dayofyear,\n" +
+				"hour, minute, second, millisecond, microsecond, epoch",
 		},
 		Builtin{
 			Types:      ArgTypes{{"element", TypeString}, {"input", TypeDate}},
@@ -1102,10 +1354,22 @@ var Builtins = map[string][]Builtin{
 				fromTSTZ := MakeDTimestampTZFromDate(ctx.GetLocation(), date)
 				return extractStringFromTimestamp(ctx, fromTSTZ.Time, timeSpan)
 			},
-			Info: "Extracts `element` from `input`. Compatible `elements` are: <br/>&#8226; " +
-				"year<br/>&#8226; quarter<br/>&#8226; month<br/>&#8226; week<br/>&#8226; " +
-				"dayofweek<br/>&#8226; dayofyear<br/>&#8226; hour<br/>&#8226; minute<br/>&#8226; " +
-				"second<br/>&#8226; millisecond<br/>&#8226; microsecond<br/>&#8226; epoch",
+			Info: "Extracts `element` from `input`.\n\n" +
+				"Compatible elements: year, quarter, month, week, dayofweek, dayofyear,\n" +
+				"hour, minute, second, millisecond, microsecond, epoch",
+		},
+		Builtin{
+			Types:      ArgTypes{{"element", TypeString}, {"input", TypeTimestampTZ}},
+			ReturnType: fixedReturnType(TypeInt),
+			category:   categoryDateAndTime,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				fromTSTZ := args[1].(*DTimestampTZ)
+				timeSpan := strings.ToLower(string(MustBeDString(args[0])))
+				return extractStringFromTimestamp(ctx, fromTSTZ.Time, timeSpan)
+			},
+			Info: "Extracts `element` from `input`.\n\n" +
+				"Compatible elements: year, quarter, month, week, dayofweek, dayofyear,\n" +
+				"hour, minute, second, millisecond, microsecond, epoch",
 		},
 	},
 
@@ -1136,12 +1400,60 @@ var Builtins = map[string][]Builtin{
 					return NewDInt(DInt(fromInterval.Nanos / int64(time.Microsecond))), nil
 
 				default:
-					return nil, fmt.Errorf("unsupported timespan: %s", timeSpan)
+					return nil, pgerror.NewErrorf(
+						pgerror.CodeInvalidParameterValueError, "unsupported timespan: %s", timeSpan)
 				}
 			},
-			Info: "Extracts `element` from `input`. Compatible `elements` are: <br/>&#8226; hour" +
-				"<br/>&#8226; minute<br/>&#8226; second<br/>&#8226; millisecond<br/>&#8226; " +
-				"microsecond",
+			Info: "Extracts `element` from `input`.\n" +
+				"Compatible elements: hour, minute, second, millisecond, microsecond.",
+		},
+	},
+
+	// https://www.postgresql.org/docs/10/static/functions-datetime.html#functions-datetime-trunc
+	"date_trunc": {
+		Builtin{
+			Types:      ArgTypes{{"element", TypeString}, {"input", TypeTimestamp}},
+			ReturnType: fixedReturnType(TypeTimestamp),
+			category:   categoryDateAndTime,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				// extract timeSpan fromTime.
+				fromTS := args[1].(*DTimestamp)
+				timeSpan := strings.ToLower(string(MustBeDString(args[0])))
+				return truncateTimestamp(ctx, fromTS.Time, timeSpan)
+			},
+			Info: "Truncates `input` to precision `element`.  Sets all fields that are less\n" +
+				"significant than `element` to zero (or one, for day and month)\n\n" +
+				"Compatible elements: year, quarter, month, week, hour, minute, second,\n" +
+				"millisecond, microsecond.",
+		},
+		Builtin{
+			Types:      ArgTypes{{"element", TypeString}, {"input", TypeDate}},
+			ReturnType: fixedReturnType(TypeDate),
+			category:   categoryDateAndTime,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				timeSpan := strings.ToLower(string(MustBeDString(args[0])))
+				date := args[1].(*DDate)
+				fromTSTZ := MakeDTimestampTZFromDate(ctx.GetLocation(), date)
+				return truncateTimestamp(ctx, fromTSTZ.Time, timeSpan)
+			},
+			Info: "Truncates `input` to precision `element`.  Sets all fields that are less\n" +
+				"significant than `element` to zero (or one, for day and month)\n\n" +
+				"Compatible elements: year, quarter, month, week, hour, minute, second,\n" +
+				"millisecond, microsecond.",
+		},
+		Builtin{
+			Types:      ArgTypes{{"element", TypeString}, {"input", TypeTimestampTZ}},
+			ReturnType: fixedReturnType(TypeTimestampTZ),
+			category:   categoryDateAndTime,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				fromTSTZ := args[1].(*DTimestampTZ)
+				timeSpan := strings.ToLower(string(MustBeDString(args[0])))
+				return truncateTimestamp(ctx, fromTSTZ.Time, timeSpan)
+			},
+			Info: "Truncates `input` to precision `element`.  Sets all fields that are less\n" +
+				"significant than `element` to zero (or one, for day and month)\n\n" +
+				"Compatible elements: year, quarter, month, week, hour, minute, second,\n" +
+				"millisecond, microsecond.",
 		},
 	},
 
@@ -1199,12 +1511,12 @@ var Builtins = map[string][]Builtin{
 	"cbrt": {
 		floatBuiltin1(func(x float64) (Datum, error) {
 			return NewDFloat(DFloat(math.Cbrt(x))), nil
-		}, "Calculates the cube root (&#8731;) of `val`."),
+		}, "Calculates the cube root (∛) of `val`."),
 		decimalBuiltin1(func(x *apd.Decimal) (Datum, error) {
 			dd := &DDecimal{}
 			_, err := DecimalCtx.Cbrt(&dd.Decimal, x)
 			return dd, err
-		}, "Calculates the cube root (&#8731;) of `val`."),
+		}, "Calculates the cube root (∛) of `val`."),
 	},
 
 	"ceil":    ceilImpl,
@@ -1298,6 +1610,11 @@ var Builtins = map[string][]Builtin{
 		},
 	},
 
+	"json_remove_path": {
+	// TODO(justin): added here so #- can be desugared into it, still needs to be
+	// implemented.
+	},
+
 	"ln": {
 		floatBuiltin1(func(x float64) (Datum, error) {
 			return NewDFloat(DFloat(math.Log(x))), nil
@@ -1371,8 +1688,12 @@ var Builtins = map[string][]Builtin{
 			Types:      ArgTypes{{"input", TypeFloat}, {"decimal_accuracy", TypeInt}},
 			ReturnType: fixedReturnType(TypeFloat),
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				f := float64(*args[0].(*DFloat))
+				if math.IsInf(f, 0) || math.IsNaN(f) {
+					return args[0], nil
+				}
 				var x apd.Decimal
-				if _, err := x.SetFloat64(float64(*args[0].(*DFloat))); err != nil {
+				if _, err := x.SetFloat64(f); err != nil {
 					return nil, err
 				}
 
@@ -1478,10 +1799,8 @@ var Builtins = map[string][]Builtin{
 			return NewDFloat(DFloat(math.Trunc(x))), nil
 		}, "Truncates the decimal values of `val`."),
 		decimalBuiltin1(func(x *apd.Decimal) (Datum, error) {
-			// TODO(mjibson): see cockroachdb/apd#24
 			dd := &DDecimal{}
-			frac := new(apd.Decimal)
-			x.Modf(&dd.Decimal, frac)
+			x.Modf(&dd.Decimal, nil)
 			return dd, nil
 		}, "Truncates the decimal values of `val`."),
 	},
@@ -1522,7 +1841,7 @@ var Builtins = map[string][]Builtin{
 		Builtin{
 			Types:      ArgTypes{{"input", TypeAnyArray}, {"array_dimension", TypeInt}},
 			ReturnType: fixedReturnType(TypeInt),
-			category:   categorySystemInfo,
+			category:   categoryArray,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				arr := MustBeDArray(args[0])
 				dimen := int64(MustBeDInt(args[1]))
@@ -1538,7 +1857,7 @@ var Builtins = map[string][]Builtin{
 		Builtin{
 			Types:      ArgTypes{{"input", TypeAnyArray}, {"array_dimension", TypeInt}},
 			ReturnType: fixedReturnType(TypeInt),
-			category:   categorySystemInfo,
+			category:   categoryArray,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				arr := MustBeDArray(args[0])
 				dimen := int64(MustBeDInt(args[1]))
@@ -1554,7 +1873,7 @@ var Builtins = map[string][]Builtin{
 		Builtin{
 			Types:      ArgTypes{{"input", TypeAnyArray}, {"array_dimension", TypeInt}},
 			ReturnType: fixedReturnType(TypeInt),
-			category:   categorySystemInfo,
+			category:   categoryArray,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				arr := MustBeDArray(args[0])
 				dimen := int64(MustBeDInt(args[1]))
@@ -1565,6 +1884,142 @@ var Builtins = map[string][]Builtin{
 				"supported `array_dimension` is **1**.",
 		},
 	},
+
+	"array_append": arrayBuiltin(func(typ Type) Builtin {
+		return Builtin{
+			Types:        ArgTypes{{"array", TArray{typ}}, {"elem", typ}},
+			ReturnType:   fixedReturnType(TArray{typ}),
+			category:     categoryArray,
+			nullableArgs: true,
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				return appendToMaybeNullArray(typ, args[0], args[1])
+			},
+			Info: "Appends `elem` to `array`, returning the result.",
+		}
+	}),
+
+	"array_prepend": arrayBuiltin(func(typ Type) Builtin {
+		return Builtin{
+			Types:        ArgTypes{{"elem", typ}, {"array", TArray{typ}}},
+			ReturnType:   fixedReturnType(TArray{typ}),
+			category:     categoryArray,
+			nullableArgs: true,
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				return prependToMaybeNullArray(typ, args[0], args[1])
+			},
+			Info: "Prepends `elem` to `array`, returning the result.",
+		}
+	}),
+
+	"array_cat": arrayBuiltin(func(typ Type) Builtin {
+		return Builtin{
+			Types:        ArgTypes{{"left", TArray{typ}}, {"right", TArray{typ}}},
+			ReturnType:   fixedReturnType(TArray{typ}),
+			category:     categoryArray,
+			nullableArgs: true,
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				return concatArrays(typ, args[0], args[1])
+			},
+			Info: "Appends two arrays.",
+		}
+	}),
+
+	"array_remove": arrayBuiltin(func(typ Type) Builtin {
+		return Builtin{
+			Types:        ArgTypes{{"array", TArray{typ}}, {"elem", typ}},
+			ReturnType:   fixedReturnType(TArray{typ}),
+			category:     categoryArray,
+			nullableArgs: true,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				if args[0] == DNull {
+					return DNull, nil
+				}
+				result := NewDArray(typ)
+				for _, e := range MustBeDArray(args[0]).Array {
+					if e.Compare(ctx, args[1]) != 0 {
+						if err := result.Append(e); err != nil {
+							return nil, err
+						}
+					}
+				}
+				return result, nil
+			},
+			Info: "Remove from `array` all elements equal to `elem`.",
+		}
+	}),
+
+	"array_replace": arrayBuiltin(func(typ Type) Builtin {
+		return Builtin{
+			Types:        ArgTypes{{"array", TArray{typ}}, {"toreplace", typ}, {"replacewith", typ}},
+			ReturnType:   fixedReturnType(TArray{typ}),
+			category:     categoryArray,
+			nullableArgs: true,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				if args[0] == DNull {
+					return DNull, nil
+				}
+				result := NewDArray(typ)
+				for _, e := range MustBeDArray(args[0]).Array {
+					if e.Compare(ctx, args[1]) == 0 {
+						if err := result.Append(args[2]); err != nil {
+							return nil, err
+						}
+					} else {
+						if err := result.Append(e); err != nil {
+							return nil, err
+						}
+					}
+				}
+				return result, nil
+			},
+			Info: "Replace all occurrences of `toreplace` in `array` with `replacewith`.",
+		}
+	}),
+
+	"array_position": arrayBuiltin(func(typ Type) Builtin {
+		return Builtin{
+			Types:        ArgTypes{{"array", TArray{typ}}, {"elem", typ}},
+			ReturnType:   fixedReturnType(TypeInt),
+			category:     categoryArray,
+			nullableArgs: true,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				if args[0] == DNull {
+					return DNull, nil
+				}
+				for i, e := range MustBeDArray(args[0]).Array {
+					if e.Compare(ctx, args[1]) == 0 {
+						return NewDInt(DInt(i + 1)), nil
+					}
+				}
+				return DNull, nil
+			},
+			Info: "Return the index of the first occurrence of `elem` in `array`.",
+		}
+	}),
+
+	"array_positions": arrayBuiltin(func(typ Type) Builtin {
+		return Builtin{
+			Types:        ArgTypes{{"array", TArray{typ}}, {"elem", typ}},
+			ReturnType:   fixedReturnType(TArray{typ}),
+			category:     categoryArray,
+			nullableArgs: true,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				if args[0] == DNull {
+					return DNull, nil
+				}
+				result := NewDArray(TypeInt)
+				for i, e := range MustBeDArray(args[0]).Array {
+					if e.Compare(ctx, args[1]) == 0 {
+						if err := result.Append(NewDInt(DInt(i + 1))); err != nil {
+							return nil, err
+						}
+					}
+				}
+				return result, nil
+			},
+			Info: "Returns and array of indexes of all occurrences of `elem` in `array`.",
+		}
+	}),
 
 	// Metadata functions.
 
@@ -1618,7 +2073,7 @@ var Builtins = map[string][]Builtin{
 	"current_schemas": {
 		Builtin{
 			Types:      ArgTypes{{"include_pg_catalog", TypeBool}},
-			ReturnType: fixedReturnType(TypeStringArray),
+			ReturnType: fixedReturnType(TArray{TypeString}),
 			category:   categorySystemInfo,
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 				includePgCatalog := *(args[0].(*DBool))
@@ -1628,8 +2083,14 @@ var Builtins = map[string][]Builtin{
 						return nil, err
 					}
 				}
-				for _, p := range ctx.SearchPath {
-					if !includePgCatalog && p == "pg_catalog" {
+				var iter func() (string, bool)
+				if includePgCatalog {
+					iter = ctx.SearchPath.Iter()
+				} else {
+					iter = ctx.SearchPath.IterWithoutImplicitPGCatalog()
+				}
+				for p, ok := iter(); ok; p, ok = iter() {
+					if p == ctx.Database {
 						continue
 					}
 					if err := schemas.Append(NewDString(p)); err != nil {
@@ -1639,6 +2100,22 @@ var Builtins = map[string][]Builtin{
 				return schemas, nil
 			},
 			Info: "Returns the current search path for unqualified names.",
+		},
+	},
+
+	"current_user": {
+		Builtin{
+			Types:      ArgTypes{},
+			ReturnType: fixedReturnType(TypeString),
+			category:   categorySystemInfo,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				if len(ctx.User) == 0 {
+					return DNull, nil
+				}
+				return NewDString(ctx.User), nil
+			},
+			Info: "Returns the current user. This function is provided for " +
+				"compatibility with PostgreSQL.",
 		},
 	},
 
@@ -1654,15 +2131,15 @@ var Builtins = map[string][]Builtin{
 		},
 	},
 
-	"crdb_internal.force_internal_error": {
+	"crdb_internal.force_error": {
 		Builtin{
-			Types:      ArgTypes{{"msg", TypeString}},
+			Types:      ArgTypes{{"errorCode", TypeString}, {"msg", TypeString}},
 			ReturnType: fixedReturnType(TypeInt),
 			impure:     true,
-			privileged: true,
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
-				msg := string(*args[0].(*DString))
-				return nil, pgerror.NewError(pgerror.CodeInternalError, msg)
+				errCode := string(*args[0].(*DString))
+				msg := string(*args[1].(*DString))
+				return nil, pgerror.NewError(errCode, msg)
 			},
 			category: categorySystemInfo,
 			Info:     "This function is used only by CockroachDB's developers for testing purposes.",
@@ -1700,6 +2177,11 @@ var Builtins = map[string][]Builtin{
 		},
 	},
 
+	// If force_retry is called during the specified interval from the beginning
+	// of the transaction it returns a retryable error. If not, 0 is returned
+	// instead of an error.
+	// The second version allows one to create an error intended for a transaction
+	// different than the current statement's transaction.
 	"crdb_internal.force_retry": {
 		Builtin{
 			Types:      ArgTypes{{"val", TypeInterval}},
@@ -1712,10 +2194,7 @@ var Builtins = map[string][]Builtin{
 					Nanos: int64(ctx.stmtTimestamp.Sub(ctx.txnTimestamp)),
 				}
 				if elapsed.Compare(minDuration) < 0 {
-					return nil, roachpb.NewHandledRetryableTxnError(
-						"forced by crdb_internal.force_retry()",
-						nil, /* txnID */
-						roachpb.Transaction{})
+					return nil, ctx.Txn.GenerateForcedRetryableError("forced by crdb_internal.force_retry()")
 				}
 				return DZero, nil
 			},
@@ -1739,8 +2218,9 @@ var Builtins = map[string][]Builtin{
 					if err != nil {
 						return nil, err
 					}
-					return nil, roachpb.NewHandledRetryableTxnError(
-						"forced by crdb_internal.force_retry()", &uuid, roachpb.Transaction{})
+					err = ctx.Txn.GenerateForcedRetryableError("forced by crdb_internal.force_retry()")
+					err.(*roachpb.HandledRetryableTxnError).TxnID = uuid
+					return nil, err
 				}
 				return DZero, nil
 			},
@@ -1760,6 +2240,21 @@ var Builtins = map[string][]Builtin{
 			},
 			category: categorySystemInfo,
 			Info:     "This function is used only by CockroachDB's developers for testing purposes.",
+		},
+	},
+
+	"crdb_internal.set_vmodule": {
+		Builtin{
+			Types:      ArgTypes{{"vmodule_string", TypeString}},
+			ReturnType: fixedReturnType(TypeInt),
+			impure:     true,
+			privileged: true,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				return DZero, log.SetVModule(string(*args[0].(*DString)))
+			},
+			category: categorySystemInfo,
+			Info: "This function is used for internal debugging purposes. " +
+				"Incorrect use can severely impact performance.",
 		},
 	},
 }
@@ -1800,7 +2295,8 @@ var substringImpls = []Builtin{
 			length := int(MustBeDInt(args[2]))
 
 			if length < 0 {
-				return nil, fmt.Errorf("negative substring length %d not allowed", length)
+				return nil, pgerror.NewErrorf(
+					pgerror.CodeInvalidParameterValueError, "negative substring length %d not allowed", length)
 			}
 
 			end := start + length
@@ -1918,6 +2414,16 @@ var powImpls = []Builtin{
 		},
 		Info: "Calculates `x`^`y`.",
 	},
+}
+
+func arrayBuiltin(impl func(Type) Builtin) []Builtin {
+	result := make([]Builtin, 0, len(TypesAnyNonArray))
+	for _, typ := range TypesAnyNonArray {
+		if canBeInArray(typ) {
+			result = append(result, impl(typ))
+		}
+	}
+	return result
 }
 
 func decimalLogFn(
@@ -2063,8 +2569,9 @@ func feedHash(h hash.Hash, args Datums) {
 func hashBuiltin(newHash func() hash.Hash, info string) []Builtin {
 	return []Builtin{
 		{
-			Types:      VariadicType{TypeString},
-			ReturnType: fixedReturnType(TypeString),
+			Types:        VariadicType{TypeString},
+			ReturnType:   fixedReturnType(TypeString),
+			nullableArgs: true,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				h := newHash()
 				feedHash(h, args)
@@ -2073,8 +2580,9 @@ func hashBuiltin(newHash func() hash.Hash, info string) []Builtin {
 			Info: info,
 		},
 		{
-			Types:      VariadicType{TypeBytes},
-			ReturnType: fixedReturnType(TypeString),
+			Types:        VariadicType{TypeBytes},
+			ReturnType:   fixedReturnType(TypeString),
+			nullableArgs: true,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				h := newHash()
 				feedHash(h, args)
@@ -2088,8 +2596,9 @@ func hashBuiltin(newHash func() hash.Hash, info string) []Builtin {
 func hash32Builtin(newHash func() hash.Hash32, info string) []Builtin {
 	return []Builtin{
 		{
-			Types:      VariadicType{TypeString},
-			ReturnType: fixedReturnType(TypeInt),
+			Types:        VariadicType{TypeString},
+			ReturnType:   fixedReturnType(TypeInt),
+			nullableArgs: true,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				h := newHash()
 				feedHash(h, args)
@@ -2098,8 +2607,9 @@ func hash32Builtin(newHash func() hash.Hash32, info string) []Builtin {
 			Info: info,
 		},
 		{
-			Types:      VariadicType{TypeBytes},
-			ReturnType: fixedReturnType(TypeInt),
+			Types:        VariadicType{TypeBytes},
+			ReturnType:   fixedReturnType(TypeInt),
+			nullableArgs: true,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				h := newHash()
 				feedHash(h, args)
@@ -2112,8 +2622,9 @@ func hash32Builtin(newHash func() hash.Hash32, info string) []Builtin {
 func hash64Builtin(newHash func() hash.Hash64, info string) []Builtin {
 	return []Builtin{
 		{
-			Types:      VariadicType{TypeString},
-			ReturnType: fixedReturnType(TypeInt),
+			Types:        VariadicType{TypeString},
+			ReturnType:   fixedReturnType(TypeInt),
+			nullableArgs: true,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				h := newHash()
 				feedHash(h, args)
@@ -2122,8 +2633,9 @@ func hash64Builtin(newHash func() hash.Hash64, info string) []Builtin {
 			Info: info,
 		},
 		{
-			Types:      VariadicType{TypeBytes},
-			ReturnType: fixedReturnType(TypeInt),
+			Types:        VariadicType{TypeBytes},
+			ReturnType:   fixedReturnType(TypeInt),
+			nullableArgs: true,
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				h := newHash()
 				feedHash(h, args)
@@ -2174,8 +2686,6 @@ func (k regexpFlagKey) pattern() (string, error) {
 	return regexpEvalFlags(k.sqlPattern, k.sqlFlags)
 }
 
-var replaceSubRe = regexp.MustCompile(`\\[&1-9]`)
-
 func regexpReplace(ctx *EvalContext, s, pattern, to, sqlFlags string) (Datum, error) {
 	patternRe, err := ctx.ReCache.GetRegexp(regexpFlagKey{pattern, sqlFlags})
 	if err != nil {
@@ -2187,7 +2697,7 @@ func regexpReplace(ctx *EvalContext, s, pattern, to, sqlFlags string) (Datum, er
 		matchCount = -1
 	}
 
-	replaceIndex := 0
+	finalIndex := 0
 	var newString bytes.Buffer
 
 	// regexp.ReplaceAllStringFunc cannot be used here because it does not provide
@@ -2204,42 +2714,54 @@ func regexpReplace(ctx *EvalContext, s, pattern, to, sqlFlags string) (Datum, er
 	// and so on) represent the start and end index in s of matched subexpressions within the
 	// pattern.
 	for _, matchIndex := range patternRe.FindAllStringSubmatchIndex(s, matchCount) {
-		start := matchIndex[0]
-		end := matchIndex[1]
+		// matchStart and matchEnd are the boundaries of the current regexp match
+		// in the searched text.
+		matchStart := matchIndex[0]
+		matchEnd := matchIndex[1]
 
 		// Add sections of s either before the first match or between matches.
-		preMatch := s[replaceIndex:start]
+		preMatch := s[finalIndex:matchStart]
 		newString.WriteString(preMatch)
 
-		// Add the replacement string for the current match.
-		match := s[start:end]
-		matchTo := replaceSubRe.ReplaceAllStringFunc(to, func(repl string) string {
-			subRef := repl[len(repl)-1]
-			if subRef == '&' {
-				return match
+		// We write out `to` into `newString` in chunks, flushing out the next chunk
+		// when we hit a `\\` or a backreference.
+		// chunkStart is the start of the next chunk we will flush out.
+		chunkStart := 0
+		// i is the current position in the replacement text that we are scanning
+		// through.
+		i := 0
+		for i < len(to) {
+			if to[i] == '\\' && i+1 < len(to) {
+				i++
+				if to[i] == '\\' {
+					// `\\` is special in regexpReplace to insert a literal backslash.
+					newString.WriteString(to[chunkStart:i])
+					chunkStart = i + 1
+				} else if ('0' <= to[i] && to[i] <= '9') || to[i] == '&' {
+					newString.WriteString(to[chunkStart : i-1])
+					chunkStart = i + 1
+					if to[i] == '&' {
+						// & refers to the entire match.
+						newString.WriteString(s[matchStart:matchEnd])
+					} else {
+						idx := int(to[i] - '0')
+						// regexpReplace expects references to "out-of-bounds" capture groups
+						// to be ignored.
+						if 2*idx < len(matchIndex) {
+							newString.WriteString(s[matchIndex[2*idx]:matchIndex[2*idx+1]])
+						}
+					}
+				}
 			}
+			i++
+		}
+		newString.WriteString(to[chunkStart:])
 
-			sub, err := strconv.Atoi(string(subRef))
-			if err != nil {
-				panic(fmt.Sprintf("invalid integer submatch reference seen: %v", err))
-			}
-			if 2*sub >= len(matchIndex) {
-				// regexpReplace expects references to "out-of-bounds" capture groups
-				// to be ignored, so replace with an empty string.
-				return ""
-			}
-
-			subStart := matchIndex[2*sub]
-			subEnd := matchIndex[2*sub+1]
-			return s[subStart:subEnd]
-		})
-		newString.WriteString(matchTo)
-
-		replaceIndex = end
+		finalIndex = matchEnd
 	}
 
 	// Add the section of s past the final match.
-	newString.WriteString(s[replaceIndex:])
+	newString.WriteString(s[finalIndex:])
 
 	return NewDString(newString.String()), nil
 }
@@ -2280,7 +2802,8 @@ func regexpEvalFlags(pattern, sqlFlags string) (string, error) {
 			flags |= syntax.DotNL
 			flags &^= syntax.OneLine
 		default:
-			return "", fmt.Errorf("invalid regexp flag: %q", sqlFlag)
+			return "", pgerror.NewErrorf(
+				pgerror.CodeInvalidRegularExpressionError, "invalid regexp flag: %q", sqlFlag)
 		}
 	}
 
@@ -2305,7 +2828,8 @@ func regexpEvalFlags(pattern, sqlFlags string) (string, error) {
 
 func overlay(s, to string, pos, size int) (Datum, error) {
 	if pos < 1 {
-		return nil, fmt.Errorf("non-positive substring length not allowed: %d", pos)
+		return nil, pgerror.NewErrorf(
+			pgerror.CodeInvalidParameterValueError, "non-positive substring length not allowed: %d", pos)
 	}
 	pos--
 
@@ -2515,7 +3039,7 @@ func extractStringFromTimestamp(
 		return NewDInt(DInt(fromTime.Year())), nil
 
 	case "quarter":
-		return NewDInt(DInt(fromTime.Month()/4 + 1)), nil
+		return NewDInt(DInt((fromTime.Month()-1)/3 + 1)), nil
 
 	case "month", "months":
 		return NewDInt(DInt(fromTime.Month())), nil
@@ -2553,6 +3077,69 @@ func extractStringFromTimestamp(
 		return NewDInt(DInt(fromTime.Unix())), nil
 
 	default:
-		return nil, fmt.Errorf("unsupported timespan: %s", timeSpan)
+		return nil, pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError, "unsupported timespan: %s", timeSpan)
 	}
+}
+
+func truncateTimestamp(_ *EvalContext, fromTime time.Time, timeSpan string) (Datum, error) {
+	year := fromTime.Year()
+	month := fromTime.Month()
+	day := fromTime.Day()
+	hour := fromTime.Hour()
+	min := fromTime.Minute()
+	sec := fromTime.Second()
+	nsec := fromTime.Nanosecond()
+	loc := fromTime.Location()
+
+	monthTrunc := time.January
+	dayTrunc := 1
+	hourTrunc := 0
+	minTrunc := 0
+	secTrunc := 0
+	nsecTrunc := 0
+
+	switch timeSpan {
+	case "year", "years":
+		month, day, hour, min, sec, nsec = monthTrunc, dayTrunc, hourTrunc, minTrunc, secTrunc, nsecTrunc
+
+	case "quarter":
+		firstMonthInQuarter := ((month-1)/3)*3 + 1
+		month, day, hour, min, sec, nsec = firstMonthInQuarter, dayTrunc, hourTrunc, minTrunc, secTrunc, nsecTrunc
+
+	case "month", "months":
+		day, hour, min, sec, nsec = dayTrunc, hourTrunc, minTrunc, secTrunc, nsecTrunc
+
+	case "week", "weeks":
+		// Subtract (day of week * nanoseconds per day) to get date as of previous Sunday.
+		previousSunday := fromTime.Add(time.Duration(-1 * int64(fromTime.Weekday()) * int64(time.Hour) * 24))
+		year, month, day = previousSunday.Year(), previousSunday.Month(), previousSunday.Day()
+		hour, min, sec, nsec = hourTrunc, minTrunc, secTrunc, nsecTrunc
+
+	case "day", "days":
+		hour, min, sec, nsec = hourTrunc, minTrunc, secTrunc, nsecTrunc
+
+	case "hour", "hours":
+		min, sec, nsec = minTrunc, secTrunc, nsecTrunc
+
+	case "minute", "minutes":
+		sec, nsec = secTrunc, nsecTrunc
+
+	case "second", "seconds":
+		nsec = nsecTrunc
+
+	case "millisecond", "milliseconds":
+		// This a PG extension not supported in MySQL.
+		milliseconds := (nsec / int(time.Millisecond)) * int(time.Millisecond)
+		nsec = milliseconds
+
+	case "microsecond", "microseconds":
+		microseconds := (nsec / int(time.Microsecond)) * int(time.Microsecond)
+		nsec = microseconds
+
+	default:
+		return nil, pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError, "unsupported timespan: %s", timeSpan)
+	}
+
+	toTime := time.Date(year, month, day, hour, min, sec, nsec, loc)
+	return MakeDTimestampTZ(toTime, time.Microsecond), nil
 }

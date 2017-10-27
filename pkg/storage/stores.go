@@ -11,21 +11,20 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
 import (
 	"fmt"
+	"unsafe"
 
 	"golang.org/x/net/context"
-	"golang.org/x/sync/syncmap"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -44,8 +43,13 @@ import (
 type Stores struct {
 	log.AmbientContext
 	clock    *hlc.Clock
-	storeMap syncmap.Map // map[roachpb.StoreID]*Store
-	mu       struct {
+	storeMap syncutil.IntMap // map[roachpb.StoreID]*Store
+	// These two versions are usually cluster.BinaryMinimumSupportedVersion and
+	// cluster.BinaryServerVersion, respectively. They are changed in some
+	// tests.
+	minSupportedVersion roachpb.Version
+	serverVersion       roachpb.Version
+	mu                  struct {
 		syncutil.Mutex
 		biLatestTS hlc.Timestamp         // Timestamp of gossip bootstrap info
 		latestBI   *gossip.BootstrapInfo // Latest cached bootstrap info
@@ -57,17 +61,21 @@ var _ gossip.Storage = &Stores{} // Stores implements the gossip.Storage interfa
 
 // NewStores returns a local-only sender which directly accesses
 // a collection of stores.
-func NewStores(ambient log.AmbientContext, clock *hlc.Clock) *Stores {
+func NewStores(
+	ambient log.AmbientContext, clock *hlc.Clock, minVersion, serverVersion roachpb.Version,
+) *Stores {
 	return &Stores{
-		AmbientContext: ambient,
-		clock:          clock,
+		AmbientContext:      ambient,
+		clock:               clock,
+		minSupportedVersion: minVersion,
+		serverVersion:       serverVersion,
 	}
 }
 
 // GetStoreCount returns the number of stores this node is exporting.
 func (ls *Stores) GetStoreCount() int {
 	var count int
-	ls.storeMap.Range(func(k, v interface{}) bool {
+	ls.storeMap.Range(func(_ int64, _ unsafe.Pointer) bool {
 		count++
 		return true
 	})
@@ -76,22 +84,22 @@ func (ls *Stores) GetStoreCount() int {
 
 // HasStore returns true if the specified store is owned by this Stores.
 func (ls *Stores) HasStore(storeID roachpb.StoreID) bool {
-	_, ok := ls.storeMap.Load(storeID)
+	_, ok := ls.storeMap.Load(int64(storeID))
 	return ok
 }
 
 // GetStore looks up the store by store ID. Returns an error
 // if not found.
 func (ls *Stores) GetStore(storeID roachpb.StoreID) (*Store, error) {
-	if value, ok := ls.storeMap.Load(storeID); ok {
-		return value.(*Store), nil
+	if value, ok := ls.storeMap.Load(int64(storeID)); ok {
+		return (*Store)(value), nil
 	}
 	return nil, roachpb.NewStoreNotFoundError(storeID)
 }
 
 // AddStore adds the specified store to the store map.
 func (ls *Stores) AddStore(s *Store) {
-	if _, loaded := ls.storeMap.LoadOrStore(s.Ident.StoreID, s); loaded {
+	if _, loaded := ls.storeMap.LoadOrStore(int64(s.Ident.StoreID), unsafe.Pointer(s)); loaded {
 		panic(fmt.Sprintf("cannot add store twice: %+v", s.Ident))
 	}
 	// If we've already read the gossip bootstrap info, ensure that
@@ -108,7 +116,7 @@ func (ls *Stores) AddStore(s *Store) {
 
 // RemoveStore removes the specified store from the store map.
 func (ls *Stores) RemoveStore(s *Store) {
-	ls.storeMap.Delete(s.Ident.StoreID)
+	ls.storeMap.Delete(int64(s.Ident.StoreID))
 }
 
 // VisitStores implements a visitor pattern over stores in the
@@ -119,11 +127,40 @@ func (ls *Stores) RemoveStore(s *Store) {
 // in random order.
 func (ls *Stores) VisitStores(visitor func(s *Store) error) error {
 	var err error
-	ls.storeMap.Range(func(k, v interface{}) bool {
-		err = visitor(v.(*Store))
+	ls.storeMap.Range(func(k int64, v unsafe.Pointer) bool {
+		err = visitor((*Store)(v))
 		return err == nil
 	})
 	return err
+}
+
+// GetReplicaForRangeID returns the replica which contains the specified range,
+// or nil if it's not found.
+func (ls *Stores) GetReplicaForRangeID(rangeID roachpb.RangeID) (*Replica, error) {
+	var replica *Replica
+
+	err := ls.VisitStores(func(store *Store) error {
+		replicaFromStore, err := store.GetReplica(rangeID)
+
+		switch err.(type) {
+		case nil:
+			replica = replicaFromStore
+		case *roachpb.RangeNotFoundError:
+			return nil
+		default:
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	if replica == nil {
+		return nil, roachpb.NewRangeNotFoundError(rangeID)
+	}
+	return replica, nil
 }
 
 // Send implements the client.Sender interface. The store is looked up from the
@@ -195,8 +232,8 @@ func (ls *Stores) LookupReplica(
 	var repDesc roachpb.ReplicaDescriptor
 	var repDescFound bool
 	var err error
-	ls.storeMap.Range(func(k, v interface{}) bool {
-		store := v.(*Store)
+	ls.storeMap.Range(func(k int64, v unsafe.Pointer) bool {
+		store := (*Store)(v)
 		replica := store.LookupReplica(start, nil)
 		if replica == nil {
 			return true
@@ -275,8 +312,8 @@ func (ls *Stores) ReadBootstrapInfo(bi *gossip.BootstrapInfo) error {
 	var err error
 
 	// Find the most recent bootstrap info.
-	ls.storeMap.Range(func(k, v interface{}) bool {
-		s := v.(*Store)
+	ls.storeMap.Range(func(k int64, v unsafe.Pointer) bool {
+		s := (*Store)(v)
 		var storeBI gossip.BootstrapInfo
 		var ok bool
 		ok, err = engine.MVCCGetProto(ctx, s.engine, keys.StoreGossipKey(), hlc.Timestamp{}, true, nil, &storeBI)
@@ -325,10 +362,174 @@ func (ls *Stores) updateBootstrapInfoLocked(bi *gossip.BootstrapInfo) error {
 	ls.mu.latestBI = protoutil.Clone(bi).(*gossip.BootstrapInfo)
 	// Update all stores.
 	var err error
-	ls.storeMap.Range(func(k, v interface{}) bool {
-		s := v.(*Store)
+	ls.storeMap.Range(func(k int64, v unsafe.Pointer) bool {
+		s := (*Store)(v)
 		err = engine.MVCCPutProto(ctx, s.engine, nil, keys.StoreGossipKey(), hlc.Timestamp{}, nil, bi)
 		return err == nil
 	})
 	return err
+}
+
+// ReadVersionFromEngineOrDefault reads the persisted cluster version from the
+// engine, falling back to v1.0 if no version is specified on the engine.
+func ReadVersionFromEngineOrDefault(
+	ctx context.Context, e engine.Engine,
+) (cluster.ClusterVersion, error) {
+	var cv cluster.ClusterVersion
+	cv, err := ReadClusterVersion(ctx, e)
+	if err != nil {
+		return cluster.ClusterVersion{}, err
+	}
+
+	// These values should always exist in 1.1-initialized clusters, but may
+	// not on 1.0.x; we synthesize the missing version.
+	if cv.UseVersion == (roachpb.Version{}) {
+		cv.UseVersion = cluster.VersionByKey(cluster.VersionBase)
+	}
+	if cv.MinimumVersion == (roachpb.Version{}) {
+		cv.MinimumVersion = cluster.VersionByKey(cluster.VersionBase)
+	}
+	return cv, nil
+}
+
+// WriteClusterVersionToEngines writes the given version to the given engines,
+// without any sanity checks.
+func WriteClusterVersionToEngines(
+	ctx context.Context, engines []engine.Engine, cv cluster.ClusterVersion,
+) error {
+	for _, eng := range engines {
+		if err := WriteClusterVersion(ctx, eng, cv); err != nil {
+			return errors.Wrapf(err, "error writing version to engine %s", eng)
+		}
+	}
+	return nil
+}
+
+// SynthesizeClusterVersionFromEngines implements the core of (*Stores).SynthesizeClusterVersion.
+func SynthesizeClusterVersionFromEngines(
+	ctx context.Context, engines []engine.Engine, minSupportedVersion, serverVersion roachpb.Version,
+) (cluster.ClusterVersion, error) {
+	// Find the most recent bootstrap info.
+	type originVersion struct {
+		roachpb.Version
+		origin string
+	}
+
+	// FIXME(tschottdorf): If we don't find anything, this should return v1.0, but
+	// we have to guarantee first that you always find something (should be OK).
+	maxMinVersion := originVersion{
+		Version: minSupportedVersion,
+		origin:  "(no store)",
+	}
+
+	// FIXME(tschottdorf): when we don't have anything on the stores, we need to
+	// set this to `minSupportedVersions`. It looks like currently it would be
+	// set to `v1.0` which may not even be supported.
+	// This is the case in which the node is joining an existing cluster.
+	minUseVersion := originVersion{
+		Version: serverVersion,
+		origin:  "(no store)",
+	}
+
+	// We run this twice because only after having seen all the versions, we
+	// can decide whether the node catches a version error. However, we also
+	// want to name at least one engine that violates the version
+	// constraints, which at the latest the second loop will achieve
+	// (because then minUseVersion and maxMinVersion don't change any more).
+	for _, eng := range engines {
+		var cv cluster.ClusterVersion
+		cv, err := ReadVersionFromEngineOrDefault(ctx, eng)
+		if err != nil {
+			return cluster.ClusterVersion{}, err
+		}
+
+		// Avoid running a binary with a store that is too new. For example,
+		// restarting into 1.1 after having upgraded to 1.2 doesn't work.
+		for _, v := range []roachpb.Version{cv.MinimumVersion, cv.UseVersion} {
+			if serverVersion.Less(v) {
+				return cluster.ClusterVersion{}, errors.Errorf("engine %s requires at least v%s, but running version is %s",
+					eng, v, serverVersion)
+			}
+		}
+
+		// Track the highest minimum version encountered.
+		if maxMinVersion.Version.Less(cv.MinimumVersion) {
+			maxMinVersion.Version = cv.MinimumVersion
+			maxMinVersion.origin = fmt.Sprint(eng)
+
+		}
+		// Track smallest use version encountered.
+		if cv.UseVersion.Less(minUseVersion.Version) {
+			minUseVersion.Version = cv.UseVersion
+			minUseVersion.origin = fmt.Sprint(eng)
+		}
+	}
+
+	cv := cluster.ClusterVersion{
+		UseVersion:     minUseVersion.Version,
+		MinimumVersion: maxMinVersion.Version,
+	}
+	log.Eventf(ctx, "read ClusterVersion %+v", cv)
+
+	for _, v := range []originVersion{minUseVersion, maxMinVersion} {
+		// Avoid running a binary too new for this store. This is what you'd catch
+		// if, say, you restarted directly from 1.0 into 1.2 (bumping the min
+		// version) without going through 1.1 first. It would also what you catch if
+		// you are starting 1.1 for the first time (after 1.0), but it crashes
+		// half-way through the startup sequence (so now some stores have 1.1, but
+		// some 1.0), in which case you are expected to run 1.1 again (hopefully
+		// without the crash this time) which would then rewrite all the stores.
+		//
+		// We only verify this now because as we iterate through the stores, we
+		// may not yet have picked up the final versions we're actually planning
+		// to use.
+		if v.Version.Less(minSupportedVersion) {
+			return cluster.ClusterVersion{}, errors.Errorf("engine %s at v%s too old for running version %s "+
+				"(requires at least v%s)", v.origin, v.Version, serverVersion,
+				minSupportedVersion)
+		}
+	}
+	// Write the "actual" version back to all stores. This is almost always a
+	// no-op, but will backfill the information for 1.0.x clusters, and also
+	// smoothens out inconsistent state that can crop up during an ill-timed
+	// crash or when new stores are being added.
+	return cv, WriteClusterVersionToEngines(ctx, engines, cv)
+}
+
+// SynthesizeClusterVersion reads and returns the ClusterVersion protobuf
+// (written to any of the configured stores (all of which are bootstrapped)).
+// The returned value is also replicated to all stores for consistency, in case
+// a new store was added or an old store re-configured. In case of non-identical
+// versions across the stores, returns a version that carries the largest
+// MinVersion and the smallest UseVersion.
+//
+// If there aren't any stores, returns a ClusterVersion with MinSupportedVersion
+// and UseVersion set to the minimum supported version and server version of the
+// build, respectively.
+func (ls *Stores) SynthesizeClusterVersion(ctx context.Context) (cluster.ClusterVersion, error) {
+	var engines []engine.Engine
+	ls.storeMap.Range(func(_ int64, v unsafe.Pointer) bool {
+		engines = append(engines, (*Store)(v).engine)
+		return true // want more
+	})
+	cv, err := SynthesizeClusterVersionFromEngines(ctx, engines, ls.minSupportedVersion, ls.serverVersion)
+	if err != nil {
+		return cluster.ClusterVersion{}, err
+	}
+	return cv, nil
+}
+
+// WriteClusterVersion persists the supplied ClusterVersion to every
+// configured store. Returns nil on success; otherwise returns first
+// error encountered writing to the stores.
+//
+// WriteClusterVersion makes no attempt to validate the supplied version.
+func (ls *Stores) WriteClusterVersion(ctx context.Context, cv cluster.ClusterVersion) error {
+	// Update all stores.
+	var engines []engine.Engine
+	ls.storeMap.Range(func(_ int64, v unsafe.Pointer) bool {
+		engines = append(engines, (*Store)(v).Engine())
+		return true // want more
+	})
+	return WriteClusterVersionToEngines(ctx, engines, cv)
 }

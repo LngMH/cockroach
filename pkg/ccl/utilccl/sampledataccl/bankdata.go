@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
@@ -210,7 +211,7 @@ func (b *Backup) NextKeyValues(
 
 	newDesc := *tableDesc
 	newDesc.ID = newTableID
-	newDescBytes, err := sqlbase.WrapDescriptor(&newDesc).Marshal()
+	newDescBytes, err := protoutil.Marshal(sqlbase.WrapDescriptor(&newDesc))
 	if err != nil {
 		return nil, roachpb.Span{}, err
 	}
@@ -382,8 +383,7 @@ func (d *bankData) NextSplit() ([]string, bool) {
 	if d.splitIdx+1 >= d.Ranges {
 		return nil, false
 	}
-	// TODO(dan): This doesn't make evenly sized splits.
-	split := []string{strconv.Itoa(d.splitIdx)}
+	split := []string{strconv.Itoa((d.splitIdx + 1) * (d.Rows / d.Ranges))}
 	d.splitIdx++
 	return split, true
 }

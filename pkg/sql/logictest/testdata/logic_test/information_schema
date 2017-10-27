@@ -24,63 +24,63 @@ statement error database "information_schema" already exists
 CREATE DATABASE information_schema
 
 statement ok
-DROP DATABASE other_db
+DROP DATABASE other_db CASCADE
 
 
 # Verify information_schema tables handle mutation statements correctly.
 
-statement error user root does not have DROP privilege on table tables
+statement error user root does not have DROP privilege on relation tables
 ALTER TABLE information_schema.tables RENAME TO information_schema.bad
 
-statement error user root does not have CREATE privilege on table tables
+statement error user root does not have CREATE privilege on relation tables
 ALTER TABLE information_schema.tables RENAME COLUMN x TO y
 
-statement error user root does not have CREATE privilege on table tables
+statement error user root does not have CREATE privilege on relation tables
 ALTER TABLE information_schema.tables ADD COLUMN x DECIMAL
 
-statement error user root does not have CREATE privilege on table tables
+statement error user root does not have CREATE privilege on relation tables
 ALTER TABLE information_schema.tables DROP COLUMN x
 
-statement error user root does not have CREATE privilege on table tables
+statement error user root does not have CREATE privilege on relation tables
 ALTER TABLE information_schema.tables ADD CONSTRAINT foo UNIQUE (b)
 
-statement error user root does not have CREATE privilege on table tables
+statement error user root does not have CREATE privilege on relation tables
 ALTER TABLE information_schema.tables DROP CONSTRAINT bar
 
-statement error user root does not have CREATE privilege on table tables
+statement error user root does not have CREATE privilege on relation tables
 ALTER TABLE information_schema.tables ALTER COLUMN x SET DEFAULT 'foo'
 
-statement error user root does not have CREATE privilege on table tables
+statement error user root does not have CREATE privilege on relation tables
 ALTER TABLE information_schema.tables ALTER x DROP NOT NULL
 
-statement error user root does not have CREATE privilege on table tables
+statement error user root does not have CREATE privilege on relation tables
 CREATE INDEX i on information_schema.tables (x)
 
-statement error user root does not have DROP privilege on table tables
+statement error user root does not have DROP privilege on relation tables
 DROP TABLE information_schema.tables
 
-statement error user root does not have CREATE privilege on table tables
+statement error user root does not have CREATE privilege on relation tables
 DROP INDEX information_schema.tables@i
 
-statement error user root does not have GRANT privilege on table tables
+statement error user root does not have GRANT privilege on relation tables
 GRANT CREATE ON information_schema.tables TO root
 
-statement error user root does not have GRANT privilege on table tables
+statement error user root does not have GRANT privilege on relation tables
 REVOKE CREATE ON information_schema.tables FROM root
 
 
 # Verify information_schema tables handles read-only property correctly.
 
-query error user root does not have DELETE privilege on table tables
+query error user root does not have DELETE privilege on relation tables
 DELETE FROM information_schema.tables
 
-query error user root does not have INSERT privilege on table tables
+query error user root does not have INSERT privilege on relation tables
 INSERT INTO information_schema.tables VALUES ('abc')
 
-statement error user root does not have UPDATE privilege on table tables
+statement error user root does not have UPDATE privilege on relation tables
 UPDATE information_schema.tables SET a = 'abc'
 
-statement error user root does not have DROP privilege on table tables
+statement error user root does not have DROP privilege on relation tables
 TRUNCATE TABLE information_schema.tables
 
 
@@ -111,6 +111,7 @@ columns
 key_column_usage
 schema_privileges
 schemata
+sequences
 statistics
 table_constraints
 table_privileges
@@ -195,7 +196,7 @@ def           system              NULL                        NULL
 def           test                NULL                        NULL
 
 statement ok
-DROP DATABASE other_db
+DROP DATABASE other_db CASCADE
 
 ## information_schema.tables
 
@@ -204,24 +205,34 @@ DROP DATABASE other_db
 query TT
 select table_schema, table_name FROM information_schema.tables ORDER BY 1, 2
 ----
+crdb_internal       backward_dependencies
 crdb_internal       builtin_functions
 crdb_internal       cluster_queries
 crdb_internal       cluster_sessions
 crdb_internal       cluster_settings
+crdb_internal       create_statements
+crdb_internal       forward_dependencies
+crdb_internal       index_columns
 crdb_internal       jobs
 crdb_internal       leases
 crdb_internal       node_build_info
 crdb_internal       node_queries
+crdb_internal       node_runtime_info
 crdb_internal       node_sessions
 crdb_internal       node_statement_statistics
+crdb_internal       ranges
 crdb_internal       schema_changes
 crdb_internal       session_trace
 crdb_internal       session_variables
+crdb_internal       table_columns
+crdb_internal       table_indexes
 crdb_internal       tables
+crdb_internal       zones
 information_schema  columns
 information_schema  key_column_usage
 information_schema  schema_privileges
 information_schema  schemata
+information_schema  sequences
 information_schema  statistics
 information_schema  table_constraints
 information_schema  table_privileges
@@ -250,6 +261,7 @@ pg_catalog          pg_range
 pg_catalog          pg_roles
 pg_catalog          pg_settings
 pg_catalog          pg_tables
+pg_catalog          pg_tablespace
 pg_catalog          pg_type
 pg_catalog          pg_views
 system              descriptor
@@ -261,6 +273,7 @@ system              rangelog
 system              settings
 system              ui
 system              users
+system              web_sessions
 system              zones
 
 statement ok
@@ -328,7 +341,9 @@ query T
 SELECT table_name FROM information_schema.tables WHERE table_name > 't'  ORDER BY 1 DESC
 ----
 zones
+zones
 xyz
+web_sessions
 views
 users
 user_privileges
@@ -336,31 +351,43 @@ ui
 tables
 tables
 table_privileges
+table_indexes
 table_constraints
+table_columns
 
 # Check that the metadata is reported properly.
 query TTTTI colnames
 SELECT * FROM information_schema.tables
 ----
 table_catalog  table_schema        table_name                 table_type   version
+def            crdb_internal       backward_dependencies      SYSTEM VIEW  1
 def            crdb_internal       builtin_functions          SYSTEM VIEW  1
 def            crdb_internal       cluster_queries            SYSTEM VIEW  1
 def            crdb_internal       cluster_sessions           SYSTEM VIEW  1
 def            crdb_internal       cluster_settings           SYSTEM VIEW  1
+def            crdb_internal       create_statements          SYSTEM VIEW  1
+def            crdb_internal       forward_dependencies       SYSTEM VIEW  1
+def            crdb_internal       index_columns              SYSTEM VIEW  1
 def            crdb_internal       jobs                       SYSTEM VIEW  1
 def            crdb_internal       leases                     SYSTEM VIEW  1
 def            crdb_internal       node_build_info            SYSTEM VIEW  1
 def            crdb_internal       node_queries               SYSTEM VIEW  1
+def            crdb_internal       node_runtime_info          SYSTEM VIEW  1
 def            crdb_internal       node_sessions              SYSTEM VIEW  1
 def            crdb_internal       node_statement_statistics  SYSTEM VIEW  1
+def            crdb_internal       ranges                     SYSTEM VIEW  1
 def            crdb_internal       schema_changes             SYSTEM VIEW  1
 def            crdb_internal       session_trace              SYSTEM VIEW  1
 def            crdb_internal       session_variables          SYSTEM VIEW  1
+def            crdb_internal       table_columns              SYSTEM VIEW  1
+def            crdb_internal       table_indexes              SYSTEM VIEW  1
 def            crdb_internal       tables                     SYSTEM VIEW  1
+def            crdb_internal       zones                      SYSTEM VIEW  1
 def            information_schema  columns                    SYSTEM VIEW  1
 def            information_schema  key_column_usage           SYSTEM VIEW  1
 def            information_schema  schema_privileges          SYSTEM VIEW  1
 def            information_schema  schemata                   SYSTEM VIEW  1
+def            information_schema  sequences                  SYSTEM VIEW  1
 def            information_schema  statistics                 SYSTEM VIEW  1
 def            information_schema  table_constraints          SYSTEM VIEW  1
 def            information_schema  table_privileges           SYSTEM VIEW  1
@@ -391,6 +418,7 @@ def            pg_catalog          pg_range                   SYSTEM VIEW  1
 def            pg_catalog          pg_roles                   SYSTEM VIEW  1
 def            pg_catalog          pg_settings                SYSTEM VIEW  1
 def            pg_catalog          pg_tables                  SYSTEM VIEW  1
+def            pg_catalog          pg_tablespace              SYSTEM VIEW  1
 def            pg_catalog          pg_type                    SYSTEM VIEW  1
 def            pg_catalog          pg_views                   SYSTEM VIEW  1
 def            system              descriptor                 BASE TABLE   1
@@ -402,6 +430,7 @@ def            system              rangelog                   BASE TABLE   1
 def            system              settings                   BASE TABLE   1
 def            system              ui                         BASE TABLE   1
 def            system              users                      BASE TABLE   1
+def            system              web_sessions               BASE TABLE   1
 def            system              zones                      BASE TABLE   1
 
 statement ok
@@ -442,29 +471,30 @@ def            other_db      xyz         BASE TABLE  6
 user root
 
 statement ok
-DROP DATABASE other_db
+DROP DATABASE other_db CASCADE
 
 statement ok
 SET DATABASE = test
 
 ## information_schema.table_constraints
 
-query TTTTTT colnames
+query TTTTTTTTT colnames
 SELECT *
 FROM information_schema.table_constraints
 ORDER BY TABLE_NAME, CONSTRAINT_TYPE, CONSTRAINT_NAME
 ----
-constraint_catalog  constraint_schema  constraint_name  table_schema  table_name  constraint_type
-def                 system             primary          system        descriptor  PRIMARY KEY
-def                 system             primary          system        eventlog    PRIMARY KEY
-def                 system             primary          system        jobs        PRIMARY KEY
-def                 system             primary          system        lease       PRIMARY KEY
-def                 system             primary          system        namespace   PRIMARY KEY
-def                 system             primary          system        rangelog    PRIMARY KEY
-def                 system             primary          system        settings    PRIMARY KEY
-def                 system             primary          system        ui          PRIMARY KEY
-def                 system             primary          system        users       PRIMARY KEY
-def                 system             primary          system        zones       PRIMARY KEY
+constraint_catalog  constraint_schema  constraint_name  table_catalog  table_schema  table_name    constraint_type  is_deferrable  initially_deferred
+def                 system             primary          def            system        descriptor    PRIMARY KEY      NO             NO
+def                 system             primary          def            system        eventlog      PRIMARY KEY      NO             NO
+def                 system             primary          def            system        jobs          PRIMARY KEY      NO             NO
+def                 system             primary          def            system        lease         PRIMARY KEY      NO             NO
+def                 system             primary          def            system        namespace     PRIMARY KEY      NO             NO
+def                 system             primary          def            system        rangelog      PRIMARY KEY      NO             NO
+def                 system             primary          def            system        settings      PRIMARY KEY      NO             NO
+def                 system             primary          def            system        ui            PRIMARY KEY      NO             NO
+def                 system             primary          def            system        users         PRIMARY KEY      NO             NO
+def                 system             primary          def            system        web_sessions  PRIMARY KEY      NO             NO
+def                 system             primary          def            system        zones         PRIMARY KEY      NO             NO
 
 statement ok
 CREATE DATABASE constraint_db
@@ -486,21 +516,21 @@ CREATE TABLE constraint_db.t2 (
 statement ok
 SET DATABASE = constraint_db
 
-query TTTTTT colnames
+query TTTTTTTTT colnames
 SELECT *
 FROM information_schema.table_constraints
 WHERE constraint_schema = 'constraint_db'
 ORDER BY TABLE_NAME, CONSTRAINT_TYPE, CONSTRAINT_NAME
 ----
-constraint_catalog  constraint_schema  constraint_name  table_schema   table_name  constraint_type
-def                 constraint_db      c2               constraint_db  t1          CHECK
-def                 constraint_db      check_a          constraint_db  t1          CHECK
-def                 constraint_db      primary          constraint_db  t1          PRIMARY KEY
-def                 constraint_db      t1_a_key         constraint_db  t1          UNIQUE
-def                 constraint_db      fk               constraint_db  t2          FOREIGN KEY
+constraint_catalog  constraint_schema  constraint_name  table_catalog  table_schema   table_name  constraint_type  is_deferrable  initially_deferred
+def                 constraint_db      c2               def            constraint_db  t1          CHECK            NO             NO
+def                 constraint_db      check_a          def            constraint_db  t1          CHECK            NO             NO
+def                 constraint_db      primary          def            constraint_db  t1          PRIMARY KEY      NO             NO
+def                 constraint_db      t1_a_key         def            constraint_db  t1          UNIQUE           NO             NO
+def                 constraint_db      fk               def            constraint_db  t2          FOREIGN KEY      NO             NO
 
 statement ok
-DROP DATABASE constraint_db
+DROP DATABASE constraint_db CASCADE
 
 ## information_schema.columns
 
@@ -509,44 +539,52 @@ SELECT table_catalog, table_schema, table_name, column_name, ordinal_position
 FROM information_schema.columns
 WHERE table_schema != 'information_schema' AND table_schema != 'pg_catalog' AND table_schema != 'crdb_internal'
 ----
-table_catalog  table_schema  table_name  column_name     ordinal_position
-def            system        descriptor  id              1
-def            system        descriptor  descriptor      2
-def            system        eventlog    timestamp       1
-def            system        eventlog    eventType       2
-def            system        eventlog    targetID        3
-def            system        eventlog    reportingID     4
-def            system        eventlog    info            5
-def            system        eventlog    uniqueID        6
-def            system        jobs        id              1
-def            system        jobs        status          2
-def            system        jobs        created         3
-def            system        jobs        payload         4
-def            system        lease       descID          1
-def            system        lease       version         2
-def            system        lease       nodeID          3
-def            system        lease       expiration      4
-def            system        namespace   parentID        1
-def            system        namespace   name            2
-def            system        namespace   id              3
-def            system        rangelog    timestamp       1
-def            system        rangelog    rangeID         2
-def            system        rangelog    storeID         3
-def            system        rangelog    eventType       4
-def            system        rangelog    otherRangeID    5
-def            system        rangelog    info            6
-def            system        rangelog    uniqueID        7
-def            system        settings    name            1
-def            system        settings    value           2
-def            system        settings    lastUpdated     3
-def            system        settings    valueType       4
-def            system        ui          key             1
-def            system        ui          value           2
-def            system        ui          lastUpdated     3
-def            system        users       username        1
-def            system        users       hashedPassword  2
-def            system        zones       id              1
-def            system        zones       config          2
+table_catalog  table_schema  table_name    column_name     ordinal_position  
+def            system        descriptor    id              1                 
+def            system        descriptor    descriptor      2                 
+def            system        eventlog      timestamp       1                 
+def            system        eventlog      eventType       2                 
+def            system        eventlog      targetID        3                 
+def            system        eventlog      reportingID     4                 
+def            system        eventlog      info            5                 
+def            system        eventlog      uniqueID        6                 
+def            system        jobs          id              1                 
+def            system        jobs          status          2                 
+def            system        jobs          created         3                 
+def            system        jobs          payload         4                 
+def            system        lease         descID          1                 
+def            system        lease         version         2                 
+def            system        lease         nodeID          3                 
+def            system        lease         expiration      4                 
+def            system        namespace     parentID        1                 
+def            system        namespace     name            2                 
+def            system        namespace     id              3                 
+def            system        rangelog      timestamp       1                 
+def            system        rangelog      rangeID         2                 
+def            system        rangelog      storeID         3                 
+def            system        rangelog      eventType       4                 
+def            system        rangelog      otherRangeID    5                 
+def            system        rangelog      info            6                 
+def            system        rangelog      uniqueID        7                 
+def            system        settings      name            1                 
+def            system        settings      value           2                 
+def            system        settings      lastUpdated     3                 
+def            system        settings      valueType       4                 
+def            system        ui            key             1                 
+def            system        ui            value           2                 
+def            system        ui            lastUpdated     3                 
+def            system        users         username        1                 
+def            system        users         hashedPassword  2                 
+def            system        web_sessions  id              1                 
+def            system        web_sessions  hashedSecret    2                 
+def            system        web_sessions  username        3                 
+def            system        web_sessions  createdAt       4                 
+def            system        web_sessions  expiresAt       5                 
+def            system        web_sessions  revokedAt       6                 
+def            system        web_sessions  lastUsedAt      7                 
+def            system        web_sessions  auditInfo       8                 
+def            system        zones         id              1                 
+def            system        zones         config          2
 
 statement ok
 SET DATABASE = test
@@ -689,7 +727,7 @@ def                 constraint_column  fk               def            constrain
 def                 constraint_column  fk               def            constraint_column  t3          b            2                 2
 
 statement ok
-DROP DATABASE constraint_column
+DROP DATABASE constraint_column CASCADE
 
 ## information_schema.schema_privileges
 
@@ -724,51 +762,56 @@ root      def            test          ALL             NULL
 query TTTTTTTT colnames
 SELECT * FROM information_schema.table_privileges
 ----
-grantor  grantee  table_catalog  table_schema  table_name  privilege_type  is_grantable  with_hierarchy
-NULL     root     def            system        descriptor  GRANT           NULL          NULL
-NULL     root     def            system        descriptor  SELECT          NULL          NULL
-NULL     root     def            system        eventlog    DELETE          NULL          NULL
-NULL     root     def            system        eventlog    GRANT           NULL          NULL
-NULL     root     def            system        eventlog    INSERT          NULL          NULL
-NULL     root     def            system        eventlog    SELECT          NULL          NULL
-NULL     root     def            system        eventlog    UPDATE          NULL          NULL
-NULL     root     def            system        jobs        DELETE          NULL          NULL
-NULL     root     def            system        jobs        GRANT           NULL          NULL
-NULL     root     def            system        jobs        INSERT          NULL          NULL
-NULL     root     def            system        jobs        SELECT          NULL          NULL
-NULL     root     def            system        jobs        UPDATE          NULL          NULL
-NULL     root     def            system        lease       DELETE          NULL          NULL
-NULL     root     def            system        lease       GRANT           NULL          NULL
-NULL     root     def            system        lease       INSERT          NULL          NULL
-NULL     root     def            system        lease       SELECT          NULL          NULL
-NULL     root     def            system        lease       UPDATE          NULL          NULL
-NULL     root     def            system        namespace   GRANT           NULL          NULL
-NULL     root     def            system        namespace   SELECT          NULL          NULL
-NULL     root     def            system        rangelog    DELETE          NULL          NULL
-NULL     root     def            system        rangelog    GRANT           NULL          NULL
-NULL     root     def            system        rangelog    INSERT          NULL          NULL
-NULL     root     def            system        rangelog    SELECT          NULL          NULL
-NULL     root     def            system        rangelog    UPDATE          NULL          NULL
-NULL     root     def            system        settings    DELETE          NULL          NULL
-NULL     root     def            system        settings    GRANT           NULL          NULL
-NULL     root     def            system        settings    INSERT          NULL          NULL
-NULL     root     def            system        settings    SELECT          NULL          NULL
-NULL     root     def            system        settings    UPDATE          NULL          NULL
-NULL     root     def            system        ui          DELETE          NULL          NULL
-NULL     root     def            system        ui          GRANT           NULL          NULL
-NULL     root     def            system        ui          INSERT          NULL          NULL
-NULL     root     def            system        ui          SELECT          NULL          NULL
-NULL     root     def            system        ui          UPDATE          NULL          NULL
-NULL     root     def            system        users       DELETE          NULL          NULL
-NULL     root     def            system        users       GRANT           NULL          NULL
-NULL     root     def            system        users       INSERT          NULL          NULL
-NULL     root     def            system        users       SELECT          NULL          NULL
-NULL     root     def            system        users       UPDATE          NULL          NULL
-NULL     root     def            system        zones       DELETE          NULL          NULL
-NULL     root     def            system        zones       GRANT           NULL          NULL
-NULL     root     def            system        zones       INSERT          NULL          NULL
-NULL     root     def            system        zones       SELECT          NULL          NULL
-NULL     root     def            system        zones       UPDATE          NULL          NULL
+grantor  grantee  table_catalog  table_schema  table_name    privilege_type  is_grantable  with_hierarchy  
+NULL     root     def            system        descriptor    GRANT           NULL          NULL            
+NULL     root     def            system        descriptor    SELECT          NULL          NULL            
+NULL     root     def            system        eventlog      DELETE          NULL          NULL            
+NULL     root     def            system        eventlog      GRANT           NULL          NULL            
+NULL     root     def            system        eventlog      INSERT          NULL          NULL            
+NULL     root     def            system        eventlog      SELECT          NULL          NULL            
+NULL     root     def            system        eventlog      UPDATE          NULL          NULL            
+NULL     root     def            system        jobs          DELETE          NULL          NULL            
+NULL     root     def            system        jobs          GRANT           NULL          NULL            
+NULL     root     def            system        jobs          INSERT          NULL          NULL            
+NULL     root     def            system        jobs          SELECT          NULL          NULL            
+NULL     root     def            system        jobs          UPDATE          NULL          NULL            
+NULL     root     def            system        lease         DELETE          NULL          NULL            
+NULL     root     def            system        lease         GRANT           NULL          NULL            
+NULL     root     def            system        lease         INSERT          NULL          NULL            
+NULL     root     def            system        lease         SELECT          NULL          NULL            
+NULL     root     def            system        lease         UPDATE          NULL          NULL            
+NULL     root     def            system        namespace     GRANT           NULL          NULL            
+NULL     root     def            system        namespace     SELECT          NULL          NULL            
+NULL     root     def            system        rangelog      DELETE          NULL          NULL            
+NULL     root     def            system        rangelog      GRANT           NULL          NULL            
+NULL     root     def            system        rangelog      INSERT          NULL          NULL            
+NULL     root     def            system        rangelog      SELECT          NULL          NULL            
+NULL     root     def            system        rangelog      UPDATE          NULL          NULL            
+NULL     root     def            system        settings      DELETE          NULL          NULL            
+NULL     root     def            system        settings      GRANT           NULL          NULL            
+NULL     root     def            system        settings      INSERT          NULL          NULL            
+NULL     root     def            system        settings      SELECT          NULL          NULL            
+NULL     root     def            system        settings      UPDATE          NULL          NULL            
+NULL     root     def            system        ui            DELETE          NULL          NULL            
+NULL     root     def            system        ui            GRANT           NULL          NULL            
+NULL     root     def            system        ui            INSERT          NULL          NULL            
+NULL     root     def            system        ui            SELECT          NULL          NULL            
+NULL     root     def            system        ui            UPDATE          NULL          NULL            
+NULL     root     def            system        users         DELETE          NULL          NULL            
+NULL     root     def            system        users         GRANT           NULL          NULL            
+NULL     root     def            system        users         INSERT          NULL          NULL            
+NULL     root     def            system        users         SELECT          NULL          NULL            
+NULL     root     def            system        users         UPDATE          NULL          NULL            
+NULL     root     def            system        web_sessions  DELETE          NULL          NULL            
+NULL     root     def            system        web_sessions  GRANT           NULL          NULL            
+NULL     root     def            system        web_sessions  INSERT          NULL          NULL            
+NULL     root     def            system        web_sessions  SELECT          NULL          NULL            
+NULL     root     def            system        web_sessions  UPDATE          NULL          NULL            
+NULL     root     def            system        zones         DELETE          NULL          NULL            
+NULL     root     def            system        zones         GRANT           NULL          NULL            
+NULL     root     def            system        zones         INSERT          NULL          NULL            
+NULL     root     def            system        zones         SELECT          NULL          NULL            
+NULL     root     def            system        zones         UPDATE          NULL          NULL
 
 statement ok
 CREATE TABLE other_db.xyz (i INT)
@@ -853,8 +896,7 @@ is_updatable  is_insertable_into  is_trigger_updatable  is_trigger_deletable  is
 NULL          NULL                NULL                  NULL                  NULL
 
 statement ok
-DROP DATABASE other_db
-
+DROP DATABASE other_db CASCADE
 
 #Verify  information_schema.user_privileges
 
@@ -870,3 +912,21 @@ root     def            GRANT           NULL
 root     def            INSERT          NULL
 root     def            SELECT          NULL
 root     def            UPDATE          NULL
+
+# Check existence of information_schema.sequences
+query TTBTT colnames
+SHOW COLUMNS FROM information_schema.sequences
+----
+Field                    Type    Null   Default        Indices
+sequence_catalog         STRING  false  '':::STRING    {}
+sequence_schema          STRING  false  '':::STRING    {}
+sequence_name            STRING  false  '':::STRING    {}
+data_type                STRING  false  '':::STRING    {}
+numeric_precision        INT     false  0:::INT        {}
+numeric_precision_radix  INT     false  0:::INT        {}
+numeric_scale            INT     false  0:::INT        {}
+start_value              STRING  false  '':::STRING    {}
+minimum_value            STRING  false  '':::STRING    {}
+maximum_value            STRING  false  '':::STRING    {}
+increment                STRING  false  '':::STRING    {}
+cycle_option             STRING  false  'NO':::STRING  {}

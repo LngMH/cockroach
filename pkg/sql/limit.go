@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package sql
 
@@ -74,8 +72,8 @@ func (p *planner) Limit(ctx context.Context, n *parser.Limit) (*limitNode, error
 	return &res, nil
 }
 
-func (n *limitNode) Start(ctx context.Context) error {
-	if err := n.plan.Start(ctx); err != nil {
+func (n *limitNode) Start(params runParams) error {
+	if err := n.plan.Start(params); err != nil {
 		return err
 	}
 
@@ -147,7 +145,7 @@ func (n *limitNode) evalLimit() error {
 
 func (n *limitNode) Values() parser.Datums { return n.plan.Values() }
 
-func (n *limitNode) Next(ctx context.Context) (bool, error) {
+func (n *limitNode) Next(params runParams) (bool, error) {
 	// n.rowIndex is the 0-based index of the next row.
 	// We don't do (n.rowIndex >= n.offset + n.count) to avoid overflow (count can be MaxInt64).
 	if n.rowIndex-n.offset >= n.count {
@@ -155,7 +153,7 @@ func (n *limitNode) Next(ctx context.Context) (bool, error) {
 	}
 
 	for {
-		if next, err := n.plan.Next(ctx); !next {
+		if next, err := n.plan.Next(params); !next {
 			return false, err
 		}
 

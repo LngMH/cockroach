@@ -12,18 +12,19 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Ben Darnell
 
 package storage
 
 import (
+	"bytes"
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/gogo/protobuf/proto"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/pkg/errors"
 )
 
@@ -51,6 +52,19 @@ const (
 // separate local and global command queues).
 type SpanSet struct {
 	spans [numSpanAccess][numSpanScope][]roachpb.Span
+}
+
+// String prints a string representation of the span set.
+func (ss *SpanSet) String() string {
+	var buf bytes.Buffer
+	for i := SpanAccess(0); i < numSpanAccess; i++ {
+		for j := spanScope(0); j < numSpanScope; j++ {
+			for _, span := range ss.getSpans(i, j) {
+				fmt.Fprintf(&buf, "%d %d: %s\n", i, j, span)
+			}
+		}
+	}
+	return buf.String()
 }
 
 func (ss *SpanSet) len() int {
@@ -220,7 +234,7 @@ func (s *SpanSetIterator) Value() []byte {
 }
 
 // ValueProto implements engine.Iterator.
-func (s *SpanSetIterator) ValueProto(msg proto.Message) error {
+func (s *SpanSetIterator) ValueProto(msg protoutil.Message) error {
 	return s.i.ValueProto(msg)
 }
 
@@ -249,6 +263,16 @@ func (s *SpanSetIterator) ComputeStats(
 	return s.i.ComputeStats(start, end, nowNanos)
 }
 
+// FindSplitKey implements engine.Iterator.
+func (s *SpanSetIterator) FindSplitKey(
+	start, end, minSplitKey engine.MVCCKey, targetSize int64, allowMeta2Splits bool,
+) (engine.MVCCKey, error) {
+	if err := s.spans.checkAllowed(SpanReadOnly, roachpb.Span{Key: start.Key, EndKey: end.Key}); err != nil {
+		return engine.MVCCKey{}, err
+	}
+	return s.i.FindSplitKey(start, end, minSplitKey, targetSize, allowMeta2Splits)
+}
+
 type spanSetReader struct {
 	r     engine.Reader
 	spans *SpanSet
@@ -271,7 +295,9 @@ func (s spanSetReader) Get(key engine.MVCCKey) ([]byte, error) {
 	return s.r.Get(key)
 }
 
-func (s spanSetReader) GetProto(key engine.MVCCKey, msg proto.Message) (bool, int64, int64, error) {
+func (s spanSetReader) GetProto(
+	key engine.MVCCKey, msg protoutil.Message,
+) (bool, int64, int64, error) {
 	if err := s.spans.checkAllowed(SpanReadOnly, roachpb.Span{Key: key.Key}); err != nil {
 		return false, 0, 0, err
 	}

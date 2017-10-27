@@ -357,7 +357,7 @@ There are several scenarios in which transactions interact:
   In that case, we would need to take this value into account, but
   we just don't know. Hence the transaction restarts, using instead
   a future timestamp (but remembering a maximum timestamp used to
-  limit the uncertainty window to the maximum clock skew). In fact,
+  limit the uncertainty window to the maximum clock offset). In fact,
   this is optimized further; see the details under "choosing a time
   stamp" below.
 
@@ -469,7 +469,7 @@ Please see [pkg/roachpb/data.proto](https://github.com/cockroachdb/cockroach/blo
 
 **Choosing a Timestamp**
 
-A key challenge of reading data in a distributed system with clock skew
+A key challenge of reading data in a distributed system with clock offset
 is choosing a timestamp guaranteed to be greater than the latest
 timestamp of any committed transaction (in absolute time). No system can
 claim consistency and fail to read already-committed data.
@@ -482,7 +482,7 @@ existing timestamped data on the node.
 For multiple nodes, the timestamp of the node coordinating the
 transaction `t` is used. In addition, a maximum timestamp `t+ε` is
 supplied to provide an upper bound on timestamps for already-committed
-data (`ε` is the maximum clock skew). As the transaction progresses, any
+data (`ε` is the maximum clock offset). As the transaction progresses, any
 data read which have timestamps greater than `t` but less than `t+ε`
 cause the transaction to abort and retry with the conflicting timestamp
 t<sub>c</sub>, where t<sub>c</sub> \> t. The maximum timestamp `t+ε` remains
@@ -1062,118 +1062,20 @@ database which is stored in the replicated key-value map.
 
 Time series are stored at Store granularity and allow the admin dashboard
 to efficiently gain visibility into a universe of information at the Cluster,
-Node or Store level. A [periodic background process](RFCS/time_series_culling.md)
+Node or Store level. A [periodic background process](RFCS/20160901_time_series_culling.md)
 culls older timeseries data, downsampling and eventually discarding it.
 
-# Key-prefix Accounting and Zones
+# Zones
 
-Arbitrarily fine-grained accounting is specified via
-key prefixes. Key prefixes can overlap, as is necessary for capturing
-hierarchical relationships. For illustrative purposes, let’s say keys
-specifying rows in a set of databases have the following format:
-
-`<db>:<table>:<primary-key>[:<secondary-key>]`
-
-In this case, we might collect accounting with
-key prefixes:
-
-`db1`, `db1:user`, `db1:order`,
-
-Accounting is kept for the entire map by default.
-
-## Accounting
-to keep accounting for a range defined by a key prefix, an entry is created in
-the accounting system table. The format of accounting table keys is:
-
-`\0acct<key-prefix>`
-
-In practice, we assume each node is capable of caching the
-entire accounting table as it is likely to be relatively small.
-
-Accounting is kept for key prefix ranges with eventual consistency for
-efficiency. There are two types of values which comprise accounting:
-counts and occurrences, for lack of better terms. Counts describe
-system state, such as the total number of bytes, rows,
-etc. Occurrences include transient performance and load metrics. Both
-types of accounting are captured as time series with minute
-granularity. The length of time accounting metrics are kept is
-configurable. Below are examples of each type of accounting value.
-
-**System State Counters/Performance**
-
-- Count of items (e.g. rows)
-- Total bytes
-- Total key bytes
-- Total value length
-- Queued message count
-- Queued message total bytes
-- Count of values \< 16B
-- Count of values \< 64B
-- Count of values \< 256B
-- Count of values \< 1K
-- Count of values \< 4K
-- Count of values \< 16K
-- Count of values \< 64K
-- Count of values \< 256K
-- Count of values \< 1M
-- Count of values \> 1M
-- Total bytes of accounting
-
-
-**Load Occurrences**
-
-- Get op count
-- Get total MB
-- Put op count
-- Put total MB
-- Delete op count
-- Delete total MB
-- Delete range op count
-- Delete range total MB
-- Scan op count
-- Scan op MB
-- Split count
-- Merge count
-
-Because accounting information is kept as time series and over many
-possible metrics of interest, the data can become numerous. Accounting
-data are stored in the map near the key prefix described, in order to
-distribute load (for both aggregation and storage).
-
-Accounting keys for system state have the form:
-`<key-prefix>|acctd<metric-name>*`. Notice the leading ‘pipe’
-character. It’s meant to sort the root level account AFTER any other
-system tables. They must increment the same underlying values as they
-are permanent counts, and not transient activity. Logic at the
-node takes care of snapshotting the value into an appropriately
-suffixed (e.g. with timestamp hour) multi-value time series entry.
-
-Keys for perf/load metrics:
-`<key-prefix>acctd<metric-name><hourly-timestamp>`.
-
-`<hourly-timestamp>`-suffixed accounting entries are multi-valued,
-containing a varint64 entry for each minute with activity during the
-specified hour.
-
-To efficiently keep accounting over large key ranges, the task of
-aggregation must be distributed. If activity occurs within the same
-range as the key prefix for accounting, the updates are made as part
-of the consensus write. If the ranges differ, then a message is sent
-to the parent range to increment the accounting. If upon receiving the
-message, the parent range also does not include the key prefix, it in
-turn forwards it to its parent or left child in the balanced binary
-tree which is maintained to describe the range hierarchy. This limits
-the number of messages before an update is visible at the root to `2*log N`,
-where `N` is the number of ranges in the key prefix.
-
-## Zones
-zones are stored in the map with keys prefixed by
-`\0zone` followed by the key prefix to which the zone
-configuration applies. Zone values specify a protobuf containing
+Zones provide a method for configuring the replication of portions of the
+keyspace. Zone values specify a protobuf containing
 the datacenters from which replicas for ranges which fall under
 the zone must be chosen.
 
-Please see [pkg/config/config.proto](https://github.com/cockroachdb/cockroach/blob/master/pkg/config/config.proto) for up-to-date data structures used, the best entry point being `message ZoneConfig`.
+Please see
+[pkg/config/zone.proto](https://github.com/cockroachdb/cockroach/blob/master/pkg/config/zone.proto)
+for up-to-date data structures used, the best entry point being
+`message ZoneConfig`.
 
 If zones are modified in situ, each node verifies the
 existing zones for its ranges against the zone configuration. If
@@ -1205,7 +1107,7 @@ PostgreSQL, although it also diverges in significant ways:
   and SERIALIZABLE.  The other traditional SQL isolation levels are
   internally mapped to either SNAPSHOT or SERIALIZABLE.
 
-- CockroachDB implements its own [SQL type system](RFCS/typing.md)
+- CockroachDB implements its own [SQL type system](RFCS/20160203_typing.md)
   which only supports a limited form of implicit coercions between
   types compared to PostgreSQL. The rationale is to keep the
   implementation simple and efficient, capitalizing on the observation
@@ -1301,7 +1203,7 @@ the indexed row.
 Dist-SQL is a new execution framework being developed as of Q3 2016 with the
 goal of distributing the processing of SQL queries.
 See the [Distributed SQL
-RFC](RFCS/distributed_sql.md)
+RFC](RFCS/20160421_distributed_sql.md)
 for a detailed design of the subsystem; this section will serve as a summary.
 
 Distributing the processing is desirable for multiple reasons:
@@ -1416,7 +1318,7 @@ matched by a guarantee), we insert a **sorting aggregator**.
 
 Logical plans are transformed into physical plans in a *physical planning
 phase*. See the [corresponding
-section](RFCS/distributed_sql.md#from-logical-to-physical) of the Distributed SQL RFC
+section](RFCS/20160421_distributed_sql.md#from-logical-to-physical) of the Distributed SQL RFC
 for details.  To summarize, each aggregator is planned as one or more
 *processors*, which we distribute starting from the data layout - `TABLE
 READER`s have multiple instances, split according to the ranges - each instance

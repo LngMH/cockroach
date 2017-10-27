@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // TableLookupsByID maps table IDs to looked up descriptors or, for tables that
@@ -80,43 +81,175 @@ func TablesNeededForFKs(table TableDescriptor, usage FKCheck) TableLookupsByID {
 	return ret
 }
 
-type fkInsertHelper map[IndexID][]baseFKHelper
-
-var errSkipUnusedFK = errors.New("no columns involved in FK included in writer")
-
-func makeFKInsertHelper(
-	txn *client.Txn, table TableDescriptor, otherTables TableLookupsByID, colMap map[ColumnID]int,
-) (fkInsertHelper, error) {
-	var fks fkInsertHelper
-	for _, idx := range table.AllNonDropIndexes() {
-		if idx.ForeignKey.IsSet() {
-			fk, err := makeBaseFKHelper(txn, otherTables, idx, idx.ForeignKey, colMap)
-			if err == errSkipUnusedFK {
-				continue
-			}
-			if err != nil {
-				return fks, err
-			}
-			if fks == nil {
-				fks = make(fkInsertHelper)
-			}
-			fks[idx.ID] = append(fks[idx.ID], fk)
-		}
-	}
-	return fks, nil
+// spanKVFetcher is an kvFetcher that returns a set slice of kvs.
+type spanKVFetcher struct {
+	kvs []roachpb.KeyValue
 }
 
-func (fks fkInsertHelper) checkAll(ctx context.Context, row parser.Datums) error {
-	for idx := range fks {
-		if err := fks.checkIdx(ctx, idx, row); err != nil {
+// nextKV implements the kvFetcher interface.
+func (f *spanKVFetcher) nextKV(ctx context.Context) (bool, roachpb.KeyValue, error) {
+	if len(f.kvs) == 0 {
+		return false, roachpb.KeyValue{}, nil
+	}
+	kv := f.kvs[0]
+	f.kvs = f.kvs[1:]
+	return true, kv, nil
+}
+
+// getRangesInfo implements the kvFetcher interface.
+func (f *spanKVFetcher) getRangesInfo() []roachpb.RangeInfo {
+	panic("getRangesInfo() called on spanKVFetcher")
+}
+
+// fkBatchChecker accumulates foreign key checks and sends them out as a single
+// kv batch on demand. Checks are accumulated in order - the first failing check
+// will be the one that produces an error report.
+type fkBatchChecker struct {
+	batch roachpb.BatchRequest
+	// batchIdxToFk maps the index of the check request/response in the kv batch
+	// to the baseFKHelper that created it.
+	batchIdxToFk []*baseFKHelper
+	txn          *client.Txn
+}
+
+func (f *fkBatchChecker) reset() {
+	f.batch.Reset()
+	f.batchIdxToFk = f.batchIdxToFk[:0]
+}
+
+// addCheck adds a check for the given row and baseFKHelper to the batch.
+func (f *fkBatchChecker) addCheck(row parser.Datums, source *baseFKHelper) error {
+	span, err := source.spanForValues(row)
+	if err != nil {
+		return err
+	}
+	r := roachpb.RequestUnion{}
+	scan := roachpb.ScanRequest{Span: span}
+	r.MustSetInner(&scan)
+	f.batch.Requests = append(f.batch.Requests, r)
+	f.batchIdxToFk = append(f.batchIdxToFk, source)
+	return nil
+}
+
+// runCheck sends the accumulated batch of foreign key checks to kv, given the
+// old and new values of the row being modified. Either oldRow or newRow can
+// be set to nil in the case of an insert or a delete, respectively.
+// A pgerror.CodeForeignKeyViolationError is returned if a foreign key violation
+// is detected, corresponding to the first foreign key that was violated in
+// order of addition.
+func (f *fkBatchChecker) runCheck(
+	ctx context.Context, oldRow parser.Datums, newRow parser.Datums,
+) error {
+	if len(f.batch.Requests) == 0 {
+		return nil
+	}
+	defer f.reset()
+
+	br, err := f.txn.Send(ctx, f.batch)
+	if err != nil {
+		return err.GoError()
+	}
+
+	fetcher := spanKVFetcher{}
+	for i, resp := range br.Responses {
+		fk := f.batchIdxToFk[i]
+
+		fetcher.kvs = resp.GetInner().(*roachpb.ScanResponse).Rows
+		if err := fk.rf.StartScanFrom(ctx, &fetcher); err != nil {
 			return err
+		}
+		switch fk.dir {
+		case CheckInserts:
+			// If we're inserting, then there's a violation if the scan found nothing.
+			if fk.rf.kvEnd {
+				fkValues := make(parser.Datums, fk.prefixLen)
+				for valueIdx, colID := range fk.searchIdx.ColumnIDs[:fk.prefixLen] {
+					fkValues[valueIdx] = newRow[fk.ids[colID]]
+				}
+				return pgerror.NewErrorf(pgerror.CodeForeignKeyViolationError,
+					"foreign key violation: value %s not found in %s@%s %s",
+					fkValues, fk.searchTable.Name, fk.searchIdx.Name, fk.searchIdx.ColumnNames[:fk.prefixLen])
+			}
+		case CheckDeletes:
+			// If we're deleting, then there's a violation if the scan found something.
+			if !fk.rf.kvEnd {
+				if oldRow == nil {
+					return pgerror.NewErrorf(pgerror.CodeForeignKeyViolationError,
+						"foreign key violation: non-empty columns %s referenced in table %q",
+						fk.writeIdx.ColumnNames[:fk.prefixLen], fk.searchTable.Name)
+				}
+				fkValues := make(parser.Datums, fk.prefixLen)
+				for valueIdx, colID := range fk.searchIdx.ColumnIDs[:fk.prefixLen] {
+					fkValues[valueIdx] = oldRow[fk.ids[colID]]
+				}
+				return pgerror.NewErrorf(pgerror.CodeForeignKeyViolationError,
+					"foreign key violation: values %v in columns %s referenced in table %q",
+					fkValues, fk.writeIdx.ColumnNames[:fk.prefixLen], fk.searchTable.Name)
+			}
+		default:
+			log.Fatalf(ctx, "impossible case: baseFKHelper has dir=%v", fk.dir)
 		}
 	}
 	return nil
 }
 
-func (fks fkInsertHelper) checkIdx(ctx context.Context, idx IndexID, row parser.Datums) error {
-	for _, fk := range fks[idx] {
+type fkInsertHelper struct {
+	// fks maps index id to slice of baseFKHelper, the outgoing foreign keys for
+	// each index. These slices will have at most one entry, since there can be
+	// at most one outgoing foreign key per index. We use this data structure
+	// instead of a one-to-one map for consistency with the other insert helpers.
+	fks map[IndexID][]baseFKHelper
+
+	checker *fkBatchChecker
+}
+
+var errSkipUnusedFK = errors.New("no columns involved in FK included in writer")
+
+func makeFKInsertHelper(
+	txn *client.Txn,
+	table TableDescriptor,
+	otherTables TableLookupsByID,
+	colMap map[ColumnID]int,
+	alloc *DatumAlloc,
+) (fkInsertHelper, error) {
+	h := fkInsertHelper{
+		checker: &fkBatchChecker{
+			txn: txn,
+		},
+	}
+	for _, idx := range table.AllNonDropIndexes() {
+		if idx.ForeignKey.IsSet() {
+			fk, err := makeBaseFKHelper(txn, otherTables, idx, idx.ForeignKey, colMap, alloc, CheckInserts)
+			if err == errSkipUnusedFK {
+				continue
+			}
+			if err != nil {
+				return h, err
+			}
+			if h.fks == nil {
+				h.fks = make(map[IndexID][]baseFKHelper)
+			}
+			h.fks[idx.ID] = append(h.fks[idx.ID], fk)
+		}
+	}
+	return h, nil
+}
+
+func (h fkInsertHelper) checkAll(ctx context.Context, row parser.Datums) error {
+	if len(h.fks) == 0 {
+		return nil
+	}
+	for idx := range h.fks {
+		if err := h.checkIdx(ctx, idx, row); err != nil {
+			return err
+		}
+	}
+	return h.checker.runCheck(ctx, nil, row)
+}
+
+func (h fkInsertHelper) checkIdx(ctx context.Context, idx IndexID, row parser.Datums) error {
+	fks := h.fks
+	for i, fk := range fks[idx] {
 		nulls := true
 		for _, colID := range fk.searchIdx.ColumnIDs[:fk.prefixLen] {
 			found, ok := fk.ids[colID]
@@ -129,34 +262,41 @@ func (fks fkInsertHelper) checkIdx(ctx context.Context, idx IndexID, row parser.
 			continue
 		}
 
-		found, err := fk.check(ctx, row)
-		if err != nil {
+		if err := h.checker.addCheck(row, &(fks[idx][i])); err != nil {
 			return err
-		}
-		if found == nil {
-			fkValues := make(parser.Datums, fk.prefixLen)
-			for i, colID := range fk.searchIdx.ColumnIDs[:fk.prefixLen] {
-				fkValues[i] = row[fk.ids[colID]]
-			}
-			return pgerror.NewErrorf(pgerror.CodeForeignKeyViolationError,
-				"foreign key violation: value %s not found in %s@%s %s",
-				fkValues, fk.searchTable.Name, fk.searchIdx.Name, fk.searchIdx.ColumnNames[:fk.prefixLen])
 		}
 	}
 	return nil
 }
 
 // CollectSpans implements the FkSpanCollector interface.
-func (fks fkInsertHelper) CollectSpans() (reads roachpb.Spans, writes roachpb.Spans) {
-	return collectSpansForFKMap(fks)
+func (h fkInsertHelper) CollectSpans() roachpb.Spans {
+	return collectSpansWithFKMap(h.fks)
 }
 
-type fkDeleteHelper map[IndexID][]baseFKHelper
+// CollectSpansForValues implements the FkSpanCollector interface.
+func (h fkInsertHelper) CollectSpansForValues(values parser.Datums) (roachpb.Spans, error) {
+	return collectSpansForValuesWithFKMap(h.fks, values)
+}
+
+type fkDeleteHelper struct {
+	fks map[IndexID][]baseFKHelper
+
+	checker *fkBatchChecker
+}
 
 func makeFKDeleteHelper(
-	txn *client.Txn, table TableDescriptor, otherTables TableLookupsByID, colMap map[ColumnID]int,
+	txn *client.Txn,
+	table TableDescriptor,
+	otherTables TableLookupsByID,
+	colMap map[ColumnID]int,
+	alloc *DatumAlloc,
 ) (fkDeleteHelper, error) {
-	var fks fkDeleteHelper
+	h := fkDeleteHelper{
+		checker: &fkBatchChecker{
+			txn: txn,
+		},
+	}
 	for _, idx := range table.AllNonDropIndexes() {
 		for _, ref := range idx.ReferencedBy {
 			if otherTables[ref.Table].IsAdding {
@@ -164,75 +304,75 @@ func makeFKDeleteHelper(
 				// and thus does not need to be checked for FK violations.
 				continue
 			}
-			fk, err := makeBaseFKHelper(txn, otherTables, idx, ref, colMap)
+			fk, err := makeBaseFKHelper(txn, otherTables, idx, ref, colMap, alloc, CheckDeletes)
 			if err == errSkipUnusedFK {
 				continue
 			}
 			if err != nil {
-				return fks, err
+				return h, err
 			}
-			if fks == nil {
-				fks = make(fkDeleteHelper)
+			if h.fks == nil {
+				h.fks = make(map[IndexID][]baseFKHelper)
 			}
-			fks[idx.ID] = append(fks[idx.ID], fk)
+			h.fks[idx.ID] = append(h.fks[idx.ID], fk)
 		}
 	}
-	return fks, nil
+	return h, nil
 }
 
-func (fks fkDeleteHelper) checkAll(ctx context.Context, row parser.Datums) error {
-	for idx := range fks {
-		if err := fks.checkIdx(ctx, idx, row); err != nil {
+func (h fkDeleteHelper) checkAll(ctx context.Context, row parser.Datums) error {
+	if len(h.fks) == 0 {
+		return nil
+	}
+	for idx := range h.fks {
+		if err := h.checkIdx(ctx, idx, row); err != nil {
 			return err
 		}
 	}
-	return nil
+	return h.checker.runCheck(ctx, row, nil /* newRow */)
 }
 
-func (fks fkDeleteHelper) checkIdx(ctx context.Context, idx IndexID, row parser.Datums) error {
-	for _, fk := range fks[idx] {
-		found, err := fk.check(ctx, row)
-		if err != nil {
+func (h fkDeleteHelper) checkIdx(ctx context.Context, idx IndexID, row parser.Datums) error {
+	for i := range h.fks[idx] {
+		if err := h.checker.addCheck(row, &h.fks[idx][i]); err != nil {
 			return err
 		}
-		if found != nil {
-			if row == nil {
-				return pgerror.NewErrorf(pgerror.CodeForeignKeyViolationError,
-					"foreign key violation: non-empty columns %s referenced in table %q",
-					fk.writeIdx.ColumnNames[:fk.prefixLen], fk.searchTable.Name)
-			}
-			fkValues := make(parser.Datums, fk.prefixLen)
-			for i, colID := range fk.searchIdx.ColumnIDs[:fk.prefixLen] {
-				fkValues[i] = row[fk.ids[colID]]
-			}
-			return pgerror.NewErrorf(pgerror.CodeForeignKeyViolationError,
-				"foreign key violation: values %v in columns %s referenced in table %q",
-				fkValues, fk.writeIdx.ColumnNames[:fk.prefixLen], fk.searchTable.Name)
-		}
-
 	}
 	return nil
 }
 
 // CollectSpans implements the FkSpanCollector interface.
-func (fks fkDeleteHelper) CollectSpans() (reads roachpb.Spans, writes roachpb.Spans) {
-	return collectSpansForFKMap(fks)
+func (h fkDeleteHelper) CollectSpans() roachpb.Spans {
+	return collectSpansWithFKMap(h.fks)
+}
+
+// CollectSpansForValues implements the FkSpanCollector interface.
+func (h fkDeleteHelper) CollectSpansForValues(values parser.Datums) (roachpb.Spans, error) {
+	return collectSpansForValuesWithFKMap(h.fks, values)
 }
 
 type fkUpdateHelper struct {
 	inbound  fkDeleteHelper // Check old values are not referenced.
 	outbound fkInsertHelper // Check rows referenced by new values still exist.
+
+	checker *fkBatchChecker
 }
 
 func makeFKUpdateHelper(
-	txn *client.Txn, table TableDescriptor, otherTables TableLookupsByID, colMap map[ColumnID]int,
+	txn *client.Txn,
+	table TableDescriptor,
+	otherTables TableLookupsByID,
+	colMap map[ColumnID]int,
+	alloc *DatumAlloc,
 ) (fkUpdateHelper, error) {
 	ret := fkUpdateHelper{}
 	var err error
-	if ret.inbound, err = makeFKDeleteHelper(txn, table, otherTables, colMap); err != nil {
+	if ret.inbound, err = makeFKDeleteHelper(txn, table, otherTables, colMap, alloc); err != nil {
 		return ret, err
 	}
-	ret.outbound, err = makeFKInsertHelper(txn, table, otherTables, colMap)
+	ret.outbound, err = makeFKInsertHelper(txn, table, otherTables, colMap, alloc)
+	ret.outbound.checker = ret.inbound.checker
+	ret.checker = ret.inbound.checker
 	return ret, err
 }
 
@@ -246,10 +386,23 @@ func (fks fkUpdateHelper) checkIdx(
 }
 
 // CollectSpans implements the FkSpanCollector interface.
-func (fks fkUpdateHelper) CollectSpans() (reads roachpb.Spans, writes roachpb.Spans) {
-	inboundReads, inboundWrites := fks.inbound.CollectSpans()
-	outboundReads, outboundWrites := fks.outbound.CollectSpans()
-	return append(inboundReads, outboundReads...), append(inboundWrites, outboundWrites...)
+func (fks fkUpdateHelper) CollectSpans() roachpb.Spans {
+	inboundReads := fks.inbound.CollectSpans()
+	outboundReads := fks.outbound.CollectSpans()
+	return append(inboundReads, outboundReads...)
+}
+
+// CollectSpansForValues implements the FkSpanCollector interface.
+func (fks fkUpdateHelper) CollectSpansForValues(values parser.Datums) (roachpb.Spans, error) {
+	inboundReads, err := fks.inbound.CollectSpansForValues(values)
+	if err != nil {
+		return nil, err
+	}
+	outboundReads, err := fks.outbound.CollectSpansForValues(values)
+	if err != nil {
+		return nil, err
+	}
+	return append(inboundReads, outboundReads...), nil
 }
 
 type baseFKHelper struct {
@@ -261,6 +414,7 @@ type baseFKHelper struct {
 	writeIdx     IndexDescriptor  // the index we want to modify
 	searchPrefix []byte           // prefix of keys in searchIdx
 	ids          map[ColumnID]int // col IDs
+	dir          FKCheck          // direction of check
 }
 
 func makeBaseFKHelper(
@@ -269,8 +423,10 @@ func makeBaseFKHelper(
 	writeIdx IndexDescriptor,
 	ref ForeignKeyReference,
 	colMap map[ColumnID]int,
+	alloc *DatumAlloc,
+	dir FKCheck,
 ) (baseFKHelper, error) {
-	b := baseFKHelper{txn: txn, writeIdx: writeIdx, searchTable: otherTables[ref.Table].Table}
+	b := baseFKHelper{txn: txn, writeIdx: writeIdx, searchTable: otherTables[ref.Table].Table, dir: dir}
 	if b.searchTable == nil {
 		return b, errors.Errorf("referenced table %d not in provided table map %+v", ref.Table, otherTables)
 	}
@@ -285,14 +441,10 @@ func makeBaseFKHelper(
 	}
 	b.searchIdx = searchIdx
 	ids := ColIDtoRowIndexFromCols(b.searchTable.Columns)
-	needed := make([]bool, len(ids))
-	for _, i := range searchIdx.ColumnIDs {
-		needed[ids[i]] = true
-	}
 	isSecondary := b.searchTable.PrimaryIndex.ID != searchIdx.ID
 	err = b.rf.Init(b.searchTable, ids, searchIdx, false, /* reverse */
-		isSecondary, b.searchTable.Columns, needed,
-		false /* returnRangeInfo */)
+		isSecondary, b.searchTable.Columns, nil,
+		false /* returnRangeInfo */, alloc)
 	if err != nil {
 		return b, err
 	}
@@ -313,51 +465,58 @@ func makeBaseFKHelper(
 	return b, nil
 }
 
-// TODO(dt): Batch checks of many rows.
-func (f baseFKHelper) check(ctx context.Context, values parser.Datums) (parser.Datums, error) {
+func (f baseFKHelper) spanForValues(values parser.Datums) (roachpb.Span, error) {
 	var key roachpb.Key
 	if values != nil {
-		keyBytes, _, err := EncodeIndexKey(
-			f.searchTable, f.searchIdx, f.ids, values, f.searchPrefix)
+		keyBytes, _, err := EncodePartialIndexKey(
+			f.searchTable, f.searchIdx, f.prefixLen, f.ids, values, f.searchPrefix)
 		if err != nil {
-			return nil, err
+			return roachpb.Span{}, err
 		}
 		key = roachpb.Key(keyBytes)
 	} else {
 		key = roachpb.Key(f.searchPrefix)
 	}
-	spans := roachpb.Spans{roachpb.Span{Key: key, EndKey: key.PrefixEnd()}}
-	if err := f.rf.StartScan(ctx, f.txn, spans, true /* limit batches */, 1); err != nil {
-		return nil, err
-	}
-	return f.rf.NextRowDecoded(ctx, false /* traceKV */)
+	return roachpb.Span{Key: key, EndKey: key.PrefixEnd()}, nil
 }
 
-// CollectSpans implements the FkSpanCollector interface.
-func (f baseFKHelper) CollectSpans() (reads roachpb.Spans, writes roachpb.Spans) {
+func (f baseFKHelper) span() roachpb.Span {
 	key := roachpb.Key(f.searchPrefix)
-	return roachpb.Spans{roachpb.Span{Key: key, EndKey: key.PrefixEnd()}}, nil
+	return roachpb.Span{Key: key, EndKey: key.PrefixEnd()}
 }
 
 // FkSpanCollector can collect the spans that foreign key validation will touch.
 type FkSpanCollector interface {
-	CollectSpans() (reads roachpb.Spans, writes roachpb.Spans)
+	CollectSpans() roachpb.Spans
+	CollectSpansForValues(values parser.Datums) (roachpb.Spans, error)
 }
 
-var _ FkSpanCollector = baseFKHelper{}
 var _ FkSpanCollector = fkInsertHelper{}
 var _ FkSpanCollector = fkDeleteHelper{}
 var _ FkSpanCollector = fkUpdateHelper{}
 
-func collectSpansForFKMap(
-	fks map[IndexID][]baseFKHelper,
-) (reads roachpb.Spans, writes roachpb.Spans) {
+func collectSpansWithFKMap(fks map[IndexID][]baseFKHelper) roachpb.Spans {
+	var reads roachpb.Spans
 	for idx := range fks {
 		for _, fk := range fks[idx] {
-			fkReads, fkWrites := fk.CollectSpans()
-			reads = append(reads, fkReads...)
-			writes = append(writes, fkWrites...)
+			reads = append(reads, fk.span())
 		}
 	}
-	return reads, writes
+	return reads
+}
+
+func collectSpansForValuesWithFKMap(
+	fks map[IndexID][]baseFKHelper, values parser.Datums,
+) (roachpb.Spans, error) {
+	var reads roachpb.Spans
+	for idx := range fks {
+		for _, fk := range fks[idx] {
+			read, err := fk.spanForValues(values)
+			if err != nil {
+				return nil, err
+			}
+			reads = append(reads, read)
+		}
+	}
+	return reads, nil
 }

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package storage
 
@@ -101,10 +99,10 @@ var (
 		Help: "Number of failed lease transfers"}
 	metaLeaseExpirationCount = metric.Metadata{
 		Name: "leases.expiration",
-		Help: "Number of replicas using expiration-based leases"}
+		Help: "Number of replica leaseholders using expiration-based leases"}
 	metaLeaseEpochCount = metric.Metadata{
 		Name: "leases.epoch",
-		Help: "Number of replicas using epoch-based leases"}
+		Help: "Number of replica leaseholders using epoch-based leases"}
 
 	// Storage metrics.
 	metaLiveBytes = metric.Metadata{
@@ -116,6 +114,9 @@ var (
 	metaValBytes = metric.Metadata{
 		Name: "valbytes",
 		Help: "Number of bytes taken up by values"}
+	metaTotalBytes = metric.Metadata{
+		Name: "totalbytes",
+		Help: "Total number of bytes taken up by keys and values including non-live data"}
 	metaIntentBytes = metric.Metadata{
 		Name: "intentbytes",
 		Help: "Number of bytes in intent KV pairs"}
@@ -146,6 +147,9 @@ var (
 	metaAvailable = metric.Metadata{
 		Name: "capacity.available",
 		Help: "Available storage capacity"}
+	metaUsed = metric.Metadata{
+		Name: "capacity.used",
+		Help: "Used storage capacity"}
 	metaReserved = metric.Metadata{
 		Name: "capacity.reserved",
 		Help: "Capacity reserved for snapshots"}
@@ -180,12 +184,6 @@ var (
 	metaRdbBloomFilterPrefixUseful = metric.Metadata{
 		Name: "rocksdb.bloom.filter.prefix.useful",
 		Help: "Number of times the bloom filter helped avoid iterator creation"}
-	metaRdbMemtableHits = metric.Metadata{
-		Name: "rocksdb.memtable.hits",
-		Help: "Number of memtable hits"}
-	metaRdbMemtableMisses = metric.Metadata{
-		Name: "rocksdb.memtable.misses",
-		Help: "Number of memtable misses"}
 	metaRdbMemtableTotalSize = metric.Metadata{
 		Name: "rocksdb.memtable.total-size",
 		Help: "Current size of memtable"}
@@ -431,13 +429,13 @@ var (
 		Help: "Number of GC'able entries corresponding to pending txns"}
 	metaGCAbortSpanScanned = metric.Metadata{
 		Name: "queue.gc.info.abortspanscanned",
-		Help: "Number of transactions present in the abort cache scanned from the engine"}
+		Help: "Number of transactions present in the AbortSpan scanned from the engine"}
 	metaGCAbortSpanConsidered = metric.Metadata{
 		Name: "queue.gc.info.abortspanconsidered",
-		Help: "Number of abort cache entries old enough to be considered for removal"}
+		Help: "Number of AbortSpan entries old enough to be considered for removal"}
 	metaGCAbortSpanGCNum = metric.Metadata{
 		Name: "queue.gc.info.abortspangcnum",
-		Help: "Number of abort cache entries fit for removal"}
+		Help: "Number of AbortSpan entries fit for removal"}
 	metaGCPushTxn = metric.Metadata{
 		Name: "queue.gc.info.pushtxn",
 		Help: "Number of attempted pushes"}
@@ -458,6 +456,14 @@ var (
 	metaSlowRaftRequests = metric.Metadata{
 		Name: "requests.slow.raft",
 		Help: "Number of requests that have been stuck for a long time in raft"}
+
+	// AddSSTable metrics.
+	metaAddSSTableProposals = metric.Metadata{
+		Name: "addsstable.proposals",
+		Help: "Number of SSTable ingestions proposed (i.e. sent to Raft by lease holders)"}
+	metaAddSSTableApplications = metric.Metadata{
+		Name: "addsstable.applications",
+		Help: "Number of SSTable ingestions applied (i.e. applied by Replicas)"}
 )
 
 // StoreMetrics is the set of metrics for a given store.
@@ -501,6 +507,7 @@ type StoreMetrics struct {
 	LiveBytes       *metric.Gauge
 	KeyBytes        *metric.Gauge
 	ValBytes        *metric.Gauge
+	TotalBytes      *metric.Gauge
 	IntentBytes     *metric.Gauge
 	LiveCount       *metric.Gauge
 	KeyCount        *metric.Gauge
@@ -511,6 +518,7 @@ type StoreMetrics struct {
 	LastUpdateNanos *metric.Gauge
 	Capacity        *metric.Gauge
 	Available       *metric.Gauge
+	Used            *metric.Gauge
 	Reserved        *metric.Counter
 	SysBytes        *metric.Gauge
 	SysCount        *metric.Gauge
@@ -525,8 +533,6 @@ type StoreMetrics struct {
 	RdbBlockCachePinnedUsage    *metric.Gauge
 	RdbBloomFilterPrefixChecked *metric.Gauge
 	RdbBloomFilterPrefixUseful  *metric.Gauge
-	RdbMemtableHits             *metric.Gauge
-	RdbMemtableMisses           *metric.Gauge
 	RdbMemtableTotalSize        *metric.Gauge
 	RdbFlushes                  *metric.Gauge
 	RdbCompactions              *metric.Gauge
@@ -640,6 +646,11 @@ type StoreMetrics struct {
 	SlowLeaseRequests        *metric.Gauge
 	SlowRaftRequests         *metric.Gauge
 
+	// AddSSTable stats: how many AddSSTable commands were proposed and how many
+	// were applied?
+	AddSSTableProposals    *metric.Counter
+	AddSSTableApplications *metric.Counter
+
 	// Stats for efficient merges.
 	mu struct {
 		syncutil.Mutex
@@ -687,6 +698,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		LiveBytes:       metric.NewGauge(metaLiveBytes),
 		KeyBytes:        metric.NewGauge(metaKeyBytes),
 		ValBytes:        metric.NewGauge(metaValBytes),
+		TotalBytes:      metric.NewGauge(metaTotalBytes),
 		IntentBytes:     metric.NewGauge(metaIntentBytes),
 		LiveCount:       metric.NewGauge(metaLiveCount),
 		KeyCount:        metric.NewGauge(metaKeyCount),
@@ -697,6 +709,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		LastUpdateNanos: metric.NewGauge(metaLastUpdateNanos),
 		Capacity:        metric.NewGauge(metaCapacity),
 		Available:       metric.NewGauge(metaAvailable),
+		Used:            metric.NewGauge(metaUsed),
 		Reserved:        metric.NewCounter(metaReserved),
 		SysBytes:        metric.NewGauge(metaSysBytes),
 		SysCount:        metric.NewGauge(metaSysCount),
@@ -711,8 +724,6 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RdbBlockCachePinnedUsage:    metric.NewGauge(metaRdbBlockCachePinnedUsage),
 		RdbBloomFilterPrefixChecked: metric.NewGauge(metaRdbBloomFilterPrefixChecked),
 		RdbBloomFilterPrefixUseful:  metric.NewGauge(metaRdbBloomFilterPrefixUseful),
-		RdbMemtableHits:             metric.NewGauge(metaRdbMemtableHits),
-		RdbMemtableMisses:           metric.NewGauge(metaRdbMemtableMisses),
 		RdbMemtableTotalSize:        metric.NewGauge(metaRdbMemtableTotalSize),
 		RdbFlushes:                  metric.NewGauge(metaRdbFlushes),
 		RdbCompactions:              metric.NewGauge(metaRdbCompactions),
@@ -818,6 +829,10 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		SlowCommandQueueRequests: metric.NewGauge(metaSlowCommandQueueRequests),
 		SlowLeaseRequests:        metric.NewGauge(metaSlowLeaseRequests),
 		SlowRaftRequests:         metric.NewGauge(metaSlowRaftRequests),
+
+		// AddSSTable proposal + applications counters.
+		AddSSTableProposals:    metric.NewCounter(metaAddSSTableProposals),
+		AddSSTableApplications: metric.NewCounter(metaAddSSTableApplications),
 	}
 
 	sm.raftRcvdMessages[raftpb.MsgProp] = sm.RaftRcvdMsgProp
@@ -848,6 +863,7 @@ func (sm *StoreMetrics) updateMVCCGaugesLocked() {
 	sm.LiveBytes.Update(sm.mu.stats.LiveBytes)
 	sm.KeyBytes.Update(sm.mu.stats.KeyBytes)
 	sm.ValBytes.Update(sm.mu.stats.ValBytes)
+	sm.TotalBytes.Update(sm.mu.stats.Total())
 	sm.IntentBytes.Update(sm.mu.stats.IntentBytes)
 	sm.LiveCount.Update(sm.mu.stats.LiveCount)
 	sm.KeyCount.Update(sm.mu.stats.KeyCount)
@@ -884,8 +900,6 @@ func (sm *StoreMetrics) updateRocksDBStats(stats engine.Stats) {
 	sm.RdbBlockCachePinnedUsage.Update(stats.BlockCachePinnedUsage)
 	sm.RdbBloomFilterPrefixUseful.Update(stats.BloomFilterPrefixUseful)
 	sm.RdbBloomFilterPrefixChecked.Update(stats.BloomFilterPrefixChecked)
-	sm.RdbMemtableHits.Update(stats.MemtableHits)
-	sm.RdbMemtableMisses.Update(stats.MemtableMisses)
 	sm.RdbMemtableTotalSize.Update(stats.MemtableTotalSize)
 	sm.RdbFlushes.Update(stats.Flushes)
 	sm.RdbCompactions.Update(stats.Compactions)

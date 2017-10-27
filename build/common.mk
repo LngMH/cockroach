@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
-#
-# Author: Nikhil Benesch (nikhil.benesch@gmail.com)
 
 # This file defines variables and targets that are used by all Makefiles in the
 # project. The including Makefile must define REPO_ROOT to the relative path to
@@ -50,14 +48,7 @@ GO_INSTALL := GOBIN='$(LOCAL_BIN)' $(GO) install
 
 # Prefer tools we've installed with go install and Yarn to those elsewhere on
 # the PATH.
-#
-# Usually, we could use the yarn run command to avoid changing the PATH
-# globally. Unfortunately, yarn run must be executed in or beneath UI_ROOT, but
-# protobuf.mk, which depends on Yarn-installed executables, needs to execute in
-# ORG_ROOT. It's much simpler to add the Yarn executable-installation directory
-# to the PATH than have protobuf.mk adjust its paths to work in both ORG_ROOT
-# and UI_ROOT.
-export PATH := $(LOCAL_BIN):$(UI_ROOT)/node_modules/.bin:$(PATH)
+export PATH := $(LOCAL_BIN):$(PATH)
 
 # HACK: Make has a fast path and a slow path for command execution,
 # but the fast path uses the PATH variable from when make was started,
@@ -73,6 +64,12 @@ endif
 
 GIT_DIR := $(shell git rev-parse --git-dir 2> /dev/null)
 
+# Invocation of any NodeJS script should be prefixed by NODE_RUN. See the
+# comments within node-run.sh for rationale.
+NODE_RUN := $(REPO_ROOT)/build/node-run.sh
+
+YARN := $(NODE_RUN) yarn
+
 # make-lazy converts a recursive variable, which is evaluated every time it's
 # referenced, to a lazy variable, which is evaluated only the first time it's
 # used. See: http://blog.jgc.org/2016/07/lazy-gnu-make-variables.html
@@ -81,9 +78,6 @@ override make-lazy = $(eval $1 = $$(eval $1 := $(value $1))$$($1))
 UNAME := $(shell uname)
 MACOS := $(findstring Darwin,$(UNAME))
 MINGW := $(findstring MINGW,$(UNAME))
-
-NCPUS = $(shell $(LOCAL_BIN)/ncpus)
-$(call make-lazy,NCPUS)
 
 # GNU tar and BSD tar both support transforming filenames according to a regular
 # expression, but have different flags to do so.
@@ -107,7 +101,7 @@ space := $(eval) $(eval)
 # -w`, though not required by POSIX, exists on all tested platforms.
 include $(REPO_ROOT)/.go-version
 ifeq ($(shell $(GO) version | grep -qwE '$(GOVERS)' && echo y),)
-$(error "$(GOVERS) required (see CONTRIBUTING.md): $(shell $(GO) version)")
+$(error "$(GOVERS) required (see CONTRIBUTING.md): $(shell $(GO) version); use `make GOVERS=.*` for experiments")
 endif
 
 # Print an error if the user specified any variables on the command line that
@@ -115,7 +109,7 @@ endif
 # rebuilt on the first successful `make` invocation after the Makefile changes.
 include $(REPO_ROOT)/build/variables.mk
 $(foreach v,$(filter-out $(strip $(VALID_VARS)),$(.VARIABLES)),\
-	$(if $(findstring command line,$(origin $v)),$(error Variable `$v' is not recognized by this Makefile)))
+	$(if $(findstring command line,$(origin $v)),$(error Variable '$v' is not recognized by this Makefile)))
 -include $(REPO_ROOT)/customenv.mk
 
 # Tell Make to delete the target if its recipe fails. Otherwise, if a recipe
@@ -153,7 +147,14 @@ endif
 YARN_INSTALLED_TARGET := $(UI_ROOT)/yarn.installed
 
 $(YARN_INSTALLED_TARGET): $(BOOTSTRAP_TARGET) $(UI_ROOT)/package.json $(UI_ROOT)/yarn.lock
-	cd $(UI_ROOT) && yarn install
+	$(YARN) install --cwd $(UI_ROOT)
+	# Prevent ProtobufJS from trying to install its own packages because a) the
+	# the feature is buggy, and b) it introduces an unnecessary dependency on NPM.
+	# Additionally pin a known-good version of jsdoc.
+	# See: https://github.com/dcodeIO/protobuf.js/issues/716.
+	cp $(UI_ROOT)/node_modules/protobufjs/cli/{package.standalone.json,package.json}
+	$(YARN) add jsdoc@3.4.3 --cwd $(UI_ROOT)/node_modules/protobufjs/cli
+	$(YARN) install --cwd $(UI_ROOT)/node_modules/protobufjs/cli
 	@# We remove this broken dependency again in pkg/ui/webpack.config.js.
 	@# See the comment there for details.
 	rm -rf $(UI_ROOT)/node_modules/@types/node
@@ -167,11 +168,11 @@ BOOTSTRAP_TARGET := $(LOCAL_BIN)/.bootstrap
 
 # Update the git hooks and install commands from dependencies whenever they
 # change.
-$(BOOTSTRAP_TARGET): $(GITHOOKS) $(REPO_ROOT)/Gopkg.lock
+$(BOOTSTRAP_TARGET): $(GITHOOKS) $(REPO_ROOT)/Gopkg.lock $(LOCAL_BIN)/returncheck
 ifneq ($(GIT_DIR),)
 	git submodule update --init
 endif
-	@$(GO_INSTALL) -v $(PKG_ROOT)/cmd/{metacheck,ncpus,returncheck} \
+	@$(GO_INSTALL) -v \
 		$(REPO_ROOT)/vendor/github.com/golang/dep/cmd/dep \
 		$(REPO_ROOT)/vendor/github.com/client9/misspell/cmd/misspell \
 		$(REPO_ROOT)/vendor/github.com/cockroachdb/crlfmt \
@@ -182,7 +183,6 @@ endif
 		$(REPO_ROOT)/vendor/github.com/jteeuwen/go-bindata/go-bindata \
 		$(REPO_ROOT)/vendor/github.com/kisielk/errcheck \
 		$(REPO_ROOT)/vendor/github.com/mattn/goveralls \
-		$(REPO_ROOT)/vendor/github.com/mdempsky/unconvert \
 		$(REPO_ROOT)/vendor/github.com/mibk/dupl \
 		$(REPO_ROOT)/vendor/github.com/wadey/gocovmerge \
 		$(REPO_ROOT)/vendor/golang.org/x/perf/cmd/benchstat \
@@ -199,13 +199,23 @@ endif
 #     TARGET-NAME: [export] VARIABLE [:+?]=
 #
 # The additional complexity below handles whitespace and comments.
-$(REPO_ROOT)/build/variables.mk: $(REPO_ROOT)/Makefile $(REPO_ROOT)/.go-version $(REPO_ROOT)/build/common.mk $(REPO_ROOT)/build/archive/contents/Makefile
-	@echo '# This file is auto-generated by Make.' > $@
-	@echo '# DO NOT EDIT!' >> $@
+#
+# The special comments at the beginning are for Github/Go/Reviewable:
+# https://github.com/golang/go/issues/13560#issuecomment-277804473
+# https://github.com/Reviewable/Reviewable/wiki/FAQ#how-do-i-tell-reviewable-that-a-file-is-generated-and-should-not-be-reviewed
+VARIABLES_MAKEFILES := \
+  $(REPO_ROOT)/Makefile \
+	$(REPO_ROOT)/build/common.mk \
+	$(REPO_ROOT)/build/archive/contents/Makefile \
+	$(UI_ROOT)/Makefile
+
+$(REPO_ROOT)/build/variables.mk: $(REPO_ROOT)/.go-version $(VARIABLES_MAKEFILES)
+	@echo '# Code generated by Make. DO NOT EDIT.' > $@
+	@echo '# GENERATED FILE DO NOT EDIT' >> $@
 	@echo 'define VALID_VARS' >> $@
 	@sed -nE -e '/^	/d' -e 's/([^#]*)#.*/\1/' \
 	  -e 's/(^|^[^:]+:)[ ]*(export)?[ ]*([^ ]+)[ ]*[:?+]?=.*/  \3/p' $^ \
-	  | LC_COLLATE=C sort -u >> $@
+	  | sort -u >> $@
 	@echo 'endef' >> $@
 
 # The following section handles building our C/C++ dependencies. These are
@@ -216,8 +226,9 @@ JEMALLOC_SRC_DIR := $(C_DEPS_DIR)/jemalloc
 PROTOBUF_SRC_DIR := $(C_DEPS_DIR)/protobuf
 ROCKSDB_SRC_DIR  := $(C_DEPS_DIR)/rocksdb
 SNAPPY_SRC_DIR   := $(C_DEPS_DIR)/snappy
+LIBROACH_SRC_DIR := $(C_DEPS_DIR)/libroach
 
-C_LIBS_SRCS := $(JEMALLOC_SRC_DIR) $(PROTOBUF_SRC_DIR) $(ROCKSDB_SRC_DIR) $(SNAPPY_SRC_DIR)
+C_LIBS_SRCS := $(JEMALLOC_SRC_DIR) $(PROTOBUF_SRC_DIR) $(ROCKSDB_SRC_DIR) $(SNAPPY_SRC_DIR) $(LIBROACH_SRC_DIR)
 
 HOST_TRIPLE := $(shell $$($(GO) env CC) -dumpmachine)
 
@@ -282,11 +293,13 @@ JEMALLOC_DIR := $(BUILD_DIR)/jemalloc
 PROTOBUF_DIR := $(BUILD_DIR)/protobuf
 ROCKSDB_DIR  := $(BUILD_DIR)/rocksdb$(STDMALLOC_SUFFIX)$(if $(ENABLE_ROCKSDB_ASSERTIONS),_assert)
 SNAPPY_DIR   := $(BUILD_DIR)/snappy
+LIBROACH_DIR := $(BUILD_DIR)/libroach
 # Can't share with protobuf because protoc is always built for the host.
 PROTOC_DIR := $(GOPATH)/native/$(HOST_TRIPLE)/protobuf
 PROTOC 		 := $(PROTOC_DIR)/protoc
 
-C_LIBS := $(if $(USE_STDMALLOC),,libjemalloc) libprotobuf libsnappy librocksdb
+C_LIBS_OSS = $(if $(USE_STDMALLOC),,libjemalloc) libprotobuf libsnappy librocksdb libroach
+C_LIBS_CCL = $(C_LIBS_OSS) libroachccl
 
 # Go does not permit dashes in build tags. This is undocumented. Fun!
 NATIVE_SPECIFIER_TAG := $(subst -,_,$(NATIVE_SPECIFIER))$(STDMALLOC_SUFFIX)
@@ -327,7 +340,7 @@ $(CGO_FLAGS_FILES): $(REPO_ROOT)/build/common.mk
 	@echo 'package $(notdir $(@D))' >> $@
 	@echo >> $@
 	@echo '// #cgo CPPFLAGS: -I$(JEMALLOC_DIR)/include' >> $@
-	@echo '// #cgo LDFLAGS: $(addprefix -L,$(PROTOBUF_DIR) $(JEMALLOC_DIR)/lib $(SNAPPY_DIR) $(ROCKSDB_DIR))' >> $@
+	@echo '// #cgo LDFLAGS: $(addprefix -L,$(PROTOBUF_DIR) $(JEMALLOC_DIR)/lib $(SNAPPY_DIR) $(ROCKSDB_DIR) $(LIBROACH_DIR))' >> $@
 	@echo 'import "C"' >> $@
 
 # BUILD ARTIFACT CACHING
@@ -344,12 +357,11 @@ $(CGO_FLAGS_FILES): $(REPO_ROOT)/build/common.mk
 # marker file when switching between revisions that span the change. For
 # simplicity, just sequentially bump the version number within.
 #
-# NB: the recipes below nuke *all* build artifacts when a dependency's source
-# tarball changes. Normally, we could rely on the dependency's build system to
-# detect modified files and only rebuild the necessary objects, but tar assigns
-# extracted files their original modification time (i.e., a time well in the
-# past, when the tarballs were packaged), and so the build artifacts always look
-# up-to-date.
+# NB: the recipes below nuke *all* build artifacts when a dependency's configure
+# flags change. In theory, we could rely on the dependency's build system to
+# only rebuild the affected objects, but in practice dependencies on configure
+# flags are not tracked correctly, and these stale artifacts can cause
+# particularly hard-to-debug errors.
 
 $(JEMALLOC_SRC_DIR)/configure.ac: $(BOOTSTRAP_TARGET)
 
@@ -388,10 +400,10 @@ $(ROCKSDB_DIR)/Makefile: $(C_DEPS_DIR)/rocksdb-rebuild $(BOOTSTRAP_TARGET) | lib
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/rocksdb-rebuild. See above for rationale.
 	cd $(ROCKSDB_DIR) && cmake $(CMAKE_FLAGS) $(ROCKSDB_SRC_DIR) \
-	  $(if $(findstring release,$(TYPE)),,-DWITH_$(if $(findstring mingw,$(TARGET_TRIPLE)),AVX2,SSE42)=OFF) \
+	  -DWITH_$(if $(findstring mingw,$(TARGET_TRIPLE)),AVX2,SSE42)=OFF \
 	  -DSNAPPY_LIBRARIES=$(SNAPPY_DIR)/libsnappy.a -DSNAPPY_INCLUDE_DIR="$(SNAPPY_SRC_DIR);$(SNAPPY_DIR)" -DWITH_SNAPPY=ON \
 	  $(if $(USE_STDMALLOC),,-DJEMALLOC_LIBRARIES=$(JEMALLOC_DIR)/lib/libjemalloc.a -DJEMALLOC_INCLUDE_DIR=$(JEMALLOC_DIR)/include -DWITH_JEMALLOC=ON) \
-	  $(if $(ENABLE_ROCKSDB_ASSERTIONS),,-DCMAKE_CXX_FLAGS=-DNDEBUG)
+	  -DCMAKE_CXX_FLAGS="-msse3 $(if $(ENABLE_ROCKSDB_ASSERTIONS),,-DNDEBUG)"
 	@# TODO(benesch): Tweak how we pass -DNDEBUG above when we upgrade to a
 	@# RocksDB release that includes https://github.com/facebook/rocksdb/pull/2300.
 
@@ -402,6 +414,13 @@ $(SNAPPY_DIR)/Makefile: $(C_DEPS_DIR)/snappy-rebuild $(BOOTSTRAP_TARGET)
 	@# $(C_DEPS_DIR)/snappy-rebuild. See above for rationale.
 	cd $(SNAPPY_DIR) && cmake $(CMAKE_FLAGS) $(SNAPPY_SRC_DIR)
 
+$(LIBROACH_DIR)/Makefile: $(C_DEPS_DIR)/libroach-rebuild $(BOOTSTRAP_TARGET)
+	rm -rf $(LIBROACH_DIR)
+	mkdir -p $(LIBROACH_DIR)
+	@# NOTE: If you change the CMake flags below, bump the version in
+	@# $(C_DEPS_DIR)/libroach-rebuild. See above for rationale.
+	cd $(LIBROACH_DIR) && cmake $(CMAKE_FLAGS) $(LIBROACH_SRC_DIR) -DCMAKE_BUILD_TYPE=Release
+
 # We mark C and C++ dependencies as .PHONY (or .ALWAYS_REBUILD) to avoid
 # having to name the artifact (for .PHONY), which can vary by platform, and so
 # the child Makefile can determine whether the target is up to date (for both
@@ -409,27 +428,46 @@ $(SNAPPY_DIR)/Makefile: $(C_DEPS_DIR)/snappy-rebuild $(BOOTSTRAP_TARGET)
 # and we certainly don't want to duplicate them.
 
 $(PROTOC): $(PROTOC_DIR)/Makefile .ALWAYS_REBUILD
-	@$(MAKE) --no-print-directory -C $(PROTOC_DIR) -j$(NCPUS) protoc
+	@$(MAKE) --no-print-directory -C $(PROTOC_DIR) protoc
 
 .PHONY: libjemalloc
 libjemalloc: $(JEMALLOC_DIR)/Makefile
-	@$(MAKE) --no-print-directory -C $(JEMALLOC_DIR) -j$(NCPUS) build_lib_static
+	@$(MAKE) --no-print-directory -C $(JEMALLOC_DIR) build_lib_static
 
 .PHONY: libprotobuf
 libprotobuf: $(PROTOBUF_DIR)/Makefile
-	@$(MAKE) --no-print-directory -C $(PROTOBUF_DIR) -j$(NCPUS) libprotobuf
+	@$(MAKE) --no-print-directory -C $(PROTOBUF_DIR) libprotobuf
 
 .PHONY: libsnappy
 libsnappy: $(SNAPPY_DIR)/Makefile
-	@$(MAKE) --no-print-directory -C $(SNAPPY_DIR) -j$(NCPUS)
+	@$(MAKE) --no-print-directory -C $(SNAPPY_DIR) snappy
 
 .PHONY: librocksdb
 librocksdb: $(ROCKSDB_DIR)/Makefile
-	@$(MAKE) --no-print-directory -C $(ROCKSDB_DIR) -j$(NCPUS) rocksdb
+	@$(MAKE) --no-print-directory -C $(ROCKSDB_DIR) rocksdb
+
+.PHONY: libroach
+libroach: $(LIBROACH_DIR)/Makefile
+	@$(MAKE) --no-print-directory -C $(LIBROACH_DIR) roach
+
+.PHONY: libroachccl
+libroachccl: $(LIBROACH_DIR)/Makefile libroach
+	@$(MAKE) --no-print-directory -C $(LIBROACH_DIR) roachccl
 
 .PHONY: clean-c-deps
 clean-c-deps:
-	rm -rf $(JEMALLOC_DIR) && git -C $(JEMALLOC_SRC_DIR) clean -dxf
-	rm -rf $(PROTOBUF_DIR) && git -C $(PROTOBUF_SRC_DIR) clean -dxf
-	rm -rf $(ROCKSDB_DIR)  && git -C $(ROCKSDB_SRC_DIR)  clean -dxf
-	rm -rf $(SNAPPY_DIR)   && git -C $(SNAPPY_SRC_DIR)   clean -dxf
+	rm -rf $(JEMALLOC_DIR)
+	rm -rf $(PROTOBUF_DIR)
+	rm -rf $(ROCKSDB_DIR)
+	rm -rf $(SNAPPY_DIR)
+
+.PHONY: unsafe-clean-c-deps
+unsafe-clean-c-deps:
+	git -C $(JEMALLOC_SRC_DIR) clean -dxf
+	git -C $(PROTOBUF_SRC_DIR) clean -dxf
+	git -C $(ROCKSDB_SRC_DIR)  clean -dxf
+	git -C $(SNAPPY_SRC_DIR)   clean -dxf
+
+.SECONDEXPANSION:
+$(LOCAL_BIN)/%: $$(shell find $(PKG_ROOT)/cmd/$$*)
+	@$(GO_INSTALL) -v $(PKG_ROOT)/cmd/$*

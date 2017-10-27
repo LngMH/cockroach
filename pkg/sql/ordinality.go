@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
@@ -21,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
@@ -40,11 +39,11 @@ import (
 // common SQL optimizations*. Its use should be limited in clients to
 // situations where the corresponding performance cost is affordable.
 type ordinalityNode struct {
-	source   planNode
-	ordering orderingInfo
-	columns  sqlbase.ResultColumns
-	row      parser.Datums
-	curCnt   int64
+	source  planNode
+	props   physicalProps
+	columns sqlbase.ResultColumns
+	row     parser.Datums
+	curCnt  int64
 }
 
 func (p *planner) wrapOrdinality(ds planDataSource) planDataSource {
@@ -52,10 +51,10 @@ func (p *planner) wrapOrdinality(ds planDataSource) planDataSource {
 	srcColumns := planColumns(src)
 
 	res := &ordinalityNode{
-		source:   src,
-		ordering: planOrdering(src),
-		row:      make(parser.Datums, len(srcColumns)+1),
-		curCnt:   1,
+		source: src,
+		props:  planPhysicalProps(src),
+		row:    make(parser.Datums, len(srcColumns)+1),
+		curCnt: 1,
 	}
 
 	// Allocate an extra column for the ordinality values.
@@ -72,12 +71,12 @@ func (p *planner) wrapOrdinality(ds planDataSource) planDataSource {
 	ds.info.sourceColumns = res.columns
 	if srcIdx, ok := ds.info.sourceAliases.srcIdx(anonymousTable); !ok {
 		ds.info.sourceAliases = append(ds.info.sourceAliases, sourceAlias{
-			name:        anonymousTable,
-			columnRange: []int{newColIdx},
+			name:      anonymousTable,
+			columnSet: util.MakeFastIntSet(newColIdx),
 		})
 	} else {
 		srcAlias := &ds.info.sourceAliases[srcIdx]
-		srcAlias.columnRange = append(srcAlias.columnRange, newColIdx)
+		srcAlias.columnSet.Add(newColIdx)
 	}
 
 	ds.plan = res
@@ -85,8 +84,8 @@ func (p *planner) wrapOrdinality(ds planDataSource) planDataSource {
 	return ds
 }
 
-func (o *ordinalityNode) Next(ctx context.Context) (bool, error) {
-	hasNext, err := o.source.Next(ctx)
+func (o *ordinalityNode) Next(params runParams) (bool, error) {
+	hasNext, err := o.source.Next(params)
 	if !hasNext || err != nil {
 		return hasNext, err
 	}
@@ -98,9 +97,9 @@ func (o *ordinalityNode) Next(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-func (o *ordinalityNode) Values() parser.Datums           { return o.row }
-func (o *ordinalityNode) Start(ctx context.Context) error { return o.source.Start(ctx) }
-func (o *ordinalityNode) Close(ctx context.Context)       { o.source.Close(ctx) }
+func (o *ordinalityNode) Values() parser.Datums        { return o.row }
+func (o *ordinalityNode) Start(params runParams) error { return o.source.Start(params) }
+func (o *ordinalityNode) Close(ctx context.Context)    { o.source.Close(ctx) }
 
 // restrictOrdering transforms an ordering requirement on the output
 // of an ordinalityNode into an ordering requirement on its input.
@@ -125,26 +124,28 @@ func (o *ordinalityNode) optimizeOrdering() {
 	// We are going to "optimize" the ordering. We had an ordering
 	// initially from the source, but expand() may have caused it to
 	// change. So here retrieve the ordering of the source again.
-	origOrdering := planOrdering(o.source)
+	origOrdering := planPhysicalProps(o.source)
 
 	if len(origOrdering.ordering) > 0 {
 		// TODO(knz/radu): we basically have two simultaneous orderings.
-		// What we really want is something that orderingInfo cannot
+		// What we really want is something that physicalProps cannot
 		// currently express: that the rows are ordered by a set of
 		// columns AND at the same time they are also ordered by a
 		// different set of columns. However since ordinalityNode is
 		// currently the only case where this happens we consider it's not
 		// worth the hassle and just use the source ordering.
-		o.ordering = origOrdering
+		o.props = origOrdering.copy()
 	} else {
 		// No ordering defined in the source, so create a new one.
-		o.ordering.exactMatchCols = origOrdering.exactMatchCols
-		o.ordering.ordering = sqlbase.ColumnOrdering{
-			sqlbase.ColumnOrderInfo{
-				ColIdx:    len(o.columns) - 1,
-				Direction: encoding.Ascending,
-			},
-		}
-		o.ordering.unique = true
+		o.props.eqGroups = origOrdering.eqGroups.Copy()
+		o.props.constantCols = origOrdering.constantCols.Copy()
+		o.props.ordering = sqlbase.ColumnOrdering{{
+			ColIdx:    len(o.columns) - 1,
+			Direction: encoding.Ascending,
+		}}
 	}
+	// The ordinality column forms a key.
+	var k util.FastIntSet
+	k.Add(len(o.columns) - 1)
+	o.props.weakKeys = append(o.props.weakKeys, k)
 }

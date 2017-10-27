@@ -11,12 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package sqlbase
 
 import "github.com/cockroachdb/cockroach/pkg/sql/parser"
 
 // DefaultSearchPath is the search path used by virgin sessions.
-var DefaultSearchPath = parser.SearchPath{"pg_catalog"}
+var DefaultSearchPath = parser.SearchPath{}

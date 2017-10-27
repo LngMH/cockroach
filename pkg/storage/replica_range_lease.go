@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 // This file contains replica methods related to range leases.
 
@@ -29,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 )
 
@@ -83,10 +79,6 @@ func (p *pendingLeaseRequest) RequestPending() (roachpb.Lease, bool) {
 // transfer needs to be set if the request represents a lease transfer (as
 // opposed to an extension, or acquiring the lease when none is held).
 //
-// Note: Once this function gets a context to be used for cancellation, instead
-// of replica.store.Stopper().ShouldQuiesce(), care will be needed for cancelling
-// the Raft command, similar to replica.executeWriteBatch.
-//
 // Requires repl.mu is exclusively locked.
 func (p *pendingLeaseRequest) InitOrJoinRequest(
 	ctx context.Context,
@@ -117,38 +109,39 @@ func (p *pendingLeaseRequest) InitOrJoinRequest(
 	var leaseReq roachpb.Request
 	now := repl.store.Clock().Now()
 	reqLease := roachpb.Lease{
-		Start:      status.timestamp,
+		Start:      status.Timestamp,
 		Replica:    nextLeaseHolder,
 		ProposedTS: &now,
 	}
 
 	if repl.requiresExpiringLeaseRLocked() {
-		reqLease.Expiration = status.timestamp.Add(int64(repl.store.cfg.RangeLeaseActiveDuration), 0)
+		reqLease.Expiration = &hlc.Timestamp{}
+		*reqLease.Expiration = status.Timestamp.Add(int64(repl.store.cfg.RangeLeaseActiveDuration()), 0)
 	} else {
 		// Get the liveness for the next lease holder and set the epoch in the lease request.
 		liveness, err := repl.store.cfg.NodeLiveness.GetLiveness(nextLeaseHolder.NodeID)
 		if err != nil {
 			llChan <- roachpb.NewError(&roachpb.LeaseRejectedError{
-				Existing:  status.lease,
+				Existing:  status.Lease,
 				Requested: reqLease,
 				Message:   fmt.Sprintf("couldn't request lease for %+v: %v", nextLeaseHolder, err),
 			})
 			return llChan
 		}
-		reqLease.Epoch = proto.Int64(liveness.Epoch)
+		reqLease.Epoch = liveness.Epoch
 	}
 
 	if transfer {
 		leaseReq = &roachpb.TransferLeaseRequest{
 			Span:      reqSpan,
 			Lease:     reqLease,
-			PrevLease: status.lease,
+			PrevLease: status.Lease,
 		}
 	} else {
 		leaseReq = &roachpb.RequestLeaseRequest{
 			Span:      reqSpan,
 			Lease:     reqLease,
-			PrevLease: status.lease,
+			PrevLease: status.Lease,
 		}
 	}
 
@@ -160,7 +153,11 @@ func (p *pendingLeaseRequest) InitOrJoinRequest(
 			newNotLeaseHolderError(nil, repl.store.StoreID(), repl.mu.state.Desc))
 		return llChan
 	}
-	// TODO(andrei): document this subtlety.
+	// InitOrJoinRequest requires that repl.mu is exclusively locked. requestLeaseAsync
+	// also requires this lock to send results on all waiter channels. This means that
+	// no results will be sent until we've release the lock, so there's no race between
+	// adding our new channel to p.llChans below and requestLeaseAsync sending results
+	// on all channels in p.llChans. The same logic applies to p.nextLease.
 	p.llChans = append(p.llChans, llChan)
 	p.nextLease = reqLease
 	return llChan
@@ -185,24 +182,24 @@ func (p *pendingLeaseRequest) requestLeaseAsync(
 			// potentially heartbeat our own liveness or increment epoch of
 			// prior owner. Note we only do this if the previous lease was
 			// epoch-based.
-			if reqLease.Type() == roachpb.LeaseEpoch && status.state == leaseExpired &&
-				status.lease.Type() == roachpb.LeaseEpoch {
+			if reqLease.Type() == roachpb.LeaseEpoch && status.State == LeaseState_EXPIRED &&
+				status.Lease.Type() == roachpb.LeaseEpoch {
 				var err error
 				// If this replica is previous & next lease holder, manually heartbeat to become live.
-				if status.lease.OwnedBy(nextLeaseHolder.StoreID) &&
+				if status.Lease.OwnedBy(nextLeaseHolder.StoreID) &&
 					repl.store.StoreID() == nextLeaseHolder.StoreID {
-					if err = repl.store.cfg.NodeLiveness.Heartbeat(ctx, status.liveness); err != nil {
+					if err = repl.store.cfg.NodeLiveness.Heartbeat(ctx, status.Liveness); err != nil {
 						log.Error(ctx, err)
 					}
-				} else if status.liveness.Epoch == *status.lease.Epoch {
+				} else if status.Liveness.Epoch == status.Lease.Epoch {
 					// If not owner, increment epoch if necessary to invalidate lease.
-					if err = repl.store.cfg.NodeLiveness.IncrementEpoch(ctx, status.liveness); err != nil {
+					if err = repl.store.cfg.NodeLiveness.IncrementEpoch(ctx, status.Liveness); err != nil {
 						log.Error(ctx, err)
 					}
 				}
 				// Set error for propagation to all waiters below.
 				if err != nil {
-					pErr = roachpb.NewError(newNotLeaseHolderError(&status.lease, repl.store.StoreID(), repl.Desc()))
+					pErr = roachpb.NewError(newNotLeaseHolderError(&status.Lease, repl.store.StoreID(), repl.Desc()))
 				}
 			}
 
@@ -280,26 +277,6 @@ func (p *pendingLeaseRequest) TransferInProgress(
 	return roachpb.Lease{}, false
 }
 
-type leaseState int
-
-const (
-	leaseError      leaseState = iota // can't be used or acquired
-	leaseValid                        // can be used
-	leaseStasis                       // not expired, but can't be used
-	leaseExpired                      // expired, can't be used
-	leaseProscribed                   // proposed timestamp earlier than allowed
-)
-
-// LeaseStatus holds the lease state, the timestamp at which the state
-// is accurate, the lease and optionally the liveness if the lease is
-// epoch-based.
-type LeaseStatus struct {
-	state     leaseState    // state of the lease @timestamp
-	timestamp hlc.Timestamp // timestamp the lease was evaluated at
-	lease     roachpb.Lease // lease which status describes.
-	liveness  *Liveness     // liveness if epoch-based lease
-}
-
 // leaseStatus returns lease status. If the lease is epoch-based,
 // the liveness field will be set to the liveness used to compute
 // its state, unless state == leaseError.
@@ -339,28 +316,30 @@ type LeaseStatus struct {
 func (r *Replica) leaseStatus(
 	lease roachpb.Lease, timestamp, minProposedTS hlc.Timestamp,
 ) LeaseStatus {
-	status := LeaseStatus{timestamp: timestamp, lease: lease}
+	status := LeaseStatus{Timestamp: timestamp, Lease: lease}
 	var expiration hlc.Timestamp
 	if lease.Type() == roachpb.LeaseExpiration {
-		expiration = lease.Expiration
+		expiration = lease.GetExpiration()
 	} else {
 		var err error
-		status.liveness, err = r.store.cfg.NodeLiveness.GetLiveness(lease.Replica.NodeID)
-		if err != nil || status.liveness.Epoch < *lease.Epoch {
+		status.Liveness, err = r.store.cfg.NodeLiveness.GetLiveness(lease.Replica.NodeID)
+		if err != nil || status.Liveness.Epoch < lease.Epoch {
 			// If lease validity can't be determined (e.g. gossip is down
 			// and liveness info isn't available for owner), we can neither
 			// use the lease nor do we want to attempt to acquire it.
 			if err != nil {
+				// TODO(tschottdorf): this can be super spammy during startup
+				// (err=node not in liveness table) Rate limit this error.
 				log.Warningf(context.TODO(), "can't determine lease status due to node liveness error: %s", err)
 			}
-			status.state = leaseError
+			status.State = LeaseState_ERROR
 			return status
 		}
-		if status.liveness.Epoch > *lease.Epoch {
-			status.state = leaseExpired
+		if status.Liveness.Epoch > lease.Epoch {
+			status.State = LeaseState_EXPIRED
 			return status
 		}
-		expiration = status.liveness.Expiration
+		expiration = hlc.Timestamp(status.Liveness.Expiration)
 	}
 	maxOffset := r.store.Clock().MaxOffset()
 	if maxOffset == timeutil.ClocklessMaxOffset {
@@ -369,17 +348,17 @@ func (r *Replica) leaseStatus(
 	}
 	stasis := expiration.Add(-int64(maxOffset), 0)
 	if timestamp.Less(stasis) {
-		status.state = leaseValid
+		status.State = LeaseState_VALID
 		// If the replica owns the lease, additional verify that the lease's
 		// proposed timestamp is not earlier than the min proposed timestamp.
 		if lease.Replica.StoreID == r.store.StoreID() &&
 			lease.ProposedTS != nil && lease.ProposedTS.Less(minProposedTS) {
-			status.state = leaseProscribed
+			status.State = LeaseState_PROSCRIBED
 		}
 	} else if timestamp.Less(expiration) {
-		status.state = leaseStasis
+		status.State = LeaseState_STASIS
 	} else {
-		status.state = leaseExpired
+		status.State = LeaseState_EXPIRED
 	}
 	return status
 }
@@ -405,7 +384,7 @@ func (r *Replica) requestLeaseLocked(
 	ctx context.Context, status LeaseStatus,
 ) <-chan *roachpb.Error {
 	if r.store.TestingKnobs().LeaseRequestEvent != nil {
-		r.store.TestingKnobs().LeaseRequestEvent(status.timestamp)
+		r.store.TestingKnobs().LeaseRequestEvent(status.Timestamp)
 	}
 	// Propose a Raft command to get a lease for this replica.
 	repDesc, err := r.getReplicaDescriptorRLocked()
@@ -458,13 +437,13 @@ func (r *Replica) AdminTransferLease(ctx context.Context, target roachpb.StoreID
 		defer r.mu.Unlock()
 
 		status := r.leaseStatus(*r.mu.state.Lease, r.store.Clock().Now(), r.mu.minLeaseProposedTS)
-		if status.lease.OwnedBy(target) {
+		if status.Lease.OwnedBy(target) {
 			// The target is already the lease holder. Nothing to do.
 			return nil, nil, nil
 		}
 		desc := r.mu.state.Desc
-		if !status.lease.OwnedBy(r.store.StoreID()) {
-			return nil, nil, newNotLeaseHolderError(&status.lease, r.store.StoreID(), desc)
+		if !status.Lease.OwnedBy(r.store.StoreID()) {
+			return nil, nil, newNotLeaseHolderError(&status.Lease, r.store.StoreID(), desc)
 		}
 		// Verify the target is a replica of the range.
 		var ok bool
@@ -488,7 +467,7 @@ func (r *Replica) AdminTransferLease(ctx context.Context, target roachpb.StoreID
 			return nil, nil, newNotLeaseHolderError(&nextLease, r.store.StoreID(), desc)
 		}
 		// Stop using the current lease.
-		r.mu.minLeaseProposedTS = status.timestamp
+		r.mu.minLeaseProposedTS = status.Timestamp
 		transfer := r.mu.pendingLeaseRequest.InitOrJoinRequest(
 			ctx, r, nextLeaseHolder, status, desc.StartKey.AsRawKey(), true, /* transfer */
 		)

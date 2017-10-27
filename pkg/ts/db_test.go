@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package ts
 
@@ -80,7 +78,7 @@ func newTestModel(t *testing.T) testModel {
 func (tm *testModel) Start() {
 	tm.LocalTestCluster.Start(tm.t, testutils.NewNodeTestBaseContext(),
 		kv.InitSenderForLocalTestCluster)
-	tm.DB = NewDB(tm.LocalTestCluster.DB)
+	tm.DB = NewDB(tm.LocalTestCluster.DB, tm.Cfg.Settings)
 }
 
 // getActualData returns the actual value of all time series keys in the
@@ -221,7 +219,7 @@ func (tm *testModel) storeTimeSeriesData(r Resolution, data []tspb.TimeSeriesDat
 // of time series/resolution pairs will be considered for deletion.
 func (tm *testModel) prune(nowNanos int64, timeSeries ...timeSeriesResolutionInfo) {
 	// Prune time series from the system under test.
-	if err := pruneTimeSeries(
+	if err := tm.DB.pruneTimeSeries(
 		context.TODO(),
 		tm.LocalTestCluster.DB,
 		timeSeries,
@@ -234,7 +232,7 @@ func (tm *testModel) prune(nowNanos int64, timeSeries ...timeSeriesResolutionInf
 	}
 
 	// Prune data from the model.
-	thresholds := computeThresholds(nowNanos)
+	thresholds := tm.DB.computeThresholds(nowNanos)
 	for k := range tm.modelData {
 		name, _, res, ts, err := DecodeDataKey(roachpb.Key(k))
 		if err != nil {
@@ -407,4 +405,18 @@ func TestPollSource(t *testing.T) {
 	}
 	tm.assertKeyCount(3)
 	tm.assertModelCorrect()
+}
+
+// TestPruneThreshold verifies that `PruneThreshold` returns correct result in nanoseconds
+func TestPruneThreshold(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tm := newTestModel(t)
+	tm.Start()
+	defer tm.Stop()
+	expected := resolution10sDefaultPruneThreshold.Nanoseconds()
+	db := NewDB(nil, tm.Cfg.Settings)
+	result := db.PruneThreshold(Resolution10s)
+	if expected != result {
+		t.Errorf("prune threshold did not match expected value: %d != %d", expected, result)
+	}
 }

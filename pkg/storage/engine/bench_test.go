@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package engine
 
@@ -110,7 +108,7 @@ func setupMVCCData(
 		// sstables.
 		if scaled := len(order) / 20; i > 0 && (i%scaled) == 0 {
 			log.Infof(context.Background(), "committing (%d/~%d)", i/scaled, 20)
-			if err := batch.Commit(false /* !sync */); err != nil {
+			if err := batch.Commit(false /* sync */); err != nil {
 				b.Fatal(err)
 			}
 			batch.Close()
@@ -129,7 +127,7 @@ func setupMVCCData(
 			b.Fatal(err)
 		}
 	}
-	if err := batch.Commit(false /* !sync */); err != nil {
+	if err := batch.Commit(false /* sync */); err != nil {
 		b.Fatal(err)
 	}
 	batch.Close()
@@ -325,7 +323,7 @@ func runMVCCInitPut(emk engineMaker, valueSize int, b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-		if err := MVCCInitPut(context.Background(), eng, nil, key, ts, value, nil); err != nil {
+		if err := MVCCInitPut(context.Background(), eng, nil, key, ts, value, false, nil); err != nil {
 			b.Fatalf("failed put: %s", err)
 		}
 	}
@@ -347,7 +345,7 @@ func runMVCCBlindInitPut(emk engineMaker, valueSize int, b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-		if err := MVCCBlindInitPut(context.Background(), eng, nil, key, ts, value, nil); err != nil {
+		if err := MVCCBlindInitPut(context.Background(), eng, nil, key, ts, value, false, nil); err != nil {
 			b.Fatalf("failed put: %s", err)
 		}
 	}
@@ -382,7 +380,7 @@ func runMVCCBatchPut(emk engineMaker, valueSize, batchSize int, b *testing.B) {
 			}
 		}
 
-		if err := batch.Commit(false /* !sync */); err != nil {
+		if err := batch.Commit(false /* sync */); err != nil {
 			b.Fatal(err)
 		}
 
@@ -433,7 +431,7 @@ func runMVCCBatchTimeSeries(emk engineMaker, batchSize int, b *testing.B) {
 			}
 		}
 
-		if err := batch.Commit(false /* !sync */); err != nil {
+		if err := batch.Commit(false /* sync */); err != nil {
 			b.Fatal(err)
 		}
 		batch.Close()
@@ -592,6 +590,28 @@ func runMVCCComputeStats(emk engineMaker, valueBytes int, b *testing.B) {
 	log.Infof(context.Background(), "live_bytes: %d", stats.LiveBytes)
 }
 
+// runMVCCCFindSplitKey benchmarks MVCCFindSplitKey on a 64MB range of data.
+func runMVCCFindSplitKey(emk engineMaker, valueBytes int, b *testing.B) {
+	const rangeBytes = 64 * 1024 * 1024
+	numKeys := rangeBytes / (overhead + valueBytes)
+	eng, _ := setupMVCCData(emk, 1, numKeys, valueBytes, b)
+	defer eng.Close()
+
+	b.SetBytes(rangeBytes)
+	b.ResetTimer()
+
+	var err error
+	for i := 0; i < b.N; i++ {
+		_, err = MVCCFindSplitKey(context.Background(), eng, roachpb.RKeyMin,
+			roachpb.RKeyMax, rangeBytes/2, true /* allowMeta2Splits */)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.StopTimer()
+}
+
 func runBatchApplyBatchRepr(
 	emk engineMaker, writeOnly bool, valueSize, batchSize int, b *testing.B,
 ) {
@@ -626,7 +646,7 @@ func runBatchApplyBatchRepr(
 		} else {
 			batch = eng.NewBatch()
 		}
-		if err := batch.ApplyBatchRepr(repr, false /* !sync */); err != nil {
+		if err := batch.ApplyBatchRepr(repr, false /* sync */); err != nil {
 			b.Fatal(err)
 		}
 		batch.Close()
@@ -639,7 +659,7 @@ func BenchmarkMVCCPutDelete_RocksDB(b *testing.B) {
 	rocksdb := setupMVCCInMemRocksDB(b, "put_delete")
 	defer rocksdb.Close()
 
-	r := rand.New(rand.NewSource(int64(timeutil.Now().UnixNano())))
+	r := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 	value := roachpb.MakeValueFromBytes(randutil.RandBytes(r, 10))
 	var blockNum int64
 

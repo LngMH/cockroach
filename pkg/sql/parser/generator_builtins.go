@@ -11,14 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
 import (
-	"errors"
 	"fmt"
+	"sort"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 )
 
 // Table generators, also called "set-generating functions", are
@@ -58,9 +58,9 @@ type generatorFactory func(ctx *EvalContext, args Datums) (ValueGenerator, error
 // rows of values in a streaming fashion (like Go iterators or
 // generators in Python).
 type ValueGenerator interface {
-	// ColumnTypes returns the type signature of this value generator.
+	// ResolvedType returns the type signature of this value generator.
 	// Used by DTable.ResolvedType().
-	ColumnTypes() TTuple
+	ResolvedType() TTable
 
 	// Start initializes the generator. Must be called once before
 	// Next() and Values().
@@ -103,15 +103,23 @@ var Generators = map[string][]Builtin{
 	"generate_series": {
 		makeGeneratorBuiltin(
 			ArgTypes{{"start", TypeInt}, {"end", TypeInt}},
-			TTuple{TypeInt},
+			seriesValueGeneratorType,
 			makeSeriesGenerator,
 			"Produces a virtual table containing the integer values from `start` to `end`, inclusive.",
 		),
 		makeGeneratorBuiltin(
 			ArgTypes{{"start", TypeInt}, {"end", TypeInt}, {"step", TypeInt}},
-			TTuple{TypeInt},
+			seriesValueGeneratorType,
 			makeSeriesGenerator,
 			"Produces a virtual table containing the integer values from `start` to `end`, inclusive, by increment of `step`.",
+		),
+	},
+	"pg_get_keywords": {
+		makeGeneratorBuiltin(
+			ArgTypes{},
+			keywordsValueGeneratorType,
+			makeKeywordsGenerator,
+			"Produces a virtual table containing the keywords known to the SQL parser.",
 		),
 	},
 	"unnest": {
@@ -121,16 +129,28 @@ var Generators = map[string][]Builtin{
 				if len(args) == 0 {
 					return unknownReturnType
 				}
-				return TTable{Cols: TTuple{args[0].ResolvedType().(TArray).Typ}}
+				return TTable{
+					Cols:   TTuple{args[0].ResolvedType().(TArray).Typ},
+					Labels: arrayValueGeneratorLabels,
+				}
 			},
 			makeArrayGenerator,
 			"Returns the input array as a set of rows",
 		),
 	},
+	"crdb_internal.unary_table": {
+		makeGeneratorBuiltin(
+			ArgTypes{},
+			unaryValueGeneratorType,
+			makeUnaryGenerator,
+			"Produces a virtual table containing a single row with no values.\n\n"+
+				"This function is used only by CockroachDB's developers for testing purposes.",
+		),
+	},
 }
 
-func makeGeneratorBuiltin(in ArgTypes, ret TTuple, g generatorFactory, info string) Builtin {
-	return makeGeneratorBuiltinWithReturnType(in, fixedReturnType(TTable{Cols: ret}), g, info)
+func makeGeneratorBuiltin(in ArgTypes, ret TTable, g generatorFactory, info string) Builtin {
+	return makeGeneratorBuiltinWithReturnType(in, fixedReturnType(ret), g, info)
 }
 
 func makeGeneratorBuiltinWithReturnType(
@@ -153,13 +173,79 @@ func makeGeneratorBuiltinWithReturnType(
 	}
 }
 
+// keywordsValueGenerator supports the execution of pg_get_keywords().
+type keywordsValueGenerator struct {
+	curKeyword int
+}
+
+var keywordsValueGeneratorType = TTable{
+	Cols:   TTuple{TypeString, TypeString, TypeString},
+	Labels: []string{"word", "catcode", "catdesc"},
+}
+
+func makeKeywordsGenerator(_ *EvalContext, _ Datums) (ValueGenerator, error) {
+	return &keywordsValueGenerator{}, nil
+}
+
+// ResolvedType implements the ValueGenerator interface.
+func (*keywordsValueGenerator) ResolvedType() TTable { return keywordsValueGeneratorType }
+
+// Close implements the ValueGenerator interface.
+func (*keywordsValueGenerator) Close() {}
+
+// Start implements the ValueGenerator interface.
+func (k *keywordsValueGenerator) Start() error {
+	k.curKeyword = -1
+	return nil
+}
+func (k *keywordsValueGenerator) Next() (bool, error) {
+	k.curKeyword++
+	if k.curKeyword >= len(keywordNames) {
+		return false, nil
+	}
+	return true, nil
+}
+
+// Values implements the ValueGenerator interface.
+func (k *keywordsValueGenerator) Values() Datums {
+	kw := keywordNames[k.curKeyword]
+	info := keywords[kw]
+	cat := info.cat
+	desc := keywordCategoryDescriptions[cat]
+	return Datums{NewDString(kw), NewDString(cat), NewDString(desc)}
+}
+
+var keywordCategoryDescriptions = map[string]string{
+	"R": "reserved",
+	"C": "unreserved (cannot be function or type name)",
+	"T": "reserved (can be function or type name)",
+	"U": "unreserved",
+}
+
+// keywordNames contains all the keys in the `keywords` map, sorted so
+// that pg_get_keywords returns deterministic results.
+var keywordNames = func() []string {
+	ret := make([]string, 0, len(keywords))
+	for k := range keywords {
+		ret = append(ret, k)
+	}
+	sort.Strings(ret)
+	return ret
+}()
+
 // seriesValueGenerator supports the execution of generate_series()
 // with integer bounds.
 type seriesValueGenerator struct {
 	value, start, stop, step int64
+	nextOK                   bool
 }
 
-var errStepCannotBeZero = errors.New("step cannot be 0")
+var seriesValueGeneratorType = TTable{
+	Cols:   TTuple{TypeInt},
+	Labels: []string{"generate_series"},
+}
+
+var errStepCannotBeZero = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "step cannot be 0")
 
 func makeSeriesGenerator(_ *EvalContext, args Datums) (ValueGenerator, error) {
 	start := int64(MustBeDInt(args[0]))
@@ -171,11 +257,17 @@ func makeSeriesGenerator(_ *EvalContext, args Datums) (ValueGenerator, error) {
 	if step == 0 {
 		return nil, errStepCannotBeZero
 	}
-	return &seriesValueGenerator{start, start, stop, step}, nil
+	return &seriesValueGenerator{
+		value:  start,
+		start:  start,
+		stop:   stop,
+		step:   step,
+		nextOK: true,
+	}, nil
 }
 
-// ColumnTypes implements the ValueGenerator interface.
-func (s *seriesValueGenerator) ColumnTypes() TTuple { return TTuple{TypeInt} }
+// ResolvedType implements the ValueGenerator interface.
+func (*seriesValueGenerator) ResolvedType() TTable { return seriesValueGeneratorType }
 
 // Start implements the ValueGenerator interface.
 func (s *seriesValueGenerator) Start() error { return nil }
@@ -185,6 +277,9 @@ func (s *seriesValueGenerator) Close() {}
 
 // Next implements the ValueGenerator interface.
 func (s *seriesValueGenerator) Next() (bool, error) {
+	if !s.nextOK {
+		return false, nil
+	}
 	if s.step < 0 && (s.start < s.stop) {
 		return false, nil
 	}
@@ -192,7 +287,7 @@ func (s *seriesValueGenerator) Next() (bool, error) {
 		return false, nil
 	}
 	s.value = s.start
-	s.start += s.step
+	s.start, s.nextOK = addWithOverflow(s.start, s.step)
 	return true, nil
 }
 
@@ -213,8 +308,15 @@ type arrayValueGenerator struct {
 	nextIndex int
 }
 
-// ColumnTypes implements the ValueGenerator interface.
-func (s *arrayValueGenerator) ColumnTypes() TTuple { return TTuple{s.array.ParamTyp} }
+var arrayValueGeneratorLabels = []string{"unnest"}
+
+// ResolvedType implements the ValueGenerator interface.
+func (s *arrayValueGenerator) ResolvedType() TTable {
+	return TTable{
+		Cols:   TTuple{s.array.ParamTyp},
+		Labels: arrayValueGeneratorLabels,
+	}
+}
 
 // Start implements the ValueGenerator interface.
 func (s *arrayValueGenerator) Start() error {
@@ -238,3 +340,38 @@ func (s *arrayValueGenerator) Next() (bool, error) {
 func (s *arrayValueGenerator) Values() Datums {
 	return Datums{s.array.Array[s.nextIndex]}
 }
+
+// unaryValueGenerator supports the execution of crdb_internal.unary_table().
+type unaryValueGenerator struct {
+	done bool
+}
+
+var unaryValueGeneratorType = TTable{
+	Cols:   TTuple{},
+	Labels: []string{"unary_table"},
+}
+
+func makeUnaryGenerator(_ *EvalContext, args Datums) (ValueGenerator, error) {
+	return &unaryValueGenerator{}, nil
+}
+
+// ResolvedType implements the ValueGenerator interface.
+func (*unaryValueGenerator) ResolvedType() TTable { return unaryValueGeneratorType }
+
+// Start implements the ValueGenerator interface.
+func (s *unaryValueGenerator) Start() error { return nil }
+
+// Close implements the ValueGenerator interface.
+func (s *unaryValueGenerator) Close() {}
+
+// Next implements the ValueGenerator interface.
+func (s *unaryValueGenerator) Next() (bool, error) {
+	if !s.done {
+		s.done = true
+		return true, nil
+	}
+	return false, nil
+}
+
+// Values implements the ValueGenerator interface.
+func (s *unaryValueGenerator) Values() Datums { return Datums{} }

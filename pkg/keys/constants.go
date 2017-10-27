@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package keys
 
@@ -54,7 +52,7 @@ var (
 	// via the meta range addressing indexes.
 	//
 	// Some local data are not replicated, such as the store's 'ident'
-	// record. Most local data are replicated, such as abort cache
+	// record. Most local data are replicated, such as AbortSpan
 	// entries and transaction rows, but are not addressable as normal
 	// MVCC values as part of transactions. Finally, some local data are
 	// stored as MVCC values and are addressable as part of distributed
@@ -80,6 +78,10 @@ var (
 	// localStoreGossipSuffix stores gossip bootstrap metadata for this
 	// store, updated any time new gossip hosts are encountered.
 	localStoreGossipSuffix = []byte("goss")
+	// localStoreClusterVersionSuffix stores the cluster-wide version
+	// information for this store, updated any time the operator
+	// updates the minimum cluster version.
+	localStoreClusterVersionSuffix = []byte("cver")
 	// localStoreLastUpSuffix stores the last timestamp that a store's node
 	// acknowledged that it was still running. This value will be regularly
 	// refreshed on all stores for a running node; the intention of this value
@@ -92,7 +94,7 @@ var (
 	// encoded using EncodeUvarint. The specific sort of per-range
 	// metadata is identified by one of the suffixes listed below, along
 	// with potentially additional encoded key info, for instance in the
-	// case of abort cache entry.
+	// case of AbortSpan entry.
 	//
 	// NOTE: LocalRangeIDPrefix must be kept in sync with the value
 	// in storage/engine/rocksdb/db.cc.
@@ -104,10 +106,10 @@ var (
 	// same Range ID, so they can be manipulated either together or individually
 	// in a single scan.
 	localRangeIDReplicatedInfix = []byte("r")
-	// LocalAbortCacheSuffix is the suffix for abort cache entries. The
-	// abort cache protects a transaction from re-reading its own intents
+	// LocalAbortSpanSuffix is the suffix for AbortSpan entries. The
+	// AbortSpan protects a transaction from re-reading its own intents
 	// after it's been aborted.
-	LocalAbortCacheSuffix = []byte("abc-")
+	LocalAbortSpanSuffix = []byte("abc-")
 	// LocalRangeFrozenStatusSuffix is the suffix for a frozen status.
 	// No longer used; exists only to reserve the key so we don't use it.
 	LocalRangeFrozenStatusSuffix = []byte("fzn-")
@@ -198,26 +200,30 @@ var (
 	SystemPrefix = roachpb.Key{systemPrefixByte}
 	SystemMax    = roachpb.Key{systemMaxByte}
 
-	// MigrationPrefix specifies the key prefix to store all migration details.
-	MigrationPrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("system-version/")))
-
-	// MigrationKeyMax is the maximum value for any system migration key.
-	MigrationKeyMax = MigrationPrefix.PrefixEnd()
-
-	// MigrationLease is the key that nodes must take a lease on in order to run
-	// system migrations on the cluster.
-	MigrationLease = roachpb.Key(makeKey(MigrationPrefix, roachpb.RKey("lease")))
-
 	// NodeLivenessPrefix specifies the key prefix for the node liveness
 	// table.  Note that this should sort before the rest of the system
 	// keyspace in order to limit the number of ranges which must use
 	// expiration-based range leases instead of the more efficient
 	// node-liveness epoch-based range leases (see
-	// https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/range_leases.md)
+	// https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20160210_range_leases.md)
 	NodeLivenessPrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("\x00liveness-")))
 
 	// NodeLivenessKeyMax is the maximum value for any node liveness key.
 	NodeLivenessKeyMax = NodeLivenessPrefix.PrefixEnd()
+
+	// BootstrapVersion is the key at which clusters bootstrapped with a version
+	// > 1.0 persist the version at which they were bootstrapped.
+	BootstrapVersionKey = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("bootstrap-version")))
+
+	// MigrationPrefix specifies the key prefix to store all migration details.
+	MigrationPrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("system-version/")))
+
+	// MigrationLease is the key that nodes must take a lease on in order to run
+	// system migrations on the cluster.
+	MigrationLease = roachpb.Key(makeKey(MigrationPrefix, roachpb.RKey("lease")))
+
+	// MigrationKeyMax is the maximum value for any system migration key.
+	MigrationKeyMax = MigrationPrefix.PrefixEnd()
 
 	// DescIDGenerator is the global descriptor ID generator sequence used for
 	// table and namespace IDs.
@@ -244,7 +250,8 @@ var (
 
 	// SystemConfigSplitKey is the key to split at immediately prior to the
 	// system config span. NB: Split keys need to be valid column keys.
-	SystemConfigSplitKey = MakeRowSentinelKey(TableDataMin)
+	// TODO(bdarnell): this should be either roachpb.Key or RKey, not []byte.
+	SystemConfigSplitKey = []byte(TableDataMin)
 	// SystemConfigTableDataMax is the end key of system config span.
 	SystemConfigTableDataMax = roachpb.Key(MakeTablePrefix(MaxSystemConfigDescID + 1))
 
@@ -286,19 +293,22 @@ const (
 	ZonesTableID      = 5
 	SettingsTableID   = 6
 
-	// Reserved IDs for other system tables. If you're adding a new system table,
-	// it probably belongs here.
-	// NOTE: IDs must be <= MaxReservedDescID.
-	LeaseTableID      = 11
-	EventLogTableID   = 12
-	RangeEventTableID = 13
-	UITableID         = 14
-	JobsTableID       = 15
+	// IDs for the important columns and indexes in the zones table live here to
+	// avoid introducing a dependency on sql/sqlbase throughout the codebase.
+	ZonesTablePrimaryIndexID = 1
+	ZonesTableConfigColumnID = 2
 
-	// Reserved IDs used to refer to certain parts of the system ranges that
-	// come before the system config span and user table ranges.
+	// Reserved IDs for other system tables. Note that some of these IDs refer
+	// to "Ranges" instead of a Table - these IDs are needed to store custom
+	// configuration for non-table ranges (e.g. Zone Configs).
 	// NOTE: IDs must be <= MaxReservedDescID.
+	LeaseTableID       = 11
+	EventLogTableID    = 12
+	RangeEventTableID  = 13
+	UITableID          = 14
+	JobsTableID        = 15
 	MetaRangesID       = 16
 	SystemRangesID     = 17
 	TimeseriesRangesID = 18
+	WebSessionsTableID = 19
 )

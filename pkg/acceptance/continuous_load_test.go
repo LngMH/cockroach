@@ -18,7 +18,6 @@ import (
 	"flag"
 	"net/http"
 	"regexp"
-	"strconv"
 	"testing"
 	"time"
 
@@ -32,21 +31,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
-// Run tests in this file as follows:
+// Running these tests is best done using build/teamcity-nightly-
+// acceptance.sh. See instructions therein.
 //
-// make test \
-//   PKG=./pkg/acceptance \
-//   TESTTIMEOUT=6h \
-//   TESTS=ContinuousLoad_BlockWriter \
-//   TESTFLAGS='-v -remote -key-name azure -cwd terraform/azure -nodes 4 -tf.keep-cluster=failed'
-//
-// Load is generated for the duration specified by TESTTIMEOUT, minus some time
-// required for the orderly teardown of resources created by the test.  Because
-// of the time required to create and destroy a test cluster (presently up to
-// 10 minutes), you should use a TESTTIMEOUT that's at least a few hours.
-//
-// Refer to the file-level comments in acceptance/allocator_test.go for more
-// tips on running these tests.
+// These tests run for the duration specified by the testing package's timeout
+// flag, minus some time required for the orderly teardown of resources
+// created by the test. Because of the time required to create and destroy a
+// test cluster (presently up to 10 minutes), you should use a timeout of at
+// least a few hours.
 
 // continuousLoadTest generates continuous load against a remote test cluster
 // created specifically for the test.
@@ -62,12 +54,9 @@ type continuousLoadTest struct {
 	// Process must be one of the processes (e.g. block_writer) that's
 	// downloaded by the Terraform configuration.
 	Process string
-	// CockroachDiskSizeGB is the size, in gigabytes, of the disks allocated
-	// for CockroachDB nodes. Leaving this as 0 accepts the default in the
-	// Terraform configs. This must be in GB, because Terraform only accepts
-	// disk size for GCE in GB.
-	CockroachDiskSizeGB int
 }
+
+const longWaitTime = 2 * time.Minute
 
 // queryCount returns the total SQL queries executed by the cluster.
 func (cl continuousLoadTest) queryCount(f *terrafarm.Farmer) (float64, error) {
@@ -125,16 +114,16 @@ func (cl continuousLoadTest) Run(ctx context.Context, t testing.TB) {
 		}
 		f.MustDestroy(t)
 	}()
-	f.AddVars["benchmark_name"] = cl.BenchmarkPrefix + cl.shortTestTimeout()
-	if cl.CockroachDiskSizeGB != 0 {
-		f.AddVars["cockroach_disk_size"] = strconv.Itoa(cl.CockroachDiskSizeGB)
-	}
+	f.BenchmarkName = cl.BenchmarkPrefix + cl.shortTestTimeout()
+
 	if err := f.Resize(cl.NumNodes); err != nil {
 		t.Fatal(err)
 	}
-	CheckGossip(ctx, t, f, longWaitTime, HasPeers(cl.NumNodes))
+	if err := CheckGossip(ctx, f, longWaitTime, HasPeers(cl.NumNodes)); err != nil {
+		t.Fatal(err)
+	}
 	start := timeutil.Now()
-	if err := f.StartLoad(ctx, cl.Process, *flagCLTWriters); err != nil {
+	if err := f.StartLoad(ctx, cl.Process); err != nil {
 		t.Fatal(err)
 	}
 	f.Assert(ctx, t)
@@ -198,21 +187,19 @@ func (cl continuousLoadTest) shortTestTimeout() string {
 func TestContinuousLoad_BlockWriter(t *testing.T) {
 	ctx := context.Background()
 	continuousLoadTest{
-		Prefix:              "bwriter",
-		BenchmarkPrefix:     "BenchmarkBlockWriter",
-		NumNodes:            *flagNodes,
-		Process:             "block_writer",
-		CockroachDiskSizeGB: 200,
+		Prefix:          "bwriter",
+		BenchmarkPrefix: "BenchmarkBlockWriter",
+		NumNodes:        *flagNodes,
+		Process:         "block_writer",
 	}.Run(ctx, t)
 }
 
 func TestContinuousLoad_Photos(t *testing.T) {
 	ctx := context.Background()
 	continuousLoadTest{
-		Prefix:              "photos",
-		BenchmarkPrefix:     "BenchmarkPhotos",
-		NumNodes:            *flagNodes,
-		Process:             "photos",
-		CockroachDiskSizeGB: 200,
+		Prefix:          "photos",
+		BenchmarkPrefix: "BenchmarkPhotos",
+		NumNodes:        *flagNodes,
+		Process:         "photos",
 	}.Run(ctx, t)
 }

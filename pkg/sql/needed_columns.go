@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
@@ -31,9 +29,6 @@ func setNeededColumns(plan planNode, needed []bool) {
 		if n.n.As() {
 			setNeededColumns(n.sourcePlan, allColumns(n.sourcePlan))
 		}
-
-	case *createViewNode:
-		setNeededColumns(n.sourcePlan, allColumns(n.sourcePlan))
 
 	case *explainDistSQLNode:
 		setNeededColumns(n.plan, allColumns(n.plan))
@@ -189,18 +184,27 @@ func setNeededColumns(plan planNode, needed []bool) {
 		setNeededColumns(n.rows, allColumns(n.rows))
 
 	case *alterTableNode:
+	case *cancelQueryNode:
+	case *controlJobNode:
+	case *scrubNode:
 	case *copyNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
 	case *createUserNode:
+	case *createViewNode:
 	case *dropDatabaseNode:
 	case *dropIndexNode:
 	case *dropTableNode:
 	case *dropViewNode:
 	case *dropUserNode:
-	case *emptyNode:
+	case *zeroNode:
+	case *unaryNode:
 	case *hookFnNode:
 	case *valueGenerator:
+	case *setNode:
+	case *setClusterSettingNode:
+	case *setZoneConfigNode:
+	case *showZoneConfigNode:
 	case *showRangesNode:
 	case *showFingerprintsNode:
 	case *scatterNode:

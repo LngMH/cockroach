@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql_test
 
@@ -36,6 +34,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
@@ -274,12 +273,72 @@ func runBenchmarkInsert(b *testing.B, db *gosql.DB, count int) {
 
 }
 
+// runBenchmarkInsertFK benchmarks inserting count rows into a table with a
+// present foreign key into another table.
+func runBenchmarkInsertFK(b *testing.B, db *gosql.DB, count int) {
+	for _, nFks := range []int{1, 5, 10} {
+		b.Run(fmt.Sprintf("nFks=%d", nFks), func(b *testing.B) {
+			defer func() {
+				dropStmt := "DROP TABLE IF EXISTS bench.insert"
+				for i := 0; i < nFks; i++ {
+					dropStmt += fmt.Sprintf(",bench.fk%d", i)
+				}
+				if _, err := db.Exec(dropStmt); err != nil {
+					b.Fatal(err)
+				}
+			}()
+
+			for i := 0; i < nFks; i++ {
+				if _, err := db.Exec(fmt.Sprintf(`CREATE TABLE bench.fk%d (k INT PRIMARY KEY)`, i)); err != nil {
+					b.Fatal(err)
+				}
+				if _, err := db.Exec(fmt.Sprintf(`INSERT INTO bench.fk%d VALUES(1), (2), (3)`, i)); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			createStmt := `CREATE TABLE bench.insert (k INT PRIMARY KEY`
+			valuesStr := "(%d"
+			for i := 0; i < nFks; i++ {
+				createStmt += fmt.Sprintf(",fk%d INT, FOREIGN KEY(fk%d) REFERENCES bench.fk%d(k)", i, i, i)
+				valuesStr += ",1"
+			}
+			createStmt += ")"
+			valuesStr += ")"
+			if _, err := db.Exec(createStmt); err != nil {
+				b.Fatal(err)
+			}
+
+			b.ResetTimer()
+			var buf bytes.Buffer
+			val := 0
+			for i := 0; i < b.N; i++ {
+				buf.Reset()
+				buf.WriteString(`INSERT INTO bench.insert VALUES `)
+				for j := 0; j < count; j++ {
+					if j > 0 {
+						buf.WriteString(", ")
+					}
+					fmt.Fprintf(&buf, valuesStr, val)
+					val++
+				}
+				if _, err := db.Exec(buf.String()); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+
+		})
+	}
+}
+
 func BenchmarkSQL(b *testing.B) {
 	forEachDB(b, func(b *testing.B, db *gosql.DB) {
 		for _, runFn := range []func(*testing.B, *gosql.DB, int){
 			runBenchmarkDelete,
 			runBenchmarkInsert,
 			runBenchmarkInsertDistinct,
+			runBenchmarkInsertFK,
 			runBenchmarkInterleavedSelect,
 			runBenchmarkTrackChoices,
 			runBenchmarkUpdate,
@@ -946,4 +1005,70 @@ func BenchmarkWideTable(b *testing.B) {
 			}
 		})
 	})
+}
+
+// BenchmarkPlanning runs some queries on an empty table. The purpose is to
+// benchmark (and get memory allocation statistics) the planning process.
+func BenchmarkPlanning(b *testing.B) {
+	s, db, _ := serverutils.StartServer(b, base.TestServerArgs{UseDatabase: "bench"})
+	defer s.Stopper().Stop(context.TODO())
+
+	sr := sqlutils.MakeSQLRunner(b, db)
+	sr.Exec(`CREATE DATABASE bench`)
+	sr.Exec(`CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT, INDEX(b), UNIQUE INDEX(c))`)
+
+	queries := []string{
+		`SELECT * FROM abc`,
+		`SELECT * FROM abc WHERE a > 5 ORDER BY a`,
+		`SELECT * FROM abc WHERE b = 5`,
+		`SELECT * FROM abc WHERE b = 5 ORDER BY a`,
+		`SELECT * FROM abc WHERE c = 5`,
+		`SELECT * FROM abc JOIN abc AS abc2 ON abc.a = abc2.a`,
+	}
+	for _, q := range queries {
+		b.Run(q, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				sr.Exec(q)
+			}
+		})
+	}
+}
+
+// BenchmarkIndexJoin measure an index-join with 1000 rows.
+func BenchmarkIndexJoin(b *testing.B) {
+	// The table will have an extra column not contained in the index to force a
+	// join with the PK.
+	create := `
+		 CREATE TABLE tidx (
+				 k INT NOT NULL,
+				 v INT NULL,
+				 extra STRING NULL,
+				 CONSTRAINT "primary" PRIMARY KEY (k ASC),
+				 INDEX idx (v ASC),
+				 FAMILY "primary" (k, v, extra)
+		 )
+		`
+	// We'll insert 1000 rows with random values below 1000 in the index. We'll
+	// then query the index with a query that retrieves all the data (but the
+	// optimizer doesn't know that).
+	insert := "insert into tidx(k,v) select generate_series(1,1000), (random()*1000)::int"
+	s, db, _ := serverutils.StartServer(b, base.TestServerArgs{UseDatabase: "bench"})
+	defer s.Stopper().Stop(context.TODO())
+
+	if _, err := db.Exec(`CREATE DATABASE bench`); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := db.Exec(create); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := db.Exec(insert); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := db.Exec("select * from tidx where v < 1000"); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

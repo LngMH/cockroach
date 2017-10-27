@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
 
 package sql
 
@@ -74,7 +73,7 @@ func (e *Executor) recordStatementSummary(
 	stmt Statement,
 	distSQLUsed bool,
 	automaticRetryCount int,
-	result Result,
+	resultWriter StatementResult,
 	err error,
 ) {
 	phaseTimes := &planner.phaseTimes
@@ -84,11 +83,7 @@ func (e *Executor) recordStatementSummary(
 	runLatRaw := phaseTimes[plannerEndExecStmt].Sub(phaseTimes[plannerStartExecStmt])
 
 	// Collect the statistics.
-	numRows := result.RowsAffected
-	if result.Type == parser.Rows {
-		numRows = result.Rows.Len()
-	}
-
+	numRows := resultWriter.RowsAffected()
 	runLat := runLatRaw.Seconds()
 
 	parseLat := phaseTimes[sessionEndParse].

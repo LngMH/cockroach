@@ -13,8 +13,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/licenseccl"
-	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -22,7 +23,7 @@ func TestSettingAndCheckingLicense(t *testing.T) {
 	idA, _ := uuid.FromString("A0000000-0000-0000-0000-00000000000A")
 	idB, _ := uuid.FromString("B0000000-0000-0000-0000-00000000000B")
 
-	t0 := time.Unix(0, 0)
+	t0 := timeutil.Unix(0, 0)
 
 	licA, _ := licenseccl.License{
 		ClusterID:         []uuid.UUID{idA},
@@ -35,6 +36,8 @@ func TestSettingAndCheckingLicense(t *testing.T) {
 		Type:              licenseccl.License_Evaluation,
 		ValidUntilUnixSec: t0.AddDate(0, 2, 0).Unix(),
 	}.Encode()
+
+	st := cluster.MakeTestingClusterSettings()
 
 	for i, tc := range []struct {
 		lic          string
@@ -54,13 +57,14 @@ func TestSettingAndCheckingLicense(t *testing.T) {
 		// clearing an existing, invalid lic.
 		{"", idA, t0, "requires an enterprise license"},
 	} {
-		if err := (settings.Updater{}).Set("enterprise.license", tc.lic, "s"); err != nil {
+		updater := st.MakeUpdater()
+		if err := updater.Set("enterprise.license", tc.lic, "s"); err != nil {
 			t.Fatal(err)
 		}
-		err := checkEnterpriseEnabledAt(tc.checkTime, tc.checkCluster, "", "")
+		err := checkEnterpriseEnabledAt(st, tc.checkTime, tc.checkCluster, "", "")
 		if !testutils.IsError(err, tc.err) {
 			l, _ := licenseccl.Decode(tc.lic)
-			t.Fatalf("%d: lic %v, checked by %s at %s, got %q", i, l, tc.checkCluster, tc.checkTime, err)
+			t.Fatalf("%d: lic %v, update by %T, checked by %s at %s, got %q", i, l, updater, tc.checkCluster, tc.checkTime, err)
 		}
 	}
 }
@@ -70,7 +74,10 @@ func TestSettingBadLicenseStrings(t *testing.T) {
 		{"blah", "invalid license string"},
 		{"cl-0-blah", "invalid license string"},
 	} {
-		if err := (settings.Updater{}).Set("enterprise.license", tc.lic, "s"); !testutils.IsError(
+		st := cluster.MakeTestingClusterSettings()
+		u := st.MakeUpdater()
+
+		if err := u.Set("enterprise.license", tc.lic, "s"); !testutils.IsError(
 			err, tc.err,
 		) {
 			t.Fatalf("%q: expected err %q, got %v", tc.lic, tc.err, err)

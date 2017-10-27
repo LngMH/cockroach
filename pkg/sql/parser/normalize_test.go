@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
@@ -20,26 +18,7 @@ import (
 	"testing"
 
 	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
-
-func TestReNormalizeName(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	testCases := []struct {
-		in, expected string
-	}{
-		{"HELLO", "hello"},                            // Lowercase is the norm
-		{"ıİ", "ii"},                                  // Turkish/Azeri special cases
-		{"no\u0308rmalization", "n\u00f6rmalization"}, // NFD -> NFC.
-	}
-	for _, test := range testCases {
-		s := ReNormalizeName(test.in)
-		if test.expected != s {
-			t.Errorf("%s: expected %s, but found %s", test.in, test.expected, s)
-		}
-	}
-}
 
 func TestNormalizeExpr(t *testing.T) {
 	defer mockNameTypes(map[string]Type{
@@ -119,10 +98,10 @@ func TestNormalizeExpr(t *testing.T) {
 		{`NULL > SOME ARRAY[3, 2, 1]`, `NULL`},
 		{`NULL > ALL ARRAY[3, 2, 1]`, `NULL`},
 		{`4 > ALL ARRAY[3, 2, 1]`, `true`},
-		{`a > ALL ARRAY[3, 2, 1]`, `a > ALL ARRAY[3,2,1]`},
-		{`3 > ALL ARRAY[3, 2, a]`, `3 > ALL ARRAY[3, 2, a]`},
-		{`3 > ANY (ARRAY[3, 2, a])`, `3 > ANY ARRAY[3, 2, a]`},
-		{`3 > SOME (((ARRAY[3, 2, a])))`, `3 > SOME ARRAY[3, 2, a]`},
+		{`a > ALL ARRAY[3, 2, 1]`, `a > ALL (ARRAY[3,2,1])`},
+		{`3 > ALL ARRAY[3, 2, a]`, `3 > ALL (ARRAY[3, 2, a])`},
+		{`3 > ANY (ARRAY[3, 2, a])`, `3 > ANY (ARRAY[3, 2, a])`},
+		{`3 > SOME (((ARRAY[3, 2, a])))`, `3 > SOME (ARRAY[3, 2, a])`},
 		{`NULL LIKE 'a'`, `NULL`},
 		{`NULL NOT LIKE 'a'`, `NULL`},
 		{`NULL ILIKE 'a'`, `NULL`},
@@ -166,6 +145,29 @@ func TestNormalizeExpr(t *testing.T) {
 		{`IF((true OR a < 0), (0 + a)::decimal, 2 / (1 - 1))`, `a::DECIMAL`},
 		{`COALESCE(NULL, (NULL < 3), a = 2 - 1, d)`, `COALESCE(a = 1, d)`},
 		{`COALESCE(NULL, a)`, `a`},
+		{`NOT NULL`, `NULL`},
+		{`NOT d`, `NOT d`},
+		{`NOT NOT d`, `d`},
+		{`NOT NOT NOT d`, `NOT d`},
+		{`NOT NOT NOT NOT d`, `d`},
+		{`NULL IS NULL`, `true`},
+		{`NULL IS NOT NULL`, `false`},
+		{`1 IS NULL`, `false`},
+		{`1 IS NOT NULL`, `true`},
+		{`d IS NULL`, `d IS NULL`},
+		{`d IS NOT NULL`, `d IS NOT NULL`},
+		{`NULL IS TRUE`, `false`},
+		{`NULL IS NOT TRUE`, `true`},
+		{`false IS TRUE`, `false`},
+		{`false IS NOT TRUE`, `true`},
+		{`d IS TRUE`, `(d = true) AND (d IS NOT NULL)`},
+		{`d IS NOT TRUE`, `(d != true) OR (d IS NULL)`},
+		{`NULL IS FALSE`, `false`},
+		{`NULL IS NOT FALSE`, `true`},
+		{`false IS FALSE`, `true`},
+		{`false IS NOT FALSE`, `false`},
+		{`d IS FALSE`, `(d = false) AND (d IS NOT NULL)`},
+		{`d IS NOT FALSE`, `(d != false) OR (d IS NULL)`},
 		// #15454: ensure that operators are pretty-printed correctly after normalization.
 		{`(random() + 1.0)::INT`, `(random() + 1.0)::INT`},
 		{`('a' || left('b', random()::INT)) COLLATE en`, `('a' || left('b', random()::INT)) COLLATE en`},

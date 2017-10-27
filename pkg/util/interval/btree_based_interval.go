@@ -13,8 +13,6 @@
 // permissions and limitations under the License.
 //
 // This code is based on: https://github.com/google/btree
-//
-// Author: Jingguo Yao (yaojingguo@gmail.com)
 
 package interval
 
@@ -916,4 +914,9 @@ func (t *btree) Iterator() TreeIterator {
 		}
 	}
 	return &ti
+}
+
+func (t *btree) Clear() {
+	t.root = nil
+	t.length = 0
 }

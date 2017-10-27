@@ -11,23 +11,24 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package base
 
 import (
 	"crypto/tls"
-	"fmt"
 	"net/http"
 	"net/url"
 	"sync"
 	"time"
 
+	"github.com/pkg/errors"
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/pkg/errors"
 )
 
 // Base config defaults.
@@ -51,12 +52,47 @@ const (
 	// NetworkTimeout is the timeout used for network operations.
 	NetworkTimeout = 3 * time.Second
 
-	// DefaultRaftTickInterval is the default resolution of the Raft timer.
-	DefaultRaftTickInterval = 200 * time.Millisecond
-
 	// DefaultCertsDirectory is the default value for the cert directory flag.
 	DefaultCertsDirectory = "${HOME}/.cockroach-certs"
+
+	// defaultRaftTickInterval is the default resolution of the Raft timer.
+	defaultRaftTickInterval = 200 * time.Millisecond
+
+	// defaultRangeLeaseRaftElectionTimeoutMultiplier specifies what multiple the
+	// leader lease active duration should be of the raft election timeout.
+	defaultRangeLeaseRaftElectionTimeoutMultiplier = 3
+
+	// rangeLeaseRenewalFraction specifies what fraction the range lease
+	// renewal duration should be of the range lease active time. For example,
+	// with a value of 0.2 and a lease duration of 10 seconds, leases would be
+	// eagerly renewed 2 seconds into each lease.
+	rangeLeaseRenewalFraction = 0.5
+
+	// livenessRenewalFraction specifies what fraction the node liveness
+	// renewal duration should be of the node liveness duration. For example,
+	// with a value of 0.2 and a liveness duration of 10 seconds, each node's
+	// liveness record would be eagerly renewed after 2 seconds.
+	livenessRenewalFraction = 0.5
+
+	// DefaultTableDescriptorLeaseDuration is the default mean duration a
+	// lease will be acquired for. The actual duration is jittered using
+	// the jitter fraction. Jittering is done to prevent multiple leases
+	// from being renewed simultaneously if they were all acquired
+	// simultaneously.
+	DefaultTableDescriptorLeaseDuration = 5 * time.Minute
+
+	// DefaultTableDescriptorLeaseJitterFraction is the default factor
+	// that we use to randomly jitter the lease duration when acquiring a
+	// new lease and the lease renewal timeout.
+	DefaultTableDescriptorLeaseJitterFraction = 0.25
+
+	// DefaultTableDescriptorLeaseRenewalTimeout is the default time
+	// before a lease expires when acquisition to renew the lease begins.
+	DefaultTableDescriptorLeaseRenewalTimeout = time.Minute
 )
+
+var defaultRaftElectionTimeoutTicks = envutil.EnvOrDefaultInt(
+	"COCKROACH_RAFT_ELECTION_TIMEOUT_TICKS", 15)
 
 type lazyHTTPClient struct {
 	once       sync.Once
@@ -140,8 +176,11 @@ func (cfg *Config) HTTPRequestScheme() string {
 }
 
 // AdminURL returns the URL for the admin UI.
-func (cfg *Config) AdminURL() string {
-	return fmt.Sprintf("%s://%s", cfg.HTTPRequestScheme(), cfg.HTTPAddr)
+func (cfg *Config) AdminURL() *url.URL {
+	return &url.URL{
+		Scheme: cfg.HTTPRequestScheme(),
+		Host:   cfg.HTTPAddr,
+	}
 }
 
 // GetClientCertPaths returns the paths to the client cert and key.
@@ -189,6 +228,7 @@ func (cfg *Config) PGURL(user *url.Userinfo) (*url.URL, error) {
 			options.Add("sslkey", keyPath)
 		}
 	}
+	options.Add("application_name", "cockroach")
 
 	return &url.URL{
 		Scheme:   "postgresql",
@@ -281,13 +321,80 @@ func (cfg *Config) GetServerTLSConfig() (*tls.Config, error) {
 // if needed. It uses the client TLS config.
 func (cfg *Config) GetHTTPClient() (http.Client, error) {
 	cfg.httpClient.once.Do(func() {
-		cfg.httpClient.httpClient.Timeout = NetworkTimeout
+		cfg.httpClient.httpClient.Timeout = 10 * time.Second
 		var transport http.Transport
 		cfg.httpClient.httpClient.Transport = &transport
 		transport.TLSClientConfig, cfg.httpClient.err = cfg.GetClientTLSConfig()
 	})
 
 	return cfg.httpClient.httpClient, cfg.httpClient.err
+}
+
+// RaftConfig holds raft tuning parameters.
+type RaftConfig struct {
+	// RaftTickInterval is the resolution of the Raft timer.
+	RaftTickInterval time.Duration
+
+	// RaftElectionTimeoutTicks is the number of raft ticks before the
+	// previous election expires. This value is inherited by individual stores
+	// unless overridden.
+	RaftElectionTimeoutTicks int
+
+	// RangeLeaseRaftElectionTimeoutMultiplier specifies what multiple the leader
+	// lease active duration should be of the raft election timeout.
+	RangeLeaseRaftElectionTimeoutMultiplier float64
+}
+
+// SetDefaults initializes unset fields.
+func (cfg *RaftConfig) SetDefaults() {
+	if cfg.RaftTickInterval == 0 {
+		cfg.RaftTickInterval = defaultRaftTickInterval
+	}
+	if cfg.RaftElectionTimeoutTicks == 0 {
+		cfg.RaftElectionTimeoutTicks = defaultRaftElectionTimeoutTicks
+	}
+	if cfg.RangeLeaseRaftElectionTimeoutMultiplier == 0 {
+		cfg.RangeLeaseRaftElectionTimeoutMultiplier = defaultRangeLeaseRaftElectionTimeoutMultiplier
+	}
+}
+
+// RaftElectionTimeout returns the raft election timeout, as computed from the
+// tick interval and number of election timeout ticks.
+func (cfg RaftConfig) RaftElectionTimeout() time.Duration {
+	return time.Duration(cfg.RaftElectionTimeoutTicks) * cfg.RaftTickInterval
+}
+
+// RangeLeaseDurations computes durations for range lease expiration and
+// renewal based on a default multiple of Raft election timeout.
+func (cfg RaftConfig) RangeLeaseDurations() (rangeLeaseActive, rangeLeaseRenewal time.Duration) {
+	rangeLeaseActive = time.Duration(cfg.RangeLeaseRaftElectionTimeoutMultiplier *
+		float64(cfg.RaftElectionTimeout()))
+	rangeLeaseRenewal = time.Duration(float64(rangeLeaseActive) * rangeLeaseRenewalFraction)
+	return
+}
+
+// RangeLeaseActiveDuration is the duration of the active period of leader
+// leases requested.
+func (cfg RaftConfig) RangeLeaseActiveDuration() time.Duration {
+	rangeLeaseActive, _ := cfg.RangeLeaseDurations()
+	return rangeLeaseActive
+}
+
+// RangeLeaseRenewalDuration specifies a time interval at the end of the
+// active lease interval (i.e. bounded to the right by the start of the stasis
+// period) during which operations will trigger an asynchronous renewal of the
+// lease.
+func (cfg RaftConfig) RangeLeaseRenewalDuration() time.Duration {
+	_, rangeLeaseRenewal := cfg.RangeLeaseDurations()
+	return rangeLeaseRenewal
+}
+
+// NodeLivenessDurations computes durations for node liveness expiration and
+// renewal based on a default multiple of Raft election timeout.
+func (cfg RaftConfig) NodeLivenessDurations() (livenessActive, livenessRenewal time.Duration) {
+	livenessActive = cfg.RangeLeaseActiveDuration()
+	livenessRenewal = time.Duration(float64(livenessActive) * livenessRenewalFraction)
+	return
 }
 
 // DefaultRetryOptions should be used for retrying most
@@ -300,5 +407,92 @@ func DefaultRetryOptions() retry.Options {
 		InitialBackoff: 50 * time.Millisecond,
 		MaxBackoff:     1 * time.Second,
 		Multiplier:     2,
+	}
+}
+
+const (
+	// DefaultTempStorageMaxSizeBytes is the default maximum budget
+	// for temp storage.
+	DefaultTempStorageMaxSizeBytes = 32 * 1024 * 1024 * 1024 /* 32GB */
+	// DefaultInMemTempStorageMaxSizeBytes is the default maximum budget
+	// for in-memory temp storages.
+	DefaultInMemTempStorageMaxSizeBytes = 100 * 1024 * 1024 /* 100MB */
+)
+
+// TempStorageConfig contains the details that can be specified in the cli
+// pertaining to temp storage flags, specifically --temp-dir and
+// --max-disk-temp-storage.
+type TempStorageConfig struct {
+	// InMemory specifies whether the temporary storage will remain
+	// in-memory or occupy a temporary subdirectory on-disk.
+	InMemory bool
+	// Path is the filepath of the temporary subdirectory created for
+	// the temp storage.
+	Path string
+	// Mon will be used by the temp storage to register all its capacity requests.
+	// It can be used to limit the disk or memory that temp storage is allowed to
+	// use. If InMemory is set, than this has to be a memory monitor; otherwise it
+	// has to be a disk monitor.
+	Mon *mon.BytesMonitor
+}
+
+// TempStorageConfigFromEnv creates a TempStorageConfig.
+// If parentDir is not specified and the specified store is in-memory,
+// then the temp storage will also be in-memory.
+func TempStorageConfigFromEnv(
+	ctx context.Context, firstStore StoreSpec, parentDir string, maxSizeBytes int64,
+) TempStorageConfig {
+	inMem := parentDir == "" && firstStore.InMemory
+	var monitor mon.BytesMonitor
+	if inMem {
+		monitor = mon.MakeMonitor(
+			"in-mem temp storage",
+			mon.MemoryResource,
+			nil,             /* curCount */
+			nil,             /* maxHist */
+			1024*1024,       /* increment */
+			maxSizeBytes/10, /* noteworthy */
+		)
+		monitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
+	} else {
+		monitor = mon.MakeMonitor(
+			"temp disk storage",
+			mon.DiskResource,
+			nil,             /* curCount */
+			nil,             /* maxHist */
+			64*1024*1024,    /* increment */
+			maxSizeBytes/10, /* noteworthy */
+		)
+		monitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
+	}
+
+	return TempStorageConfig{
+		InMemory: inMem,
+		Mon:      &monitor,
+	}
+}
+
+// LeaseManagerConfig holds table lease manager parameters.
+type LeaseManagerConfig struct {
+	// TableDescriptorLeaseDuration is the mean duration a lease will be
+	// acquired for.
+	TableDescriptorLeaseDuration time.Duration
+
+	// TableDescriptorLeaseJitterFraction is the factor that we use to
+	// randomly jitter the lease duration when acquiring a new lease and
+	// the lease renewal timeout.
+	TableDescriptorLeaseJitterFraction float64
+
+	// DefaultTableDescriptorLeaseRenewalTimeout is the default time
+	// before a lease expires when acquisition to renew the lease begins.
+	TableDescriptorLeaseRenewalTimeout time.Duration
+}
+
+// NewLeaseManagerConfig initializes a LeaseManagerConfig with default values.
+func NewLeaseManagerConfig() *LeaseManagerConfig {
+	return &LeaseManagerConfig{
+		TableDescriptorLeaseDuration:       DefaultTableDescriptorLeaseDuration,
+		TableDescriptorLeaseJitterFraction: DefaultTableDescriptorLeaseJitterFraction,
+		TableDescriptorLeaseRenewalTimeout: DefaultTableDescriptorLeaseRenewalTimeout,
 	}
 }

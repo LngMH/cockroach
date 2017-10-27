@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package security_test
 
@@ -214,8 +212,12 @@ func TestUseCerts(t *testing.T) {
 
 	// Start a test server and override certs.
 	// We use a real context since we want generated certs.
+	// Web session authentication is disabled in order to avoid the need to
+	// authenticate the individual clients being instantiated (session auth has
+	// no effect on what is being tested here).
 	params := base.TestServerArgs{
-		SSLCertsDir: certsDir,
+		SSLCertsDir:                     certsDir,
+		DisableWebSessionAuthentication: true,
 	}
 	s, _, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())

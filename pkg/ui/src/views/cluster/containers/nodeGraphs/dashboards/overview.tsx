@@ -1,6 +1,7 @@
 import React from "react";
 import _ from "lodash";
 
+import docsURL from "src/util/docs";
 import { LineGraph } from "src/views/cluster/components/linegraph";
 import { Metric, Axis, AxisUnits } from "src/views/shared/components/metricQuery";
 
@@ -14,8 +15,8 @@ export default function (props: GraphDashboardProps) {
       title="SQL Queries"
       sources={nodeSources}
       tooltip={
-        `The average number of SELECT, INSERT, UPDATE,
-           and DELETE statements per second ${tooltipSelection}.`
+        `A ten-second moving average of the # of SELECT, INSERT, UPDATE, and DELETE operations
+        started per second ${tooltipSelection}.`
       }
     >
       <Axis>
@@ -87,7 +88,7 @@ export default function (props: GraphDashboardProps) {
                 Control this value per node with the
                   <code>
                   <a
-                    href="https://www.cockroachlabs.com/docs/stable/start-a-node.html#flags"
+                    href={docsURL("start-a-node.html#flags")}
                     target="_blank"
                   >
                     --store
@@ -98,19 +99,16 @@ export default function (props: GraphDashboardProps) {
             </dd>
             <dt>Available</dt>
             <dd>Free disk space available {tooltipSelection} to CockroachDB.</dd>
+            <dt>Used</dt>
+            <dd>Disk space used {tooltipSelection} by CockroachDB.</dd>
           </dl>
         </div>
       )}
     >
       <Axis units={AxisUnits.Bytes}>
         <Metric name="cr.store.capacity" title="Capacity" />
-        {
-          // TODO(mrtracy): We really want to display a used capacity
-          // stat, but that is not directly recorded. We either need to
-          // start directly recording it, or add the ability to create
-          // derived series.
-        }
         <Metric name="cr.store.capacity.available" title="Available" />
+        <Metric name="cr.store.capacity.used" title="Used" />
       </Axis>
     </LineGraph>,
 

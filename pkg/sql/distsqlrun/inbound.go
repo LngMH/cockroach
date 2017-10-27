@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
@@ -21,6 +19,7 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
@@ -30,10 +29,14 @@ import (
 // already received (because the first message contains the flow and stream IDs,
 // it needs to be received before we can get here).
 func ProcessInboundStream(
-	ctx context.Context, stream DistSQL_FlowStreamServer, firstMsg *ProducerMessage, dst RowReceiver,
+	ctx context.Context,
+	stream DistSQL_FlowStreamServer,
+	firstMsg *ProducerMessage,
+	dst RowReceiver,
+	f *Flow,
 ) error {
 
-	err := processInboundStreamHelper(ctx, stream, firstMsg, dst)
+	err := processInboundStreamHelper(ctx, stream, firstMsg, dst, f)
 
 	// err, if set, will also be propagated to the producer
 	// as the last record that the producer gets.
@@ -51,7 +54,11 @@ func ProcessInboundStream(
 }
 
 func processInboundStreamHelper(
-	ctx context.Context, stream DistSQL_FlowStreamServer, firstMsg *ProducerMessage, dst RowReceiver,
+	ctx context.Context,
+	stream DistSQL_FlowStreamServer,
+	firstMsg *ProducerMessage,
+	dst RowReceiver,
+	f *Flow,
 ) error {
 	var finalErr error
 	draining := false
@@ -62,6 +69,14 @@ func processInboundStreamHelper(
 			msg = firstMsg
 			firstMsg = nil
 		} else {
+			// Check for context cancellation before recv()ing the next message.
+			select {
+			case <-f.ctx.Done():
+				// This will error out the FlowStream(), and also cancel
+				// the flow context on the producer.
+				return sqlbase.NewQueryCanceledError()
+			default:
+			}
 			var err error
 			msg, err = stream.Recv()
 			if err != nil {
@@ -79,6 +94,7 @@ func processInboundStreamHelper(
 		if err != nil {
 			return errors.Wrap(err, log.MakeMessage(ctx, "decoding error", nil /* args */))
 		}
+		var types []sqlbase.ColumnType
 		for {
 			row, meta, err := sd.GetRow(nil /* rowBuf */)
 			if err != nil {
@@ -90,7 +106,10 @@ func processInboundStreamHelper(
 			}
 
 			if log.V(3) {
-				log.Infof(ctx, "inbound stream pushing row %s", row)
+				if types == nil {
+					types = sd.Types()
+				}
+				log.Infof(ctx, "inbound stream pushing row %s", row.String(types))
 			}
 			if draining && meta.Empty() {
 				// Don't forward data rows when we're draining.

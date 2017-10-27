@@ -12,8 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package storage
 
@@ -28,6 +26,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+)
+
+// RangeLogEventReason specifies the reason why a range-log event happened.
+type RangeLogEventReason string
+
+// The set of possible reasons for range events to happen.
+const (
+	ReasonUnknown              RangeLogEventReason = ""
+	ReasonRangeUnderReplicated RangeLogEventReason = "range under-replicated"
+	ReasonRangeOverReplicated  RangeLogEventReason = "range over-replicated"
+	ReasonStoreDead            RangeLogEventReason = "store dead"
+	ReasonStoreDecommissioning RangeLogEventReason = "store decommissioning"
+	ReasonRebalance            RangeLogEventReason = "rebalance"
+	ReasonAdminRequest         RangeLogEventReason = "admin request"
 )
 
 func (s *Store) insertRangeLogEvent(
@@ -45,7 +57,7 @@ func (s *Store) insertRangeLogEvent(
 
 	const insertEventTableStmt = `
 INSERT INTO system.rangelog (
-  timestamp, rangeID, storeID, eventType, otherRangeID, info
+  timestamp, "rangeID", "storeID", "eventType", "otherRangeID", info
 )
 VALUES(
   $1, $2, $3, $4, $5, $6
@@ -126,6 +138,8 @@ func (s *Store) logChange(
 	changeType roachpb.ReplicaChangeType,
 	replica roachpb.ReplicaDescriptor,
 	desc roachpb.RangeDescriptor,
+	reason RangeLogEventReason,
+	details string,
 ) error {
 	if !s.cfg.LogRangeEvents {
 		return nil
@@ -139,12 +153,16 @@ func (s *Store) logChange(
 		info = RangeLogEvent_Info{
 			AddedReplica: &replica,
 			UpdatedDesc:  &desc,
+			Reason:       reason,
+			Details:      details,
 		}
 	case roachpb.REMOVE_REPLICA:
 		logType = RangeLogEventType_remove
 		info = RangeLogEvent_Info{
 			RemovedReplica: &replica,
 			UpdatedDesc:    &desc,
+			Reason:         reason,
+			Details:        details,
 		}
 	default:
 		return errors.Errorf("unknown replica change type %s", changeType)

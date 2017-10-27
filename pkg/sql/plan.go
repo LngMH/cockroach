@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
@@ -70,6 +68,16 @@ type planMaker interface {
 
 var _ planMaker = &planner{}
 
+// runParams is a struct containing all parameters passed to planNode.Next() and
+// planNode.Start().
+type runParams struct {
+	// context.Context for this method call.
+	ctx context.Context
+
+	// planner associated with this planNode.
+	p *planner
+}
+
 // planNode defines the interface for executing a query or portion of a query.
 //
 // The following methods apply to planNodes and contain special cases
@@ -95,17 +103,17 @@ type planNode interface {
 	// Note: Don't use directly. Use startPlan() instead.
 	//
 	// Available after optimizePlan() (or makePlan).
-	Start(ctx context.Context) error
+	Start(params runParams) error
 
 	// Next performs one unit of work, returning false if an error is
 	// encountered or if there is no more work to do. For statements
 	// that return a result set, the Values() method will return one row
 	// of results each time that Next() returns true.
-	// See executor.go: countRowsAffected() and execStmt() for an example.
+	// See executor.go: forEachRow() for an example.
 	//
 	// Available after Start(). It is illegal to call Next() after it returns
 	// false.
-	Next(ctx context.Context) (bool, error)
+	Next(params runParams) (bool, error)
 
 	// Values returns the values at the current row. The result is only valid
 	// until the next call to Next().
@@ -142,7 +150,8 @@ var _ planNode = &dropDatabaseNode{}
 var _ planNode = &dropIndexNode{}
 var _ planNode = &dropTableNode{}
 var _ planNode = &dropViewNode{}
-var _ planNode = &emptyNode{}
+var _ planNode = &zeroNode{}
+var _ planNode = &unaryNode{}
 var _ planNode = &explainDistSQLNode{}
 var _ planNode = &explainPlanNode{}
 var _ planNode = &traceNode{}
@@ -192,6 +201,9 @@ func (p *planner) makePlan(ctx context.Context, stmt Statement) (planNode, error
 	needed := allColumns(plan)
 	plan, err = p.optimizePlan(ctx, plan, needed)
 	if err != nil {
+		// Once the plan has undergone optimization, it may contain
+		// monitor-registered memory, even in case of error.
+		plan.Close(ctx)
 		return nil, err
 	}
 
@@ -206,7 +218,11 @@ func (p *planner) startPlan(ctx context.Context, plan planNode) error {
 	if err := p.startSubqueryPlans(ctx, plan); err != nil {
 		return err
 	}
-	if err := plan.Start(ctx); err != nil {
+	params := runParams{
+		ctx: ctx,
+		p:   p,
+	}
+	if err := plan.Start(params); err != nil {
 		return err
 	}
 	// Trigger limit propagation through the plan and sub-queries.
@@ -316,6 +332,8 @@ func (p *planner) newPlan(
 		return p.CancelQuery(ctx, n)
 	case *parser.CancelJob:
 		return p.CancelJob(ctx, n)
+	case *parser.Scrub:
+		return p.Scrub(ctx, n)
 	case CopyDataBlock:
 		return p.CopyData(ctx, n)
 	case *parser.CopyFrom:
@@ -352,8 +370,6 @@ func (p *planner) newPlan(
 		return p.Explain(ctx, n)
 	case *parser.Grant:
 		return p.Grant(ctx, n)
-	case *parser.Help:
-		return p.Help(ctx, n)
 	case *parser.Insert:
 		return p.Insert(ctx, n, desiredTypes)
 	case *parser.ParenSelect:
@@ -380,14 +396,20 @@ func (p *planner) newPlan(
 		return p.Select(ctx, n, desiredTypes)
 	case *parser.SelectClause:
 		return p.SelectClause(ctx, n, nil, nil, desiredTypes, publicColumns)
-	case *parser.Set:
-		return p.Set(ctx, n)
+	case *parser.SetClusterSetting:
+		return p.SetClusterSetting(ctx, n)
+	case *parser.SetZoneConfig:
+		return p.SetZoneConfig(ctx, n)
+	case *parser.SetVar:
+		return p.SetVar(ctx, n)
 	case *parser.SetTransaction:
 		return p.SetTransaction(n)
 	case *parser.SetDefaultIsolation:
 		return p.SetDefaultIsolation(n)
-	case *parser.Show:
-		return p.Show(ctx, n)
+	case *parser.ShowClusterSetting:
+		return p.ShowClusterSetting(ctx, n)
+	case *parser.ShowVar:
+		return p.ShowVar(ctx, n)
 	case *parser.ShowColumns:
 		return p.ShowColumns(ctx, n)
 	case *parser.ShowConstraints:
@@ -416,6 +438,8 @@ func (p *planner) newPlan(
 		return p.ShowTransactionStatus(ctx)
 	case *parser.ShowUsers:
 		return p.ShowUsers(ctx, n)
+	case *parser.ShowZoneConfig:
+		return p.ShowZoneConfig(ctx, n)
 	case *parser.ShowRanges:
 		return p.ShowRanges(ctx, n)
 	case *parser.ShowFingerprints:
@@ -423,6 +447,9 @@ func (p *planner) newPlan(
 	case *parser.Split:
 		return p.Split(ctx, n)
 	case *parser.Truncate:
+		if err := p.txn.SetSystemConfigTrigger(); err != nil {
+			return nil, err
+		}
 		return p.Truncate(ctx, n)
 	case *parser.UnionClause:
 		return p.UnionClause(ctx, n, desiredTypes)
@@ -445,20 +472,32 @@ func (p *planner) prepare(ctx context.Context, stmt parser.Statement) (planNode,
 	}
 
 	switch n := stmt.(type) {
+	case *parser.CancelQuery:
+		return p.CancelQuery(ctx, n)
+	case *parser.CancelJob:
+		return p.CancelJob(ctx, n)
 	case *parser.Delete:
 		return p.Delete(ctx, n, nil)
 	case *parser.Explain:
 		return p.Explain(ctx, n)
-	case *parser.Help:
-		return p.Help(ctx, n)
 	case *parser.Insert:
 		return p.Insert(ctx, n, nil)
+	case *parser.PauseJob:
+		return p.PauseJob(ctx, n)
+	case *parser.ResumeJob:
+		return p.ResumeJob(ctx, n)
 	case *parser.Select:
 		return p.Select(ctx, n, nil)
 	case *parser.SelectClause:
 		return p.SelectClause(ctx, n, nil, nil, nil, publicColumns)
-	case *parser.Show:
-		return p.Show(ctx, n)
+	case *parser.SetClusterSetting:
+		return p.SetClusterSetting(ctx, n)
+	case *parser.SetVar:
+		return p.SetVar(ctx, n)
+	case *parser.ShowClusterSetting:
+		return p.ShowClusterSetting(ctx, n)
+	case *parser.ShowVar:
+		return p.ShowVar(ctx, n)
 	case *parser.ShowCreateTable:
 		return p.ShowCreateTable(ctx, n)
 	case *parser.ShowCreateView:

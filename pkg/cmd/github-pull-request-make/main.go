@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 // This utility detects new tests added in a given pull request, and runs them
 // under stress in our CI infrastructure.
@@ -28,7 +26,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"fmt"
 	"go/build"
 	"io"
@@ -41,6 +38,7 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 
 	"github.com/google/go-github/github"
@@ -116,15 +114,42 @@ func pkgsFromDiff(r io.Reader) (map[string]pkg, error) {
 		case bytes.HasPrefix(line, []byte{'-'}) && bytes.Contains(line, []byte(".Skip")):
 			switch {
 			case len(curTestName) > 0:
-				curPkg := pkgs[curPkgName]
-				curPkg.tests = append(curPkg.tests, curTestName)
-				pkgs[curPkgName] = curPkg
+				if !(curPkgName == "build" && curTestName == "TestStyle") {
+					curPkg := pkgs[curPkgName]
+					curPkg.tests = append(curPkg.tests, curTestName)
+					pkgs[curPkgName] = curPkg
+				}
 			case len(curBenchmarkName) > 0:
 				curPkg := pkgs[curPkgName]
 				curPkg.benchmarks = append(curPkg.benchmarks, curBenchmarkName)
 				pkgs[curPkgName] = curPkg
 			}
 		}
+	}
+}
+
+func findPullRequest(
+	ctx context.Context, client *github.Client, org, repo, sha string,
+) *github.PullRequest {
+	opts := &github.PullRequestListOptions{
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	for {
+		pulls, resp, err := client.PullRequests.List(ctx, org, repo, opts)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		for _, pull := range pulls {
+			if *pull.Head.SHA == sha {
+				return pull
+			}
+		}
+
+		if resp.NextPage == 0 {
+			return nil
+		}
+		opts.Page = resp.NextPage
 	}
 }
 
@@ -159,17 +184,7 @@ func main() {
 	}
 	client := github.NewClient(httpClient)
 
-	pulls, _, err := client.PullRequests.List(ctx, org, repo, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	var currentPull *github.PullRequest
-	for _, pull := range pulls {
-		if *pull.Head.SHA == sha {
-			currentPull = pull
-			break
-		}
-	}
+	currentPull := findPullRequest(ctx, client, org, repo, sha)
 	if currentPull == nil {
 		log.Printf("SHA %s not found in open pull requests, skipping stress", sha)
 		return
@@ -195,7 +210,7 @@ func main() {
 			}
 		}
 		if vendorChanged {
-			cmd := exec.Command("dep", "ensure")
+			cmd := exec.Command("dep", "ensure", "-v")
 			cmd.Dir = crdb.Dir
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
@@ -205,15 +220,20 @@ func main() {
 			}
 
 			// Check for diffs.
-			for _, dir := range []string{crdb.Dir, filepath.Join(crdb.Dir, "vendor")} {
+			var foundDiff bool
+			for _, dir := range []string{filepath.Join(crdb.Dir, "vendor"), crdb.Dir} {
 				cmd := exec.Command("git", "diff")
 				cmd.Dir = dir
-				log.Println(cmd.Args)
-				if output, err := cmd.Output(); err != nil {
-					log.Fatal(err)
+				log.Println(cmd.Dir, cmd.Args)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					log.Fatal(err, output)
 				} else if len(output) > 0 {
-					log.Fatalf("unexpected diff:\n%s", output)
+					foundDiff = true
+					log.Printf("unexpected diff:\n%s", output)
 				}
+			}
+			if foundDiff {
+				os.Exit(1)
 			}
 		}
 	} else {
@@ -237,6 +257,7 @@ func main() {
 					fmt.Sprintf("TESTS=%s", tests),
 					fmt.Sprintf("STRESSFLAGS=-stderr -maxfails 1 -maxtime %s", duration),
 				)
+				cmd.Env = append(os.Environ(), "COCKROACH_NIGHTLY_STRESS=true")
 				cmd.Dir = crdb.Dir
 				cmd.Stdout = os.Stdout
 				cmd.Stderr = os.Stderr

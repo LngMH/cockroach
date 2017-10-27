@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package sqlbase
 
@@ -123,6 +121,25 @@ CREATE TABLE system.jobs (
 	INDEX (status, created),
 	FAMILY (id, status, created, payload)
 );`
+
+	// web_sessions are used to track authenticated user actions over stateless
+	// connections, such as the cookie-based authentication used by the Admin
+	// UI.
+	// Design outlined in /docs/RFCS/web_session_login.rfc
+	WebSessionsTableSchema = `
+CREATE TABLE system.web_sessions (
+	id             SERIAL     PRIMARY KEY,
+	"hashedSecret" BYTES      NOT NULL,
+	username       STRING     NOT NULL,
+	"createdAt"    TIMESTAMP  NOT NULL DEFAULT now(),
+	"expiresAt"    TIMESTAMP  NOT NULL,
+	"revokedAt"    TIMESTAMP,
+	"lastUsedAt"   TIMESTAMP  NOT NULL DEFAULT now(),
+	"auditInfo"    STRING,
+	INDEX("expiresAt"),
+	INDEX("createdAt"),
+	FAMILY(id, "hashedSecret", username, "createdAt", "expiresAt", "revokedAt", "lastUsedAt", "auditInfo")
+);`
 )
 
 func pk(name string) IndexDescriptor {
@@ -174,7 +191,8 @@ var SystemAllowedPrivileges = map[ID]privilege.Lists{
 	// users will be able to modify system tables' schemas at will. CREATE and
 	// DROP privileges are allowed on the above system tables for backwards
 	// compatibility reasons only!
-	keys.JobsTableID: {privilege.ReadWriteData},
+	keys.JobsTableID:        {privilege.ReadWriteData},
+	keys.WebSessionsTableID: {privilege.ReadWriteData},
 }
 
 // SystemDesiredPrivileges returns the desired privilege list (i.e., the
@@ -295,14 +313,21 @@ var (
 		Version:  1,
 		Columns: []ColumnDescriptor{
 			{Name: "id", ID: 1, Type: colTypeInt},
-			{Name: "config", ID: 2, Type: colTypeBytes, Nullable: true},
+			{Name: "config", ID: keys.ZonesTableConfigColumnID, Type: colTypeBytes, Nullable: true},
 		},
 		NextColumnID: 3,
 		Families: []ColumnFamilyDescriptor{
 			{Name: "primary", ID: 0, ColumnNames: []string{"id"}, ColumnIDs: singleID1},
 			{Name: "fam_2_config", ID: 2, ColumnNames: []string{"config"}, ColumnIDs: []ColumnID{2}, DefaultColumnID: 2},
 		},
-		PrimaryIndex:   pk("id"),
+		PrimaryIndex: IndexDescriptor{
+			Name:             "primary",
+			ID:               keys.ZonesTablePrimaryIndexID,
+			Unique:           true,
+			ColumnNames:      []string{"id"},
+			ColumnDirections: singleASC,
+			ColumnIDs:        []ColumnID{keys.ZonesTablePrimaryIndexID},
+		},
 		NextFamilyID:   3,
 		NextIndexID:    2,
 		Privileges:     NewPrivilegeDescriptor(security.RootUser, SystemDesiredPrivileges(keys.ZonesTableID)),
@@ -522,6 +547,72 @@ var (
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
+
+	// WebSessions table to authenticate sessions over stateless connections.
+	WebSessionsTable = TableDescriptor{
+		Name:     "web_sessions",
+		ID:       19,
+		ParentID: 1,
+		Version:  1,
+		Columns: []ColumnDescriptor{
+			{Name: "id", ID: 1, Type: colTypeInt, DefaultExpr: &uniqueRowIDString},
+			{Name: "hashedSecret", ID: 2, Type: colTypeBytes},
+			{Name: "username", ID: 3, Type: colTypeString},
+			{Name: "createdAt", ID: 4, Type: colTypeTimestamp, DefaultExpr: &nowString},
+			{Name: "expiresAt", ID: 5, Type: colTypeTimestamp},
+			{Name: "revokedAt", ID: 6, Type: colTypeTimestamp, Nullable: true},
+			{Name: "lastUsedAt", ID: 7, Type: colTypeTimestamp, DefaultExpr: &nowString},
+			{Name: "auditInfo", ID: 8, Type: colTypeString, Nullable: true},
+		},
+		NextColumnID: 9,
+		Families: []ColumnFamilyDescriptor{
+			{
+				Name: "fam_0_id_hashedSecret_username_createdAt_expiresAt_revokedAt_lastUsedAt_auditInfo",
+				ID:   0,
+				ColumnNames: []string{
+					"id",
+					"hashedSecret",
+					"username",
+					"createdAt",
+					"expiresAt",
+					"revokedAt",
+					"lastUsedAt",
+					"auditInfo",
+				},
+				ColumnIDs: []ColumnID{1, 2, 3, 4, 5, 6, 7, 8},
+			},
+		},
+		NextFamilyID: 1,
+		PrimaryIndex: pk("id"),
+		Indexes: []IndexDescriptor{
+			{
+				Name:             "web_sessions_expiresAt_idx",
+				ID:               2,
+				Unique:           false,
+				ColumnNames:      []string{"expiresAt"},
+				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+				ColumnIDs:        []ColumnID{5},
+				ExtraColumnIDs:   []ColumnID{1},
+			},
+			{
+				Name:             "web_sessions_createdAt_idx",
+				ID:               3,
+				Unique:           false,
+				ColumnNames:      []string{"createdAt"},
+				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+				ColumnIDs:        []ColumnID{4},
+				ExtraColumnIDs:   []ColumnID{1},
+			},
+		},
+		NextIndexID: 4,
+		Privileges: &PrivilegeDescriptor{
+			Users: []UserPrivileges{
+				{User: "root", Privileges: 0x1f0},
+			},
+		},
+		NextMutationID: 1,
+		FormatVersion:  3,
+	}
 )
 
 // Create the key/value pair for the default zone config entry.
@@ -532,7 +623,7 @@ func createDefaultZoneConfig() roachpb.KeyValue {
 		panic(fmt.Sprintf("could not marshal DefaultZoneConfig: %s", err))
 	}
 	return roachpb.KeyValue{
-		Key:   MakeZoneKey(keys.RootNamespaceID),
+		Key:   config.MakeZoneKey(uint32(keys.RootNamespaceID)),
 		Value: value,
 	}
 }

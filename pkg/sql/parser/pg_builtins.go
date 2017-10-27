@@ -11,14 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Jordan Lewis (jordan@cockroachlabs.com)
 
 package parser
 
 import (
-	"errors"
 	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 
 	"github.com/lib/pq/oid"
 )
@@ -38,6 +37,7 @@ var typeBuiltinsHaveUnderscore = map[oid.Oid]struct{}{
 	TypeDate.Oid():        {},
 	TypeDecimal.Oid():     {},
 	TypeInterval.Oid():    {},
+	TypeJSON.Oid():        {},
 	TypeUUID.Oid():        {},
 	TypeTimestamp.Oid():   {},
 	TypeTimestampTZ.Oid(): {},
@@ -81,13 +81,17 @@ func initPGBuiltins() {
 	}
 }
 
+var errUnimplemented = pgerror.NewError(pgerror.CodeFeatureNotSupportedError, "unimplemented")
+
 func makeTypeIOBuiltin(argTypes typeList, returnType Type) []Builtin {
 	return []Builtin{
 		{
 			Types:      argTypes,
 			ReturnType: fixedReturnType(returnType),
-			fn:         func(_ *EvalContext, _ Datums) (Datum, error) { return nil, errors.New("unimplemented") },
-			Info:       notUsableInfo,
+			fn: func(_ *EvalContext, _ Datums) (Datum, error) {
+				return nil, errUnimplemented
+			},
+			Info: notUsableInfo,
 		},
 	}
 }
@@ -111,6 +115,39 @@ func makeTypeIOBuiltins(builtinPrefix string, typ Type) map[string][]Builtin {
 	}
 }
 
+// http://doxygen.postgresql.org/pg__wchar_8h.html#a22e0c8b9f59f6e226a5968620b4bb6a9aac3b065b882d3231ba59297524da2f23
+var (
+	// DatEncodingUTFId is the encoding ID for our only supported database
+	// encoding, UTF8.
+	DatEncodingUTFId = NewDInt(6)
+	// DatEncodingEnUTF8 is the encoding name for our only supported database
+	// encoding, UTF8.
+	DatEncodingEnUTF8        = NewDString("en_US.utf8")
+	datEncodingUTF8ShortName = NewDString("UTF8")
+)
+
+// Make a pg_get_viewdef function with the given arguments.
+func makePGGetViewDef(argTypes ArgTypes) Builtin {
+	return Builtin{
+		Types:            argTypes,
+		distsqlBlacklist: true,
+		ReturnType:       fixedReturnType(TypeString),
+		fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+			r, err := ctx.Planner.QueryRow(
+				ctx.Ctx(), "SELECT definition FROM pg_catalog.pg_views v JOIN pg_catalog.pg_class c ON "+
+					"c.relname=v.viewname WHERE oid=$1", args[0])
+			if err != nil {
+				return nil, err
+			}
+			if len(r) == 0 {
+				return DNull, nil
+			}
+			return r[0], nil
+		},
+		Info: notUsableInfo,
+	}
+}
+
 var pgBuiltins = map[string][]Builtin{
 	// See https://www.postgresql.org/docs/9.6/static/functions-info.html.
 	"pg_backend_pid": {
@@ -119,6 +156,23 @@ var pgBuiltins = map[string][]Builtin{
 			ReturnType: fixedReturnType(TypeInt),
 			fn: func(_ *EvalContext, _ Datums) (Datum, error) {
 				return NewDInt(-1), nil
+			},
+			Info: notUsableInfo,
+		},
+	},
+
+	// See https://www.postgresql.org/docs/9.3/static/catalog-pg-database.html.
+	"pg_encoding_to_char": {
+		Builtin{
+			Types: ArgTypes{
+				{"encoding_id", TypeInt},
+			},
+			ReturnType: fixedReturnType(TypeString),
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				if args[0].Compare(ctx, DatEncodingUTFId) == 0 {
+					return datEncodingUTF8ShortName, nil
+				}
+				return DNull, nil
 			},
 			Info: notUsableInfo,
 		},
@@ -172,7 +226,7 @@ var pgBuiltins = map[string][]Builtin{
 					return nil, err
 				}
 				if len(r) == 0 {
-					return nil, fmt.Errorf("unknown index (OID=%s)", args[0])
+					return nil, pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError, "unknown index (OID=%s)", args[0])
 				}
 				return r[0], nil
 			},
@@ -181,6 +235,13 @@ var pgBuiltins = map[string][]Builtin{
 		// The other overload for this function, pg_get_indexdef(index_oid,
 		// column_no, pretty_bool), is unimplemented, because it isn't used by
 		// supported ORMs.
+	},
+
+	// pg_get_viewdef functions like SHOW CREATE VIEW but returns the same format as
+	// PostgreSQL leaving out the actual 'CREATE VIEW table_name AS' portion of the statement.
+	"pg_get_viewdef": {
+		makePGGetViewDef(ArgTypes{{"view_oid", TypeOid}}),
+		makePGGetViewDef(ArgTypes{{"view_oid", TypeOid}, {"pretty_bool", TypeBool}}),
 	},
 
 	"pg_typeof": {
@@ -219,13 +280,17 @@ var pgBuiltins = map[string][]Builtin{
 	},
 	"format_type": {
 		Builtin{
-			// TODO(jordan): typemod should be a Nullable TypeInt when supported.
-			Types:      ArgTypes{{"type_oid", TypeOid}, {"typemod", TypeInt}},
-			ReturnType: fixedReturnType(TypeString),
+			Types:        ArgTypes{{"type_oid", TypeOid}, {"typemod", TypeInt}},
+			ReturnType:   fixedReturnType(TypeString),
+			nullableArgs: true,
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
-				typ, ok := OidToType[oid.Oid(int(args[0].(*DOid).DInt))]
+				oidArg := args[0]
+				if oidArg == DNull {
+					return DNull, nil
+				}
+				typ, ok := OidToType[oid.Oid(int(oidArg.(*DOid).DInt))]
 				if !ok {
-					return NewDString(fmt.Sprintf("unknown (OID=%s)", args[0])), nil
+					return NewDString(fmt.Sprintf("unknown (OID=%s)", oidArg)), nil
 				}
 				return NewDString(typ.SQLName()), nil
 			},
@@ -312,7 +377,7 @@ var pgBuiltins = map[string][]Builtin{
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 				oid := args[0]
 				t, err := ctx.Planner.QueryRow(ctx.Ctx(),
-					"SELECT nspname FROM pg_class c JOIN pg_namespace n ON c.relnamespace=n.oid "+
+					"SELECT nspname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON c.relnamespace=n.oid "+
 						"WHERE c.oid=$1 AND nspname=ANY(current_schemas(true));", oid)
 				if err != nil {
 					return nil, err

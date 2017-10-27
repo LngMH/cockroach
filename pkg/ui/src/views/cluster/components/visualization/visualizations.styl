@@ -12,8 +12,6 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 implied. See the License for the specific language governing
 permissions and limitations under the License.
-
-Author: Max Lang (max@cockroachlabs.com)
 */
 
 @require nib
@@ -30,7 +28,6 @@ $viz-sides = 62px
   border 1px solid rgba(0, 0, 0, .1)
   // prevents borders from doubling up
   margin-bottom 10px
-  width 925px
 
   &__content
     padding 0 10px 15px
@@ -41,41 +38,43 @@ $viz-sides = 62px
       align-items center
 
   &__header
+    display flex
+    justify-content center
+    align-items center
     padding 15px 25px 0
-    clearfix()
-    text-align center
 
   &__title
     font-size 14px
     font-family Lato-Bold
     color $body-color
-    display inline
 
   &__subtitle
     color $tooltip-color
     margin-left 5px
     font-size 12px
     font-family Lato-Regular
-    display inline
 
   &__spinner
     width 40px
     height 40px
 
   &__tooltip
-    float right
+    width 36px  // Reserve space for 10px padding around centered 16px icon
+    height 16px
 
   &__tooltip-hover-area
-    padding 5px 10px
+    width 100%
+    padding 0px 10px
 
   &__info-icon
-    width 12px
-    height 12px
+    width 16px
+    height 16px
     border-radius 50%
     border 1px solid $tooltip-color
-    font-size 10px
+    font-size 12px
+    line-height 14px  // Visual tweak to vertically center the exclamation mark
+    text-align center
     color $tooltip-color
-    line-height 10px
 
   .hover-tooltip--hovered &__info-icon
     border-color $body-color

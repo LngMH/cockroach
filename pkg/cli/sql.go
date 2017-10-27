@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc berhault (marc@cockroachlabs.com)
 
 package cli
 
@@ -31,11 +29,14 @@ import (
 
 	"golang.org/x/net/context"
 
-	"github.com/chzyer/readline"
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	readline "github.com/knz/go-libedit"
+	"github.com/lib/pq"
 	"github.com/spf13/cobra"
 )
 
@@ -62,7 +63,7 @@ Open a sql shell running against a cockroach database.
 type cliState struct {
 	conn *sqlConn
 	// ins is used to read lines if isInteractive is true.
-	ins *readline.Instance
+	ins readline.EditLine
 	// buf is used to read lines if isInteractive is false.
 	buf *bufio.Reader
 
@@ -72,12 +73,10 @@ type cliState struct {
 	errExit bool
 	// Determines whether to perform client-side syntax checking.
 	checkSyntax bool
-	// Determines whether to store normalized syntax in the shell history
-	// when check_syntax is set.
-	// TODO(knz): this can possibly be set back to false by default when
-	// the upstream readline library handles multi-line history entries
-	// properly.
-	normalizeHistory bool
+	// smartPrompt indicates whether to update the prompt using queries
+	// to the server. See the state cliRefreshPrompt and
+	// doRefreshPrompt() below.
+	smartPrompt bool
 
 	// The prefix at the start of a prompt.
 	promptPrefix string
@@ -85,6 +84,8 @@ type cliState struct {
 	fullPrompt string
 	// The prompt on a continuation line in a multi-line entry.
 	continuePrompt string
+	// The current prompt, either fullPrompt or continuePrompt.
+	currentPrompt string
 
 	// State
 	//
@@ -98,21 +99,16 @@ type cliState struct {
 	lastKnownTxnStatus string
 
 	// partialLines is the array of lines accumulated so far in a
-	// multi-line entry. When syntax checking is enabled, partialLines
-	// also gets rewritten so that all statements parsed successfully so
-	// far have their own, single entry in partialLines (i.e. statements
-	// spanning multiple lines are grouped together in one partialLines
-	// entry).
+	// multi-line entry.
 	partialLines []string
 
-	// partialStmtsLen represents the number of semicolon-separated
-	// statements in `partialLines` parsed successfully so far. It grows
-	// larger than zero whenever 1) syntax checking is enabled and 2)
-	// multi-statement (as opposed to multi-line) entry starts,
-	// i.e. when the shell decides to continue inputting statements even
-	// after a full statement followed by a semicolon was read
-	// successfully. This is currently used for multi-line transaction
-	// editing.
+	// partialStmtsLen represents the number of entries in partialLines
+	// parsed successfully so far. It grows larger than zero whenever 1)
+	// syntax checking is enabled and 2) multi-statement (as opposed to
+	// multi-line) entry starts, i.e. when the shell decides to continue
+	// inputting statements even after a full statement followed by a
+	// semicolon was read successfully. This is currently used for
+	// multi-line transaction editing.
 	partialStmtsLen int
 
 	// concatLines is the concatenation of partialLines, computed during
@@ -173,7 +169,7 @@ const (
 
 // printCliHelp prints a short inline help about the CLI.
 func printCliHelp() {
-	fmt.Print(`You are using 'cockroach sql', CockroachDB's lightweight SQL client.
+	fmt.Printf(`You are using 'cockroach sql', CockroachDB's lightweight SQL client.
 Type:
   \q to exit        (Ctrl+C/Ctrl+D also supported)
   \! CMD            run an external command and print its results on standard output.
@@ -182,30 +178,32 @@ Type:
   \unset NAME       unset a flag.
   \show             during a multi-line statement or transaction, show the SQL entered so far.
   \? or "help"      print this help.
+  \h [NAME]         help on syntax of SQL commands.
+  \hf [NAME]        help on SQL built-in functions.
 
 More documentation about our SQL dialect and the CLI shell is available online:
-https://www.cockroachlabs.com/docs/stable/sql-statements.html
-https://www.cockroachlabs.com/docs/stable/use-the-built-in-sql-client.html
-
-`)
+%s
+%s`,
+		base.DocsURL("sql-statements.html"),
+		base.DocsURL("use-the-built-in-sql-client.html"),
+	)
+	fmt.Println()
 }
 
 // addHistory persists a line of input to the readline history
 // file.
 func (c *cliState) addHistory(line string) {
-	if !isInteractive {
+	if !isInteractive || len(line) == 0 {
 		return
 	}
 
-	// ins.SaveHistory will push command into memory and try to
-	// persist to disk (if ins's config.HistoryFile is set).  err can
+	// ins.AddHistory will push command into memory and try to
+	// persist to disk (if ins's history file is set). err can
 	// be not nil only if it got a IO error while trying to persist.
-	if err := c.ins.SaveHistory(line); err != nil {
+	if err := c.ins.AddHistory(line); err != nil {
 		log.Warningf(context.TODO(), "cannot save command-line history: %s", err)
 		log.Info(context.TODO(), "command-line history will not be saved in this session")
-		cfg := c.ins.Config.Clone()
-		cfg.HistoryFile = ""
-		c.ins.SetConfig(cfg)
+		c.ins.SetAutoSaveHistory("", false)
 	}
 }
 
@@ -245,6 +243,12 @@ var options = map[string]struct {
 			return nil
 		},
 	},
+	`echo`: {
+		0,
+		false,
+		func(c *cliState, _ []string) error { sqlCtx.echo = true; return nil },
+		func(c *cliState) error { sqlCtx.echo = false; return nil },
+	},
 	`errexit`: {
 		0,
 		true,
@@ -257,11 +261,17 @@ var options = map[string]struct {
 		func(c *cliState, _ []string) error { c.checkSyntax = true; return nil },
 		func(c *cliState) error { c.checkSyntax = false; return nil },
 	},
-	`normalize_history`: {
+	`show_times`: {
 		0,
-		false,
-		func(c *cliState, _ []string) error { c.normalizeHistory = true; return nil },
-		func(c *cliState) error { c.normalizeHistory = false; return nil },
+		true,
+		func(c *cliState, _ []string) error { cliCtx.showTimes = true; return nil },
+		func(c *cliState) error { cliCtx.showTimes = false; return nil },
+	},
+	`smart_prompt`: {
+		0,
+		true,
+		func(c *cliState, _ []string) error { c.smartPrompt = true; return nil },
+		func(c *cliState) error { c.smartPrompt = false; return nil },
 	},
 }
 
@@ -273,10 +283,11 @@ func (c *cliState) handleSet(args []string, nextState, errState cliStateEnum) cl
 			newRowSliceIter([][]string{
 				{"display_format", cliCtx.tableDisplayFormat.String()},
 				{"errexit", strconv.FormatBool(c.errExit)},
+				{"echo", strconv.FormatBool(sqlCtx.echo)},
 				{"check_syntax", strconv.FormatBool(c.checkSyntax)},
-				{"normalize_history", strconv.FormatBool(c.normalizeHistory)},
-			}),
-			"set", cliCtx.tableDisplayFormat)
+				{"show_times", strconv.FormatBool(cliCtx.showTimes)},
+				{"smart_prompt", strconv.FormatBool(c.smartPrompt)},
+			}))
 		if err != nil {
 			panic(err)
 		}
@@ -316,7 +327,7 @@ func (c *cliState) handleUnset(args []string, nextState, errState cliStateEnum) 
 	return nextState
 }
 
-func isEndOfStatement(fullStmt string) (isEmpty, isEnd bool) {
+func checkTokens(fullStmt string) (isEmpty bool, lastTok int) {
 	sc := parser.MakeScanner(fullStmt)
 	isEmpty = true
 	var last int
@@ -324,7 +335,52 @@ func isEndOfStatement(fullStmt string) (isEmpty, isEnd bool) {
 		isEmpty = false
 		last = t
 	})
-	return isEmpty, last == ';'
+	return isEmpty, last
+}
+
+func isEndOfStatement(lastTok int) bool {
+	return lastTok == ';' || lastTok == parser.HELPTOKEN
+}
+
+// handleHelp prints SQL help.
+func (c *cliState) handleHelp(cmd []string, nextState, errState cliStateEnum) cliStateEnum {
+	cmdrest := strings.TrimSpace(strings.Join(cmd, " "))
+	command := strings.ToUpper(cmdrest)
+	if command == "" {
+		fmt.Print(parser.AllHelp)
+	} else {
+		if h, ok := parser.HelpMessages[command]; ok {
+			msg := parser.HelpMessage{Command: command, HelpMessageBody: h}
+			msg.Format(os.Stdout)
+			fmt.Println()
+		} else {
+			fmt.Fprintf(stderr,
+				"no help available for %q.\nTry \\h with no argument to see available help.\n", cmdrest)
+			return errState
+		}
+	}
+	return nextState
+}
+
+// handleFunctionHelp prints help about built-in functions.
+func (c *cliState) handleFunctionHelp(cmd []string, nextState, errState cliStateEnum) cliStateEnum {
+	funcName := strings.TrimSpace(strings.Join(cmd, " "))
+	if funcName == "" {
+		for _, f := range parser.AllBuiltinNames {
+			fmt.Println(f)
+		}
+		fmt.Println()
+	} else {
+		_, err := parser.Parse(fmt.Sprintf("select %s(??", funcName))
+		pgerr, ok := pgerror.GetPGCause(err)
+		if !ok || !strings.HasPrefix(pgerr.Hint, "help:") {
+			fmt.Fprintf(stderr,
+				"no help available for %q.\nTry \\hf with no argument to see available help.\n", funcName)
+			return errState
+		}
+		fmt.Println(pgerr.Hint[6:])
+	}
+	return nextState
 }
 
 // execSyscmd executes system commands.
@@ -394,15 +450,22 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 		return nextState
 	}
 
-	c.refreshTransactionStatus()
-	dbName, hasDbName := c.refreshDatabaseName()
+	c.fullPrompt = c.promptPrefix
 
-	dbStr := ""
-	if hasDbName {
-		dbStr = "/" + dbName
+	if c.smartPrompt {
+		c.refreshTransactionStatus()
+		dbName, hasDbName := c.refreshDatabaseName()
+
+		dbStr := ""
+		if hasDbName {
+			dbStr = "/" + dbName
+		}
+
+		c.fullPrompt += dbStr + c.lastKnownTxnStatus
+	} else {
+		c.lastKnownTxnStatus = ""
 	}
 
-	c.fullPrompt = c.promptPrefix + dbStr + c.lastKnownTxnStatus
 	c.continuePrompt = strings.Repeat(" ", len(c.fullPrompt)-1) + "-> "
 	c.fullPrompt += "> "
 
@@ -432,7 +495,7 @@ func (c *cliState) refreshTransactionStatus() {
 	case sql.RestartWait.String():
 		c.lastKnownTxnStatus = " RETRY"
 	case sql.Open.String():
-		// The state FirstBatch is reported by the server as Open, so no need to
+		// The state AutoRetry is reported by the server as Open, so no need to
 		// handle it here.
 		c.lastKnownTxnStatus = "  OPEN"
 	}
@@ -504,37 +567,67 @@ func endsWithIncompleteTxn(stmts parser.StatementList) bool {
 	return txnStarted
 }
 
-var cmdHistFile = envutil.EnvOrDefaultString("COCKROACH_SQL_CLI_HISTORY", ".cockroachdb_history")
+var cmdHistFile = envutil.EnvOrDefaultString("COCKROACH_SQL_CLI_HISTORY", ".cockroachsql_history")
+
+// GetCompletions implements the readline.CompletionGenerator interface.
+func (c *cliState) GetCompletions(_ string) []string {
+	sql, _ := c.ins.GetLineInfo()
+	var p parser.Parser
+
+	if !strings.HasSuffix(sql, "??") {
+		fmt.Fprintf(c.ins.Stdout(),
+			"\ntab completion not supported; append '??' and press tab for contextual help\n\n%s", sql)
+		return nil
+	}
+
+	_, err := p.Parse(sql)
+	if err != nil {
+		if pgErr, ok := pgerror.GetPGCause(err); ok &&
+			err.Error() == "help token in input" &&
+			strings.HasPrefix(pgErr.Hint, "help:") {
+			fmt.Fprintf(c.ins.Stdout(), "\nSuggestion:\n%s\n", pgErr.Hint[6:])
+		} else {
+			fmt.Fprintf(c.ins.Stdout(), "\n%v\n", err)
+			maybeShowErrorDetails(c.ins.Stdout(), err, false)
+		}
+		fmt.Fprint(c.ins.Stdout(), c.currentPrompt, sql)
+	}
+	return nil
+}
 
 func (c *cliState) doStart(nextState cliStateEnum) cliStateEnum {
 	// Common initialization.
 	c.partialLines = []string{}
 
 	if isInteractive {
+		c.checkSyntax = true
+		c.errExit = false
+		c.smartPrompt = true
 		c.promptPrefix, c.fullPrompt, c.continuePrompt = preparePrompts(c.conn.url)
 
-		// We only enable history management when the terminal is actually
-		// interactive. This saves on memory when e.g. piping a large SQL
-		// script through the command-line client.
-		homeDir, err := envutil.HomeDir()
-		if err != nil {
-			if log.V(2) {
-				log.Warningf(context.TODO(), "cannot retrieve user information: %v", err)
-				log.Info(context.TODO(), "cannot load or save the command-line history")
-			}
+		c.ins.SetCompleter(c)
+		if err := c.ins.UseHistory(-1 /*maxEntries*/, true /*dedup*/); err != nil {
+			log.Warningf(context.TODO(), "cannot enable history: %v", err)
 		} else {
-			histFile := filepath.Join(homeDir, cmdHistFile)
-			cfg := c.ins.Config.Clone()
-			cfg.HistoryFile = histFile
-			cfg.HistorySearchFold = true
-			c.ins.SetConfig(cfg)
+			// We only enable history management when the terminal is actually
+			// interactive. This saves on memory when e.g. piping a large SQL
+			// script through the command-line client.
+			homeDir, err := envutil.HomeDir()
+			if err != nil {
+				log.Warningf(context.TODO(), "cannot retrieve user information: %v", err)
+				log.Warning(context.TODO(), "history will not be saved")
+			} else {
+				histFile := filepath.Join(homeDir, cmdHistFile)
+				err = c.ins.LoadHistory(histFile)
+				if err != nil {
+					log.Warningf(context.TODO(), "cannot load the command-line history (file corrupted?): %v", err)
+					log.Warning(context.TODO(), "the history file will be cleared upon first entry")
+				}
+				c.ins.SetAutoSaveHistory(histFile, true)
+			}
 		}
 
 		fmt.Println("#\n# Enter \\? for a brief introduction.\n#")
-
-		c.checkSyntax = true
-		c.normalizeHistory = true
-		c.errExit = false
 	} else {
 		// When running non-interactive, by default we want errors to stop
 		// further processing and all syntax checking to be done
@@ -553,7 +646,8 @@ func (c *cliState) doStartLine(nextState cliStateEnum) cliStateEnum {
 	c.partialStmtsLen = 0
 
 	if isInteractive {
-		c.ins.SetPrompt(c.fullPrompt)
+		c.currentPrompt = c.fullPrompt
+		c.ins.SetLeftPrompt(c.currentPrompt)
 	}
 
 	return nextState
@@ -563,7 +657,8 @@ func (c *cliState) doContinueLine(nextState cliStateEnum) cliStateEnum {
 	c.atEOF = false
 
 	if isInteractive {
-		c.ins.SetPrompt(c.continuePrompt)
+		c.currentPrompt = c.continuePrompt
+		c.ins.SetLeftPrompt(c.currentPrompt)
 	}
 
 	return nextState
@@ -575,8 +670,16 @@ func (c *cliState) doContinueLine(nextState cliStateEnum) cliStateEnum {
 func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 	var l string
 	var err error
-	if c.ins != nil {
-		l, err = c.ins.Readline()
+	if c.buf == nil {
+		l, err = c.ins.GetLine()
+		if len(l) > 0 && l[len(l)-1] == '\n' {
+			// Strip the final newline.
+			l = l[:len(l)-1]
+		} else {
+			// There was no newline at the end of the input
+			// (e.g. Ctrl+C was entered). Force one.
+			fmt.Fprintln(c.ins.Stdout())
+		}
 	} else {
 		l, err = c.buf.ReadString('\n')
 		// bufio.ReadString() differs from readline.Readline in the handling of
@@ -599,7 +702,7 @@ func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 	case nil:
 		// Good to go.
 
-	case readline.ErrInterrupt:
+	case readline.ErrInterrupted:
 		if !isInteractive {
 			// Ctrl+C terminates non-interactive shells in all cases.
 			c.exitErr = err
@@ -682,7 +785,11 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 	// to handle it as a statement, so save the history.
 	c.addHistory(c.lastInputLine)
 
-	cmd := strings.Fields(c.lastInputLine)
+	// As a convenience to the user, we strip the final semicolon, if
+	// any, in all cases.
+	line := strings.TrimRight(c.lastInputLine, "; ")
+
+	cmd := strings.Fields(line)
 	switch cmd[0] {
 	case `\q`, `\quit`, `\exit`:
 		return cliStop
@@ -711,6 +818,12 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 	case `\|`:
 		return c.pipeSyscmd(c.lastInputLine, nextState, errState)
 
+	case `\h`:
+		return c.handleHelp(cmd[1:], loopState, errState)
+
+	case `\hf`:
+		return c.handleFunctionHelp(cmd[1:], loopState, errState)
+
 	default:
 		if strings.HasPrefix(cmd[0], `\d`) {
 			// Unrecognized command for now, but we want to be helpful.
@@ -736,7 +849,8 @@ func (c *cliState) doPrepareStatementLine(
 		return startState
 	}
 
-	isEmpty, endsWithSemi := isEndOfStatement(c.concatLines)
+	isEmpty, lastTok := checkTokens(c.concatLines)
+	endOfStmt := isEndOfStatement(lastTok)
 	if c.partialStmtsLen == 0 && isEmpty {
 		// More whitespace, or comments. Still nothing to do. However
 		// if the syntax was non-trivial to arrive here,
@@ -748,21 +862,25 @@ func (c *cliState) doPrepareStatementLine(
 	}
 	if c.atEOF {
 		// Definitely no more input expected.
-		if !endsWithSemi {
+		if !endOfStmt {
 			fmt.Fprintf(stderr, "missing semicolon at end of statement: %s\n", c.concatLines)
 			c.exitErr = fmt.Errorf("last statement was not executed: %s", c.concatLines)
 			return cliStop
 		}
 	}
 
-	if !endsWithSemi {
+	if !endOfStmt {
+		if lastTok == '?' {
+			fmt.Fprintf(c.ins.Stdout(),
+				"Note: a single '?' is a JSON operator. If you want contextual help, use '??'.\n")
+		}
 		return contState
 	}
 
+	// Complete input. Remember it in the history.
+	c.addHistory(c.concatLines)
+
 	if !c.checkSyntax {
-		// If syntax checking is not enabled, put the raw statement into
-		// history, then go and run it.
-		c.addHistory(c.concatLines)
 		return execState
 	}
 
@@ -773,20 +891,21 @@ func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnu
 	// From here on, client-side syntax checking is enabled.
 	parsedStmts, err := parser.Parse(c.concatLines)
 	if err != nil {
-		_ = c.invalidSyntax(0, "statement ignored: %v", err)
+		if pgErr, ok := pgerror.GetPGCause(err); ok &&
+			err.Error() == "help token in input" &&
+			strings.HasPrefix(pgErr.Hint, "help:") {
+			fmt.Println(pgErr.Hint[6:])
+		} else {
+			_ = c.invalidSyntax(0, "statement ignored: %v", err)
+			maybeShowErrorDetails(stderr, err, false)
 
-		// Even on failure, add the last (erroneous) lines as-is to the
-		// history, so that the user can recall them later to fix them.
-		for i := c.partialStmtsLen; i < len(c.partialLines); i++ {
-			c.addHistory(c.partialLines[i])
+			// Stop here if exiterr is set.
+			if c.errExit {
+				return cliStop
+			}
 		}
 
-		// Stop here if exiterr is set.
-		if c.errExit {
-			return cliStop
-		}
-
-		// Otherwise, remove the erroneous lines from the buffered input,
+		// Remove the erroneous lines from the buffered input,
 		// then try again.
 		c.partialLines = c.partialLines[:c.partialStmtsLen]
 		if len(c.partialLines) == 0 {
@@ -797,37 +916,6 @@ func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnu
 
 	if !isInteractive {
 		return execState
-	}
-
-	var lastInputChunk bytes.Buffer
-	if c.normalizeHistory {
-		// Add statements, not lines, to the history.
-		// The last input chunk is one unit of input by the user, so
-		// we want the user to be able to recall it all at once
-		// (= one history entry)
-		for i := c.partialStmtsLen; i < len(parsedStmts); i++ {
-			if i > c.partialStmtsLen {
-				lastInputChunk.WriteByte(' ')
-			}
-			fmt.Fprint(&lastInputChunk, parser.AsStringWithFlags(parsedStmts[i], parser.FmtParsable)+";")
-		}
-	} else {
-		// Add the last lines received to the history.
-		// Like above, this is one input chunk. However there may be
-		// sensitive newlines in string literals or SQL comments, so we
-		// can't blindly concatenate all the partial input into a single
-		// line. Leave them separate.
-		for i := c.partialStmtsLen; i < len(c.partialLines); i++ {
-			fmt.Fprintln(&lastInputChunk, c.partialLines[i])
-		}
-	}
-	c.addHistory(lastInputChunk.String())
-
-	// Replace the last entered lines by the last entered statements.
-	c.partialLines = c.partialLines[:c.partialStmtsLen]
-	for i := c.partialStmtsLen; i < len(parsedStmts); i++ {
-		c.partialLines = append(c.partialLines,
-			parser.AsStringWithFlags(parsedStmts[i], parser.FmtSimpleWithPasswords)+";")
 	}
 
 	nextState := execState
@@ -845,7 +933,7 @@ func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnu
 		nextState = contState
 	}
 
-	c.partialStmtsLen = len(parsedStmts)
+	c.partialStmtsLen = len(c.partialLines)
 
 	return nextState
 }
@@ -856,15 +944,40 @@ func (c *cliState) doRunStatement(nextState cliStateEnum) cliStateEnum {
 	c.lastKnownTxnStatus = " ?"
 
 	// Now run the statement/query.
-	c.exitErr = runQueryAndFormatResults(c.conn, os.Stdout, makeQuery(c.concatLines),
-		cliCtx.tableDisplayFormat)
+	c.exitErr = runQueryAndFormatResults(c.conn, os.Stdout, makeQuery(c.concatLines))
 	if c.exitErr != nil {
 		fmt.Fprintln(stderr, c.exitErr)
+		maybeShowErrorDetails(stderr, c.exitErr, false)
 		if c.errExit {
 			return cliStop
 		}
 	}
 	return nextState
+}
+
+// maybeShowErrorDetails displays the pg "Detail" and "Hint" fields
+// embedded in the error, if any, to the user. If printNewline is set,
+// a newline character is printed before anything else.
+func maybeShowErrorDetails(w io.Writer, err error, printNewline bool) {
+	var hint, detail string
+	if pqErr, ok := err.(*pq.Error); ok {
+		hint, detail = pqErr.Hint, pqErr.Detail
+	} else if pgErr, ok := pgerror.GetPGCause(err); ok {
+		hint, detail = pgErr.Hint, pgErr.Detail
+	}
+	if detail != "" {
+		if printNewline {
+			fmt.Fprintln(w)
+			printNewline = false
+		}
+		fmt.Fprintln(w, "DETAIL:", detail)
+	}
+	if hint != "" {
+		if printNewline {
+			fmt.Fprintln(w)
+		}
+		fmt.Fprintln(w, "HINT:", hint)
+	}
 }
 
 func (c *cliState) doDecidePath() cliStateEnum {
@@ -881,7 +994,7 @@ func (c *cliState) doDecidePath() cliStateEnum {
 
 // runInteractive runs the SQL client interactively, presenting
 // a prompt to the user for each statement.
-func runInteractive(conn *sqlConn, config *readline.Config) (exitErr error) {
+func runInteractive(conn *sqlConn) (exitErr error) {
 	c := cliState{conn: conn}
 
 	state := cliStart
@@ -894,18 +1007,33 @@ func runInteractive(conn *sqlConn, config *readline.Config) (exitErr error) {
 			// chzyer/readline is exceptionally slow at reading long lines, so we
 			// only use it in interactive mode.
 			if isInteractive {
+				// If interactive and the table display format is "pretty", also
+				// enable printing of times.
+				if cliCtx.tableDisplayFormat == tableDisplayPretty {
+					cliCtx.showTimes = true
+				}
+
 				// The readline initialization is not placed in
 				// the doStart() method because of the defer.
-				c.ins, c.exitErr = readline.NewEx(config)
+				c.ins, c.exitErr = readline.InitFiles("cockroach",
+					true, /* wideChars */
+					stdin, os.Stdout, stderr)
+				if c.exitErr == readline.ErrWidecharNotSupported {
+					log.Warning(context.TODO(), "wide character support disabled")
+					c.ins, c.exitErr = readline.InitFiles("cockroach",
+						false, stdin, os.Stdout, stderr)
+				}
 				if c.exitErr != nil {
 					return c.exitErr
 				}
-				defer func() { _ = c.ins.Close() }()
+				// If the user has used bind -v or bind -l in their ~/.editrc,
+				// this will reset the standard bindings. However we really
+				// want in this shell that Ctrl+C, tab, Ctrl+Z and Ctrl+R
+				// always have the same meaning.  So reload these bindings
+				// explicitly no matter what ~/.editrc may have changed.
+				c.ins.RebindControlKeys()
+				defer c.ins.Close()
 			} else {
-				stdin := config.Stdin
-				if stdin == nil {
-					stdin = os.Stdin
-				}
 				c.buf = bufio.NewReader(stdin)
 			}
 
@@ -953,11 +1081,14 @@ func runInteractive(conn *sqlConn, config *readline.Config) (exitErr error) {
 
 // runOneStatement executes one statement and terminates
 // on error.
-func runStatements(conn *sqlConn, stmts []string, displayFormat tableDisplayFormat) error {
+func runStatements(conn *sqlConn, stmts []string) error {
 	for _, stmt := range stmts {
-		if err := runQueryAndFormatResults(conn, os.Stdout, makeQuery(stmt),
-			displayFormat); err != nil {
-			return err
+		if err := runQueryAndFormatResults(conn, os.Stdout, makeQuery(stmt)); err != nil {
+			// Expand the details and hints so that they are printed to the user.
+			var buf bytes.Buffer
+			buf.WriteString(err.Error())
+			maybeShowErrorDetails(&buf, err, true)
+			return errors.New(strings.TrimSuffix(buf.String(), "\n"))
 		}
 	}
 	return nil
@@ -985,13 +1116,15 @@ func runTerm(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if !sqlCtx.unsafeUpdates {
+		if err := conn.Exec("SET sql_safe_updates = TRUE", nil); err != nil {
+			return err
+		}
+	}
+
 	if len(sqlCtx.execStmts) > 0 {
 		// Single-line sql; run as simple as possible, without noise on stdout.
-		return runStatements(conn, sqlCtx.execStmts, cliCtx.tableDisplayFormat)
+		return runStatements(conn, sqlCtx.execStmts)
 	}
-	// Use the same as the default global readline config.
-	conf := readline.Config{
-		DisableAutoSaveHistory: true,
-	}
-	return runInteractive(conn, &conf)
+	return runInteractive(conn)
 }

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // This code was derived from https://github.com/youtube/vitess.
 //
@@ -25,6 +23,8 @@ package parser
 import (
 	"bytes"
 	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 
 	"golang.org/x/text/language"
 
@@ -123,7 +123,7 @@ func (node *CreateIndex) Format(buf *bytes.Buffer, f FmtFlags) {
 		buf.WriteByte(' ')
 	}
 	buf.WriteString("ON ")
-	FormatNode(buf, f, node.Table)
+	FormatNode(buf, f, &node.Table)
 	buf.WriteString(" (")
 	FormatNode(buf, f, node.Columns)
 	buf.WriteByte(')')
@@ -196,6 +196,7 @@ type ColumnTableDef struct {
 		Table          NormalizableTableName
 		Col            Name
 		ConstraintName Name
+		Actions        ReferenceActions
 	}
 	Family struct {
 		Name        Name
@@ -209,6 +210,27 @@ type ColumnTableDef struct {
 type ColumnTableDefCheckExpr struct {
 	Expr           Expr
 	ConstraintName Name
+}
+
+func processCollationOnType(name Name, typ ColumnType, c ColumnCollation) (ColumnType, error) {
+	locale := string(c)
+	switch s := typ.(type) {
+	case *StringColType:
+		return &CollatedStringColType{s.Name, s.N, locale}, nil
+	case *CollatedStringColType:
+		return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+			"multiple COLLATE declarations for column %q", name)
+	case *ArrayColType:
+		var err error
+		s.ParamType, err = processCollationOnType(name, s.ParamType, c)
+		if err != nil {
+			return nil, err
+		}
+		return s, nil
+	default:
+		return nil, pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
+			"COLLATE declaration for non-string-typed column %q", name)
+	}
 }
 
 func newColumnTableDef(
@@ -227,29 +249,28 @@ func newColumnTableDef(
 			if err != nil {
 				return nil, errors.Wrapf(err, "invalid locale %s", locale)
 			}
-			switch s := d.Type.(type) {
-			case *StringColType:
-				d.Type = &CollatedStringColType{s.Name, s.N, locale}
-			case *CollatedStringColType:
-				return nil, errors.Errorf("multiple COLLATE declarations for column %q", name)
-			default:
-				return nil, errors.Errorf("COLLATE declaration for non-string-typed column %q", name)
+			d.Type, err = processCollationOnType(name, d.Type, t)
+			if err != nil {
+				return nil, err
 			}
 		case *ColumnDefault:
 			if d.HasDefaultExpr() {
-				return nil, errors.Errorf("multiple default values specified for column %q", name)
+				return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+					"multiple default values specified for column %q", name)
 			}
 			d.DefaultExpr.Expr = t.Expr
 			d.DefaultExpr.ConstraintName = c.Name
 		case NotNullConstraint:
 			if d.Nullable.Nullability == Null {
-				return nil, errors.Errorf("conflicting NULL/NOT NULL declarations for column %q", name)
+				return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+					"conflicting NULL/NOT NULL declarations for column %q", name)
 			}
 			d.Nullable.Nullability = NotNull
 			d.Nullable.ConstraintName = c.Name
 		case NullConstraint:
 			if d.Nullable.Nullability == NotNull {
-				return nil, errors.Errorf("conflicting NULL/NOT NULL declarations for column %q", name)
+				return nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+					"conflicting NULL/NOT NULL declarations for column %q", name)
 			}
 			d.Nullable.Nullability = Null
 			d.Nullable.ConstraintName = c.Name
@@ -266,14 +287,17 @@ func newColumnTableDef(
 			})
 		case *ColumnFKConstraint:
 			if d.HasFKConstraint() {
-				return nil, errors.Errorf("multiple foreign key constraints specified for column %q", name)
+				return nil, pgerror.NewErrorf(pgerror.CodeInvalidTableDefinitionError,
+					"multiple foreign key constraints specified for column %q", name)
 			}
 			d.References.Table = t.Table
 			d.References.Col = t.Col
 			d.References.ConstraintName = c.Name
+			d.References.Actions = t.Actions
 		case *ColumnFamilyConstraint:
 			if d.HasColumnFamily() {
-				return nil, errors.Errorf("multiple column families specified for column %q", name)
+				return nil, pgerror.NewErrorf(pgerror.CodeInvalidTableDefinitionError,
+					"multiple column families specified for column %q", name)
 			}
 			d.Family.Name = t.Family
 			d.Family.Create = t.Create
@@ -347,12 +371,13 @@ func (node *ColumnTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 			FormatNode(buf, f, node.References.ConstraintName)
 		}
 		buf.WriteString(" REFERENCES ")
-		FormatNode(buf, f, node.References.Table)
+		FormatNode(buf, f, &node.References.Table)
 		if node.References.Col != "" {
 			buf.WriteString(" (")
 			FormatNode(buf, f, node.References.Col)
 			buf.WriteByte(')')
 		}
+		FormatNode(buf, f, node.References.Actions)
 	}
 	if node.HasColumnFamily() {
 		if node.Family.Create {
@@ -417,8 +442,9 @@ type ColumnCheckConstraint struct {
 
 // ColumnFKConstraint represents a FK-constaint on a column.
 type ColumnFKConstraint struct {
-	Table NormalizableTableName
-	Col   Name // empty-string means use PK
+	Table   NormalizableTableName
+	Col     Name // empty-string means use PK
+	Actions ReferenceActions
 }
 
 // ColumnFamilyConstraint represents FAMILY on a column.
@@ -504,12 +530,57 @@ func (node *UniqueConstraintTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 	}
 }
 
+// ReferenceAction is the method used to maintain referential integrity through
+// foreign keys.
+type ReferenceAction int
+
+// The values for ReferenceAction.
+const (
+	NoAction ReferenceAction = iota
+	Restrict
+	SetNull
+	SetDefault
+	Cascade
+)
+
+var referenceActionName = [...]string{
+	NoAction:   "NO ACTION",
+	Restrict:   "RESTRICT",
+	SetNull:    "SET NULL",
+	SetDefault: "SET DEFAULT",
+	Cascade:    "CASCADE",
+}
+
+func (ra ReferenceAction) String() string {
+	return referenceActionName[ra]
+}
+
+// ReferenceActions contains the actions specified to maintain referential
+// integrity through foreign keys for different operations.
+type ReferenceActions struct {
+	Delete ReferenceAction
+	Update ReferenceAction
+}
+
+// Format implements the NodeFormatter interface.
+func (node ReferenceActions) Format(buf *bytes.Buffer, f FmtFlags) {
+	if node.Delete != NoAction {
+		buf.WriteString(" ON DELETE ")
+		buf.WriteString(node.Delete.String())
+	}
+	if node.Update != NoAction {
+		buf.WriteString(" ON UPDATE ")
+		buf.WriteString(node.Update.String())
+	}
+}
+
 // ForeignKeyConstraintTableDef represents a FOREIGN KEY constraint in the AST.
 type ForeignKeyConstraintTableDef struct {
 	Name     Name
 	Table    NormalizableTableName
 	FromCols NameList
 	ToCols   NameList
+	Actions  ReferenceActions
 }
 
 // Format implements the NodeFormatter interface.
@@ -522,7 +593,7 @@ func (node *ForeignKeyConstraintTableDef) Format(buf *bytes.Buffer, f FmtFlags) 
 	buf.WriteString("FOREIGN KEY (")
 	FormatNode(buf, f, node.FromCols)
 	buf.WriteString(") REFERENCES ")
-	FormatNode(buf, f, node.Table)
+	FormatNode(buf, f, &node.Table)
 
 	if len(node.ToCols) > 0 {
 		buf.WriteByte(' ')
@@ -530,6 +601,8 @@ func (node *ForeignKeyConstraintTableDef) Format(buf *bytes.Buffer, f FmtFlags) 
 		FormatNode(buf, f, node.ToCols)
 		buf.WriteByte(')')
 	}
+
+	FormatNode(buf, f, node.Actions)
 }
 
 func (node *ForeignKeyConstraintTableDef) setName(name Name) {
@@ -591,7 +664,7 @@ func (node *FamilyTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 // InterleaveDef represents an interleave definition within a CREATE TABLE
 // or CREATE INDEX statement.
 type InterleaveDef struct {
-	Parent       NormalizableTableName
+	Parent       *NormalizableTableName
 	Fields       NameList
 	DropBehavior DropBehavior
 }
@@ -614,11 +687,119 @@ func (node *InterleaveDef) Format(buf *bytes.Buffer, f FmtFlags) {
 	}
 }
 
+// PartitionByType is an enum of each type of partitioning (LIST/RANGE).
+type PartitionByType string
+
+const (
+	// PartitionByList indicates a PARTITION BY LIST clause.
+	PartitionByList PartitionByType = "LIST"
+	// PartitionByRange indicates a PARTITION BY LIST clause.
+	PartitionByRange PartitionByType = "RANGE"
+)
+
+// PartitionBy represents an PARTITION BY definition within a CREATE/ALTER
+// TABLE/INDEX statement.
+type PartitionBy struct {
+	Fields NameList
+	// Exactly one of List or Range is required to be non-empty.
+	List  []ListPartition
+	Range []RangePartition
+}
+
+// Format implements the NodeFormatter interface.
+func (node *PartitionBy) Format(buf *bytes.Buffer, f FmtFlags) {
+	if len(node.List) > 0 {
+		buf.WriteString(` PARTITION BY LIST (`)
+	} else if len(node.Range) > 0 {
+		buf.WriteString(` PARTITION BY RANGE (`)
+	}
+	FormatNode(buf, f, node.Fields)
+	buf.WriteString(`) (`)
+	for i, p := range node.List {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		FormatNode(buf, f, p)
+	}
+	for i, p := range node.Range {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		FormatNode(buf, f, p)
+	}
+	buf.WriteString(`)`)
+}
+
+// ListPartition represents a PARTITION definition within a PARTITION BY LIST.
+type ListPartition struct {
+	Name         Name
+	Tuples       []*Tuple
+	Subpartition *PartitionBy
+}
+
+// Format implements the NodeFormatter interface.
+func (node ListPartition) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteString(`PARTITION `)
+	FormatNode(buf, f, node.Name)
+	buf.WriteString(` VALUES `)
+	for i, n := range node.Tuples {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		FormatNode(buf, f, n)
+	}
+	if node.Subpartition != nil {
+		FormatNode(buf, f, node.Subpartition)
+	}
+}
+
+// RangePartition represents a PARTITION definition within a PARTITION BY LIST.
+type RangePartition struct {
+	Name         Name
+	Tuple        *Tuple
+	Subpartition *PartitionBy
+}
+
+// Format implements the NodeFormatter interface.
+func (node RangePartition) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteString(`PARTITION `)
+	FormatNode(buf, f, node.Name)
+	buf.WriteString(` VALUES LESS THAN `)
+	FormatNode(buf, f, node.Tuple)
+	if node.Subpartition != nil {
+		FormatNode(buf, f, node.Subpartition)
+	}
+}
+
+// PartitionDefault represents the DEFAULT expression in a PARTITION BY clause.
+type PartitionDefault struct{}
+
+// Format implements the NodeFormatter interface.
+func (node PartitionDefault) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteString("DEFAULT")
+}
+
+// ResolvedType implements the TypedExpr interface.
+func (PartitionDefault) ResolvedType() Type { return TypeAny }
+
+// PartitionMaxValue represents the MAXVALUE expression expression in a
+// PARTITION BY clause.
+type PartitionMaxValue struct{}
+
+// Format implements the NodeFormatter interface.
+func (node PartitionMaxValue) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteString("MAXVALUE")
+}
+
+// ResolvedType implements the TypedExpr interface.
+func (PartitionMaxValue) ResolvedType() Type { return TypeAny }
+
 // CreateTable represents a CREATE TABLE statement.
 type CreateTable struct {
 	IfNotExists   bool
 	Table         NormalizableTableName
 	Interleave    *InterleaveDef
+	PartitionBy   *PartitionBy
 	Defs          TableDefs
 	AsSource      *Select
 	AsColumnNames NameList // Only to be used in conjunction with AsSource
@@ -636,7 +817,7 @@ func (node *CreateTable) Format(buf *bytes.Buffer, f FmtFlags) {
 	if node.IfNotExists {
 		buf.WriteString("IF NOT EXISTS ")
 	}
-	FormatNode(buf, f, node.Table)
+	FormatNode(buf, f, &node.Table)
 	if node.As() {
 		if len(node.AsColumnNames) > 0 {
 			buf.WriteString(" (")
@@ -651,6 +832,9 @@ func (node *CreateTable) Format(buf *bytes.Buffer, f FmtFlags) {
 		buf.WriteByte(')')
 		if node.Interleave != nil {
 			FormatNode(buf, f, node.Interleave)
+		}
+		if node.PartitionBy != nil {
+			FormatNode(buf, f, node.PartitionBy)
 		}
 	}
 }
@@ -690,7 +874,7 @@ type CreateView struct {
 // Format implements the NodeFormatter interface.
 func (node *CreateView) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("CREATE VIEW ")
-	FormatNode(buf, f, node.Name)
+	FormatNode(buf, f, &node.Name)
 
 	if len(node.ColumnNames) > 0 {
 		buf.WriteByte(' ')

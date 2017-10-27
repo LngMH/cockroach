@@ -29,8 +29,8 @@ query TTBTT colnames
 SHOW COLUMNS FROM t
 ----
 Field Type Null  Default Indices
-a     INT  false NULL    {primary,t_f_idx}
-f     INT  true  NULL    {t_f_idx}
+a     INT  false NULL    {"primary","t_f_idx"}
+f     INT  true  NULL    {"t_f_idx"}
 b     INT  true  NULL    {}
 
 statement ok
@@ -49,7 +49,7 @@ FROM crdb_internal.jobs
 ORDER BY created DESC
 LIMIT 1
 ----
-SCHEMA CHANGE  ALTER TABLE t ADD CONSTRAINT foo UNIQUE (b)  root  succeeded  1
+SCHEMA CHANGE  ALTER TABLE test.t ADD CONSTRAINT foo UNIQUE (b)  root  succeeded  1  ·
 
 statement error duplicate constraint name: "foo"
 ALTER TABLE t ADD CONSTRAINT foo UNIQUE (b)
@@ -87,8 +87,8 @@ FROM crdb_internal.jobs
 ORDER BY created DESC
 LIMIT 2
 ----
-SCHEMA CHANGE  ROLL BACK ALTER TABLE t ADD CONSTRAINT bar UNIQUE (c)  root  succeeded  1.00
-SCHEMA CHANGE  ALTER TABLE t ADD CONSTRAINT bar UNIQUE (c)            root  failed     0.10  duplicate key value (c)=(1) violates unique constraint "bar"
+SCHEMA CHANGE  ROLL BACK ALTER TABLE test.t ADD CONSTRAINT bar UNIQUE (c)  root  succeeded  1.00  ·
+SCHEMA CHANGE  ALTER TABLE test.t ADD CONSTRAINT bar UNIQUE (c)            root  failed     0.10  duplicate key value (c)=(1) violates unique constraint "bar"
 
 query IIII colnames,rowsort
 SELECT * FROM t
@@ -188,7 +188,15 @@ statement error UNIQUE constraint depends on index "foo", use DROP INDEX if you 
 ALTER TABLE t DROP CONSTRAINT foo
 
 statement ok
-DROP INDEX t@foo
+DROP INDEX foo
+
+query TTTTRT
+SELECT type, description, username, status, fraction_completed, error
+FROM crdb_internal.jobs
+ORDER BY created DESC
+LIMIT 1
+----
+SCHEMA CHANGE  DROP INDEX test.t@foo  root  succeeded  1  ·
 
 query TTBITTBB colnames
 SHOW INDEXES FROM t
@@ -240,7 +248,7 @@ ALTER TABLE t ADD COLUMN x DECIMAL
 statement ok
 ALTER TABLE t ADD COLUMN y DECIMAL NOT NULL DEFAULT (DECIMAL '1.3')
 
-statement error could not parse '1-3' as type decimal
+statement error could not parse "1-3" as type decimal
 ALTER TABLE t ADD COLUMN p DECIMAL NOT NULL DEFAULT (DECIMAL '1-3')
 
 # Add a non NULL column with no default value
@@ -286,7 +294,7 @@ FROM crdb_internal.jobs
 ORDER BY created DESC
 LIMIT 1
 ----
-SCHEMA CHANGE  DROP INDEX t@t_f_idx  root  succeeded  1
+SCHEMA CHANGE  DROP INDEX test.t@t_f_idx  root  succeeded  1  ·
 
 statement ok
 ALTER TABLE t DROP COLUMN f
@@ -324,8 +332,13 @@ ALTER TABLE t DROP COLUMN y
 statement error cannot drop column "e" because view "v" depends on it
 ALTER TABLE t DROP COLUMN e
 
-statement ok
+# TODO(knz): this statement should succeed after #17269 is fixed.
+statement error cannot drop column "d" because view "v" depends on it
 ALTER TABLE t DROP COLUMN d
+
+# TODO(knz): remove the following once the test above succeeds.
+statement ok
+ALTER TABLE t DROP COLUMN d CASCADE
 
 statement ok
 ALTER TABLE t DROP COLUMN e CASCADE
@@ -419,11 +432,11 @@ query TTBTT colnames
 SHOW COLUMNS FROM tt
 ----
 Field  Type     Null   Default       Indices
-a      INT      false  NULL          {primary,tt_s_key,tt_t_key}
+a      INT      false  NULL          {"primary","tt_s_key","tt_t_key"}
 q      DECIMAL  false  NULL          {}
 r      DECIMAL  true   NULL          {}
-s      DECIMAL  false  NULL          {tt_s_key}
-t      DECIMAL  true   4.0:::DECIMAL {tt_t_key}
+s      DECIMAL  false  NULL          {"tt_s_key"}
+t      DECIMAL  true   4.0:::DECIMAL {"tt_t_key"}
 
 # Default values can be added and changed after table creation.
 statement ok
@@ -444,7 +457,7 @@ ALTER TABLE add_default ALTER COLUMN b SET DEFAULT 10
 statement ok
 INSERT INTO add_default (a) VALUES (3)
 
-statement error incompatible type for DEFAULT expression
+statement error could not parse "foo" as type int
 ALTER TABLE add_default ALTER COLUMN b SET DEFAULT 'foo'
 
 statement error DEFAULT expression .* may not contain variable sub-expressions
@@ -565,10 +578,10 @@ INSERT INTO privs VALUES (1)
 
 user testuser
 
-statement error user testuser does not have CREATE privilege on table privs
+statement error user testuser does not have CREATE privilege on relation privs
 ALTER TABLE privs ADD c INT
 
-statement error user testuser does not have CREATE privilege on table privs
+statement error user testuser does not have CREATE privilege on relation privs
 ALTER TABLE privs ADD CONSTRAINT foo UNIQUE (b)
 
 user root
@@ -577,7 +590,7 @@ query TTBTT colnames
 SHOW COLUMNS FROM privs
 ----
 Field Type Null  Default Indices
-a     INT  false NULL    {primary}
+a     INT  false NULL    {"primary"}
 b     INT  true  NULL    {}
 
 statement ok
@@ -595,14 +608,14 @@ query TTBTT colnames
 SHOW COLUMNS FROM privs
 ----
 Field Type Null  Default Indices
-a     INT  false NULL    {primary,foo}
-b     INT  true  NULL    {foo}
+a     INT  false NULL    {"primary","foo"}
+b     INT  true  NULL    {"foo"}
 c     INT  true  NULL    {}
 
-statement error table "nonexistent" does not exist
+statement error relation "nonexistent" does not exist
 ALTER TABLE nonexistent SPLIT AT VALUES (42)
 
-statement error table "nonexistent" does not exist
+statement error relation "nonexistent" does not exist
 ALTER INDEX nonexistent@noindex SPLIT AT VALUES (42)
 
 user root
@@ -623,14 +636,14 @@ CREATE TABLE s (k1 INT, k2 INT, v INT, PRIMARY KEY (k1,k2))
 query ITTTTT colnames
 EXPLAIN (METADATA) ALTER TABLE s SPLIT AT SELECT k1,k2 FROM s ORDER BY k1 LIMIT 3
 ----
-Level  Type    Field  Description  Columns        Ordering
-0      split                       (key, pretty)
-1      limit                       (k1, k2)              +k1
-2      render                      (k1, k2)              +k1
-3      scan                        (k1, k2, v[omitted])  +k1
-3              table  s@primary
-3              spans  ALL
-3              limit  3
+Level  Type    Field  Description  Columns               Ordering
+0      split   ·      ·            (key, pretty)         ·
+1      limit   ·      ·            (k1, k2)              k1!=NULL; k2!=NULL; key(k1,k2); +k1
+2      render  ·      ·            (k1, k2)              k1!=NULL; k2!=NULL; key(k1,k2); +k1
+3      scan    ·      ·            (k1, k2, v[omitted])  k1!=NULL; k2!=NULL; key(k1,k2); +k1
+3      ·       table  s@primary    ·                     ·
+3      ·       spans  ALL          ·                     ·
+3      ·       limit  3            ·                     ·
 
 # Verify that impure defaults are evaluated separately on each row
 # (#14352)

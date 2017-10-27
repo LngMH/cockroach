@@ -11,14 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package distsqlrun
 
 import (
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -136,12 +135,15 @@ func TestDistinct(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			ds := c.spec
 
-			in := NewRowBuffer(nil /* types */, c.input, RowBufferArgs{})
+			in := NewRowBuffer(twoIntCols, c.input, RowBufferArgs{})
 			out := &RowBuffer{}
 
 			evalCtx := parser.MakeTestingEvalContext()
 			defer evalCtx.Stop(context.Background())
-			flowCtx := FlowCtx{evalCtx: evalCtx}
+			flowCtx := FlowCtx{
+				Settings: cluster.MakeTestingClusterSettings(),
+				EvalCtx:  evalCtx,
+			}
 
 			d, err := newDistinct(&flowCtx, &ds, in, &PostProcessSpec{}, out)
 			if err != nil {
@@ -164,8 +166,8 @@ func TestDistinct(t *testing.T) {
 				res = append(res, row)
 			}
 
-			if result := res.String(); result != c.expected.String() {
-				t.Errorf("invalid results: %s, expected %s'", result, c.expected.String())
+			if result := res.String(twoIntCols); result != c.expected.String(twoIntCols) {
+				t.Errorf("invalid results: %s, expected %s'", result, c.expected.String(twoIntCols))
 			}
 		})
 	}

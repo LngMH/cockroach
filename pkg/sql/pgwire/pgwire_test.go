@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package pgwire_test
 
@@ -384,6 +382,35 @@ func TestPGWireDBName(t *testing.T) {
 	}
 }
 
+// We want to ensure that despite use of errors.{Wrap,Wrapf}, we are surfacing a
+// pq.Error.
+func TestPGUnwrapError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanupFn()
+
+	db, err := gosql.Open("postgres", pgURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// This is just a statement that is known to utilize errors.Wrap.
+	stmt := "SELECT COALESCE(2, 'foo')"
+
+	if _, err := db.Exec(stmt); err == nil {
+		t.Fatalf("expected %s to error", stmt)
+	} else {
+		if _, ok := err.(*pq.Error); !ok {
+			t.Fatalf("pgwire should be surfacing a pq.Error")
+		}
+	}
+}
+
 func TestPGPrepareFail(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -405,8 +432,8 @@ func TestPGPrepareFail(t *testing.T) {
 		"SELECT $1 + $1":                            "pq: could not determine data type of placeholder $1",
 		"SELECT CASE WHEN TRUE THEN $1 END":         "pq: could not determine data type of placeholder $1",
 		"SELECT CASE WHEN TRUE THEN $1 ELSE $2 END": "pq: could not determine data type of placeholder $1",
-		"SELECT $1 > 0 AND NOT $1":                  "pq: incompatible NOT argument type: int",
-		"CREATE TABLE $1 (id INT)":                  "pq: syntax error at or near \"1\"\nCREATE TABLE $1 (id INT)\n             ^\n",
+		"SELECT $1 > 0 AND NOT $1":                  "pq: placeholder 1 already has type int, cannot assign bool",
+		"CREATE TABLE $1 (id INT)":                  "pq: syntax error at or near \"1\"",
 		"UPDATE d.t SET s = i + $1":                 "pq: unsupported binary operator: <int> + <placeholder{1}> (desired <string>)",
 		"SELECT $0 > 0":                             "pq: invalid placeholder name: $0",
 		"SELECT $2 > 0":                             "pq: could not determine data type of placeholder $1",
@@ -498,26 +525,13 @@ func TestPGPrepareWithCreateDropInTxn(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		stmt, err := tx.Prepare(`INSERT INTO d.kv (k,v) VALUES ($1, $2);`)
-		if err != nil {
-			t.Fatal(err)
+		if _, err := tx.Prepare(`
+INSERT INTO d.kv (k,v) VALUES ($1, $2);
+`); !testutils.IsError(err, "relation \"d.kv\" does not exist") {
+			t.Fatalf("err = %v", err)
 		}
 
-		// INSERT works because it is using a cached descriptor that is leased.
-		res, err := stmt.Exec('c', 'd')
-		if err != nil {
-			t.Fatal(err)
-		}
-		stmt.Close()
-		affected, err := res.RowsAffected()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if affected != 1 {
-			t.Fatalf("unexpected number of rows affected: %d", affected)
-		}
-
-		if err := tx.Commit(); err != nil {
+		if err := tx.Rollback(); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -644,6 +658,12 @@ func TestPGPreparedQuery(t *testing.T) {
 		"SELECT $1[2] LIKE 'b'": {
 			baseTest.SetArgs(pq.Array([]string{"a", "b", "c"})).Results(true),
 		},
+		"SET application_name = $1": {
+			baseTest.SetArgs("hello world"),
+		},
+		"SET CLUSTER SETTING cluster.organization = $1": {
+			baseTest.SetArgs("hello world"),
+		},
 		"SHOW DATABASE": {
 			baseTest.Results(""),
 		},
@@ -652,7 +672,7 @@ func TestPGPreparedQuery(t *testing.T) {
 		},
 		"SHOW COLUMNS FROM system.users": {
 			baseTest.
-				Results("username", "STRING", false, gosql.NullBool{}, "{primary}").
+				Results("username", "STRING", false, gosql.NullBool{}, "{\"primary\"}").
 				Results("hashedPassword", "BYTES", true, gosql.NullBool{}, "{}"),
 		},
 		"SHOW DATABASES": {
@@ -669,7 +689,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Results("users", "primary", true, 1, "username", "ASC", false, false),
 		},
 		"SHOW TABLES FROM system": {
-			baseTest.Results("descriptor").Others(9),
+			baseTest.Results("descriptor").Others(10),
 		},
 		"SHOW CONSTRAINTS FROM system.users": {
 			baseTest.Results("users", "primary", "PRIMARY KEY", "username", gosql.NullString{}),
@@ -679,10 +699,6 @@ func TestPGPreparedQuery(t *testing.T) {
 		},
 		"SHOW USERS": {
 			baseTest,
-		},
-		"HELP LEAST": {
-			baseTest.Results("least", "(anyelement...) -> anyelement", "Comparison",
-				"Returns the element with the lowest value."),
 		},
 		"SELECT (SELECT 1+$1)": {
 			baseTest.SetArgs(1).Results(2),
@@ -816,12 +832,15 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.SetArgs(pq.StringArray([]string{"foo"})).Results("foo"),
 		},
 		// #13725
-		"SELECT * FROM d.empty": {
+		"SELECT * FROM d.emptynorows": {
 			baseTest.SetArgs(),
+		},
+		"SELECT * FROM d.emptyrows": {
+			baseTest.SetArgs().Results().Results().Results(),
 		},
 		// #14238
 		"EXPLAIN SELECT 1": {
-			baseTest.SetArgs().Results(0, "render", "", "").Results(1, "nullrow", "", ""),
+			baseTest.SetArgs().Results(0, "render", "", "").Results(1, "emptyrow", "", ""),
 		},
 		// #14245
 		"SELECT 1::oid = $1": {
@@ -835,6 +854,25 @@ func TestPGPreparedQuery(t *testing.T) {
 		},
 		"SELECT $1::UUID": {
 			baseTest.SetArgs("63616665-6630-3064-6465-616462656562").Results("63616665-6630-3064-6465-616462656562"),
+		},
+		"SELECT $1::INET": {
+			baseTest.SetArgs("192.168.0.1/32").Results("192.168.0.1"),
+		},
+		"SELECT $1:::FLOAT[]": {
+			baseTest.SetArgs("{}").Results("{}"),
+			baseTest.SetArgs("{1.0,2.0,3.0}").Results("{1.0,2.0,3.0}"),
+		},
+		"SELECT $1:::DECIMAL[]": {
+			baseTest.SetArgs("{1.000}").Results("{1.000}"),
+		},
+		"SELECT $1:::STRING[]": {
+			baseTest.SetArgs(`{aaa}`).Results(`{"aaa"}`),
+			baseTest.SetArgs(`{"aaa"}`).Results(`{"aaa"}`),
+			baseTest.SetArgs(`{aaa,bbb,ccc}`).Results(`{"aaa","bbb","ccc"}`),
+		},
+		"SELECT $1:::JSON": {
+			baseTest.SetArgs(`true`).Results(`true`),
+			baseTest.SetArgs(`"hello"`).Results(`"hello"`),
 		},
 
 		// TODO(jordan): blocked on #13651
@@ -869,81 +907,80 @@ func TestPGPreparedQuery(t *testing.T) {
 		tests []preparedQueryTest,
 		queryFunc func(...interface{}) (*gosql.Rows, error),
 	) {
-		for _, test := range tests {
-			if testing.Verbose() || log.V(1) {
-				log.Infof(context.Background(), "query: %s", query)
-			}
-			rows, err := queryFunc(test.qargs...)
-			if err != nil {
-				if test.error == "" {
-					t.Errorf("%s: %v: unexpected error: %s", query, test.qargs, err)
-				} else {
-					expectedErr := test.error
-					if prepared && test.preparedError != "" {
-						expectedErr = test.preparedError
+		for idx, test := range tests {
+			t.Run(fmt.Sprintf("%d", idx), func(t *testing.T) {
+				if testing.Verbose() || log.V(1) {
+					log.Infof(context.Background(), "query: %s", query)
+				}
+				rows, err := queryFunc(test.qargs...)
+				if err != nil {
+					if test.error == "" {
+						t.Errorf("%s: %v: unexpected error: %s", query, test.qargs, err)
+					} else {
+						expectedErr := test.error
+						if prepared && test.preparedError != "" {
+							expectedErr = test.preparedError
+						}
+						if err.Error() != expectedErr {
+							t.Errorf("%s: %v: expected error: %s, got %s", query, test.qargs, expectedErr, err)
+						}
 					}
-					if err.Error() != expectedErr {
-						t.Errorf("%s: %v: expected error: %s, got %s", query, test.qargs, expectedErr, err)
+					return
+				}
+				defer rows.Close()
+
+				if test.error != "" {
+					t.Fatalf("expected error: %s: %v", query, test.qargs)
+				}
+
+				for _, expected := range test.results {
+					if !rows.Next() {
+						t.Fatalf("expected row: %s: %v", query, test.qargs)
+					}
+					dst := make([]interface{}, len(expected))
+					for i, d := range expected {
+						dst[i] = reflect.New(reflect.TypeOf(d)).Interface()
+					}
+					if err := rows.Scan(dst...); err != nil {
+						t.Error(err)
+					}
+					for i, d := range dst {
+						dst[i] = reflect.Indirect(reflect.ValueOf(d)).Interface()
+					}
+					if len(dst) > 0 && len(expected) > 0 && !reflect.DeepEqual(dst, expected) {
+						t.Errorf("%s: %v: expected %v, got %v", query, test.qargs, expected, dst)
 					}
 				}
-				continue
-			}
-			defer rows.Close()
-
-			if test.error != "" {
-				t.Errorf("expected error: %s: %v", query, test.qargs)
-				continue
-			}
-
-			for _, expected := range test.results {
-				if !rows.Next() {
-					t.Errorf("expected row: %s: %v", query, test.qargs)
-					continue
+				for rows.Next() {
+					if test.others > 0 {
+						test.others--
+						continue
+					}
+					cols, err := rows.Columns()
+					if err != nil {
+						t.Errorf("%s: %s", query, err)
+						continue
+					}
+					// Unexpected line. Get and print out the details.
+					dst := make([]interface{}, len(cols))
+					for i := range dst {
+						dst[i] = new(interface{})
+					}
+					if err := rows.Scan(dst...); err != nil {
+						t.Errorf("%s: %s", query, err)
+						continue
+					}
+					b, err := json.Marshal(dst)
+					if err != nil {
+						t.Errorf("%s: %s", query, err)
+						continue
+					}
+					t.Errorf("%s: unexpected row: %s", query, b)
 				}
-				dst := make([]interface{}, len(expected))
-				for i, d := range expected {
-					dst[i] = reflect.New(reflect.TypeOf(d)).Interface()
-				}
-				if err := rows.Scan(dst...); err != nil {
-					t.Error(err)
-				}
-				for i, d := range dst {
-					dst[i] = reflect.Indirect(reflect.ValueOf(d)).Interface()
-				}
-				if !reflect.DeepEqual(dst, expected) {
-					t.Errorf("%s: %v: expected %v, got %v", query, test.qargs, expected, dst)
-				}
-			}
-			for rows.Next() {
 				if test.others > 0 {
-					test.others--
-					continue
+					t.Fatalf("%s: expected %d more rows", query, test.others)
 				}
-				cols, err := rows.Columns()
-				if err != nil {
-					t.Errorf("%s: %s", query, err)
-					continue
-				}
-				// Unexpected line. Get and print out the details.
-				dst := make([]interface{}, len(cols))
-				for i := range dst {
-					dst[i] = new(interface{})
-				}
-				if err := rows.Scan(dst...); err != nil {
-					t.Errorf("%s: %s", query, err)
-					continue
-				}
-				b, err := json.Marshal(dst)
-				if err != nil {
-					t.Errorf("%s: %s", query, err)
-					continue
-				}
-				t.Errorf("%s: unexpected row: %s", query, b)
-			}
-			if test.others > 0 {
-				t.Errorf("%s: expected %d more rows", query, test.others)
-				continue
-			}
+			})
 		}
 	}
 
@@ -955,7 +992,11 @@ CREATE TABLE d.ts (a TIMESTAMP, b DATE);
 CREATE TABLE d.two (a INT, b INT);
 CREATE TABLE d.intStr (a INT, s STRING);
 CREATE TABLE d.str (s STRING, b BYTES);
-CREATE TABLE d.empty ();`
+CREATE TABLE d.emptynorows (); -- zero columns, zero rows
+CREATE TABLE d.emptyrows (x INT);
+INSERT INTO d.emptyrows VALUES (1),(2),(3);
+ALTER TABLE d.emptyrows DROP COLUMN x; -- zero columns, 3 rows
+`
 	if _, err := db.Exec(initStmt); err != nil {
 		t.Fatal(err)
 	}
@@ -1097,7 +1138,7 @@ func TestPGPreparedExec(t *testing.T) {
 			"DROP TABLE d.t",
 			[]preparedExecTest{
 				baseTest,
-				baseTest.Error(`pq: table "d.t" does not exist`),
+				baseTest.Error(`pq: relation "d.t" does not exist`),
 			},
 		},
 		{
@@ -1124,9 +1165,33 @@ func TestPGPreparedExec(t *testing.T) {
 			},
 		},
 		{
-			"DROP DATABASE d",
+			"DROP DATABASE d CASCADE",
 			[]preparedExecTest{
 				baseTest,
+			},
+		},
+		{
+			"CANCEL JOB $1",
+			[]preparedExecTest{
+				baseTest.SetArgs(123).Error("pq: job with ID 123 does not exist"),
+			},
+		},
+		{
+			"RESUME JOB $1",
+			[]preparedExecTest{
+				baseTest.SetArgs(123).Error("pq: job with ID 123 does not exist"),
+			},
+		},
+		{
+			"PAUSE JOB $1",
+			[]preparedExecTest{
+				baseTest.SetArgs(123).Error("pq: job with ID 123 does not exist"),
+			},
+		},
+		{
+			"CANCEL QUERY $1",
+			[]preparedExecTest{
+				baseTest.SetArgs("01").Error("pq: could not cancel query 00000000000000000000000000000001: query ID 00000000000000000000000000000001 not found"),
 			},
 		},
 		// An empty string is valid in postgres.
@@ -1156,48 +1221,58 @@ func TestPGPreparedExec(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
 
-	runTests := func(query string, tests []preparedExecTest, execFunc func(...interface{}) (gosql.Result, error)) {
-		for _, test := range tests {
-			if testing.Verbose() || log.V(1) {
-				log.Infof(context.Background(), "exec: %s", query)
-			}
-			if result, err := execFunc(test.qargs...); err != nil {
-				if test.error == "" {
-					t.Errorf("%s: %v: unexpected error: %s", query, test.qargs, err)
-				} else if err.Error() != test.error {
-					t.Errorf("%s: %v: expected error: %s, got %s", query, test.qargs, test.error, err)
+	runTests := func(
+		t *testing.T, query string, tests []preparedExecTest, execFunc func(...interface{},
+		) (gosql.Result, error)) {
+		for idx, test := range tests {
+			t.Run(fmt.Sprintf("%d", idx), func(t *testing.T) {
+				if testing.Verbose() || log.V(1) {
+					log.Infof(context.Background(), "exec: %s", query)
 				}
-			} else {
-				rowsAffected, err := result.RowsAffected()
-				if !testutils.IsError(err, test.rowsAffectedErr) {
-					t.Errorf("%s: %v: expected %q, got %v", query, test.qargs, test.rowsAffectedErr, err)
-				} else if rowsAffected != test.rowsAffected {
-					t.Errorf("%s: %v: expected %v, got %v", query, test.qargs, test.rowsAffected, rowsAffected)
+				if result, err := execFunc(test.qargs...); err != nil {
+					if test.error == "" {
+						t.Errorf("%s: %v: unexpected error: %s", query, test.qargs, err)
+					} else if err.Error() != test.error {
+						t.Errorf("%s: %v: expected error: %s, got %s", query, test.qargs, test.error, err)
+					}
+				} else {
+					rowsAffected, err := result.RowsAffected()
+					if !testutils.IsError(err, test.rowsAffectedErr) {
+						t.Errorf("%s: %v: expected %q, got %v", query, test.qargs, test.rowsAffectedErr, err)
+					} else if rowsAffected != test.rowsAffected {
+						t.Errorf("%s: %v: expected %v, got %v", query, test.qargs, test.rowsAffected, rowsAffected)
+					}
 				}
-			}
+			})
 		}
 	}
 
-	for _, execTest := range execTests {
-		runTests(execTest.query, execTest.tests, func(args ...interface{}) (gosql.Result, error) {
-			return db.Exec(execTest.query, args...)
-		})
-	}
-
-	for _, execTest := range execTests {
-		if testing.Verbose() || log.V(1) {
-			log.Infof(context.Background(), "prepare: %s", execTest.query)
+	t.Run("exec", func(t *testing.T) {
+		for _, execTest := range execTests {
+			t.Run(execTest.query, func(t *testing.T) {
+				runTests(t, execTest.query, execTest.tests, func(args ...interface{}) (gosql.Result, error) {
+					return db.Exec(execTest.query, args...)
+				})
+			})
 		}
-		if stmt, err := db.Prepare(execTest.query); err != nil {
-			t.Errorf("%s: prepare error: %s", execTest.query, err)
-		} else {
-			func() {
-				defer stmt.Close()
+	})
 
-				runTests(execTest.query, execTest.tests, stmt.Exec)
-			}()
+	t.Run("prepare", func(t *testing.T) {
+		for _, execTest := range execTests {
+			t.Run(execTest.query, func(t *testing.T) {
+				if testing.Verbose() || log.V(1) {
+					log.Infof(context.Background(), "prepare: %s", execTest.query)
+				}
+				if stmt, err := db.Prepare(execTest.query); err != nil {
+					t.Errorf("%s: prepare error: %s", execTest.query, err)
+				} else {
+					defer stmt.Close()
+
+					runTests(t, execTest.query, execTest.tests, stmt.Exec)
+				}
+			})
 		}
-	}
+	})
 }
 
 // Names should be qualified automatically during Prepare when a database name
@@ -1678,5 +1753,37 @@ func TestPGWireResultChange(t *testing.T) {
 	}
 	if count != countAfter {
 		t.Fatalf("expected %d rows, got %d", count, countAfter)
+	}
+}
+
+func TestPGWireTooManyArguments(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanupFn()
+
+	db, err := gosql.Open("postgres", pgURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	query := "SELECT"
+
+	args := make([]interface{}, 1<<16)
+	for i := 1; i <= 1<<16; i++ {
+		comma := ","
+		if i == 1 {
+			comma = ""
+		}
+		query += fmt.Sprintf("%s $%d::int", comma, i)
+		args[i-1] = i
+	}
+	query += ";"
+
+	if _, err := db.Prepare(query); !testutils.IsError(err, "more than 65535 arguments") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

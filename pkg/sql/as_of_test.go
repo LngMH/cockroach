@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@gmail.com)
 
 package sql_test
 
@@ -24,6 +22,7 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -65,7 +64,7 @@ func TestAsOfTime(t *testing.T) {
 	if err := db.QueryRow("CREATE DATABASE d; SELECT cluster_logical_timestamp()").Scan(&tsDBExists); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Query(fmt.Sprintf(query, tsDBExists), 0); !testutils.IsError(err, `pq: table "d.t" does not exist`) {
+	if _, err := db.Query(fmt.Sprintf(query, tsDBExists), 0); !testutils.IsError(err, `pq: relation "d.t" does not exist`) {
 		t.Fatal(err)
 	}
 
@@ -115,45 +114,50 @@ func TestAsOfTime(t *testing.T) {
 	}
 
 	// Future queries shouldn't work.
-	if err := db.QueryRow("SELECT a FROM d.t AS OF SYSTEM TIME '2200-01-01'").Scan(&i); err == nil {
-		t.Fatal("expected error")
-	} else if !testutils.IsError(err, "pq: cannot specify timestamp in the future") {
+	if err := db.QueryRow("SELECT a FROM d.t AS OF SYSTEM TIME '2200-01-01'").Scan(&i); !testutils.IsError(err, "pq: AS OF SYSTEM TIME: cannot specify timestamp in the future") {
 		t.Fatal(err)
 	}
 
 	// Verify queries with positive scale work properly.
-	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1e1"); err == nil {
-		t.Fatal("expected error")
-	} else if !testutils.IsError(err, `pq: database "d" does not exist`) {
+	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1e1"); !testutils.IsError(err, `pq: database "d" does not exist`) {
 		t.Fatal(err)
 	}
 
 	// Verify queries with large exponents error properly.
-	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1e40"); err == nil {
-		t.Fatal("expected error")
-	} else if !testutils.IsError(err, "value out of range") {
+	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1e40"); !testutils.IsError(err, "value out of range") {
 		t.Fatal(err)
 	}
 
 	// Verify logical parts parse with < 10 digits.
-	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1.123456789"); err == nil {
-		t.Fatal("expected error")
-	} else if !testutils.IsError(err, `pq: database "d" does not exist`) {
+	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1.123456789"); !testutils.IsError(err, `pq: database "d" does not exist`) {
 		t.Fatal(err)
 	}
 
 	// Verify logical parts parse with == 10 digits.
-	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1.1234567890"); err == nil {
-		t.Fatal("expected error")
-	} else if !testutils.IsError(err, `pq: database "d" does not exist`) {
+	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1.1234567890"); !testutils.IsError(err, `pq: database "d" does not exist`) {
 		t.Fatal(err)
 	}
 
 	// Too much logical precision is an error.
-	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1.12345678901"); err == nil {
-		t.Fatal("expected error")
-	} else if !testutils.IsError(err, "logical part has too many digits") {
+	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1.12345678901"); !testutils.IsError(err, "logical part has too many digits") {
 		t.Fatal(err)
+	}
+
+	// Ditto, as string.
+	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME '1.12345678901'"); !testutils.IsError(err, "logical part has too many digits") {
+		t.Fatal(err)
+	}
+
+	// String values that are neither timestamps nor decimals are an error.
+	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 'xxx'"); !testutils.IsError(err, "value is neither timestamp nor decimal") {
+		t.Fatal(err)
+	}
+
+	// Zero is not a valid value.
+	for _, zero := range []string{"0", "'0'", "0.0000000000", "'0.0000000000'"} {
+		if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME " + zero); !testutils.IsError(err, "zero timestamp is invalid") {
+			t.Fatal(err)
+		}
 	}
 
 	// Old queries shouldn't work.
@@ -164,9 +168,7 @@ func TestAsOfTime(t *testing.T) {
 	}
 
 	// Subqueries shouldn't work.
-	if _, err := db.Query(fmt.Sprintf("SELECT (SELECT a FROM d.t AS OF SYSTEM TIME %s)", tsVal1)); err == nil {
-		t.Fatal("expected error")
-	} else if !testutils.IsError(err, "pq: unexpected AS OF SYSTEM TIME") {
+	if _, err := db.Query(fmt.Sprintf("SELECT (SELECT a FROM d.t AS OF SYSTEM TIME %s)", tsVal1)); !testutils.IsError(err, "pq: unexpected AS OF SYSTEM TIME") {
 		t.Fatal(err)
 	}
 
@@ -181,9 +183,7 @@ func TestAsOfTime(t *testing.T) {
 	}
 
 	// Can't use in a transaction.
-	if _, err := db.Query(fmt.Sprintf("BEGIN; SELECT a FROM d.t AS OF SYSTEM TIME %s; COMMIT;", tsVal1)); err == nil {
-		t.Fatal("expected error")
-	} else if !testutils.IsError(err, "pq: unexpected AS OF SYSTEM TIME") {
+	if _, err := db.Query(fmt.Sprintf("BEGIN; SELECT a FROM d.t AS OF SYSTEM TIME %s; COMMIT;", tsVal1)); !testutils.IsError(err, "pq: unexpected AS OF SYSTEM TIME") {
 		t.Fatal(err)
 	}
 }
@@ -196,7 +196,7 @@ func TestAsOfRetry(t *testing.T) {
 
 	params, cmdFilters := createTestServerParams()
 	// Disable one phase commits because they cannot be restarted.
-	params.Knobs.Store.(*storage.StoreTestingKnobs).DisableOnePhaseCommits = true
+	params.Knobs.Store.(*storage.StoreTestingKnobs).DisableOptional1PC = true
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 
@@ -231,7 +231,7 @@ func TestAsOfRetry(t *testing.T) {
 	if _, err := parser.ExactCtx.Sub(walltime, walltime, oneTick); err != nil {
 		t.Fatal(err)
 	}
-	tsVal1 := walltime.ToStandard()
+	tsVal1 := walltime.Text('f')
 
 	// Set up error injection that causes retries.
 	magicVals := createFilterVals(nil, nil)
@@ -245,6 +245,9 @@ func TestAsOfRetry(t *testing.T) {
 
 			switch req := args.Req.(type) {
 			case *roachpb.ScanRequest:
+				if client.TestingIsRangeLookupRequest(req) {
+					return nil
+				}
 				for key, count := range magicVals.restartCounts {
 					if err := checkCorrectTxn(string(req.Key), magicVals, args.Hdr.Txn); err != nil {
 						return roachpb.NewError(err)

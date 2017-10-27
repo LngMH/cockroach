@@ -36,7 +36,7 @@ export interface SimplifiedEvent {
 // Specialization of generic SortedTable component:
 //   https://github.com/Microsoft/TypeScript/issues/3960
 //
-// The variable name must start with a capital letter or TSX will not recognize
+// The variable name must start with a capital letter or JSX will not recognize
 // it as a component.
 // tslint:disable-next-line:variable-name
 const EventSortedTable = SortedTable as new () => SortedTable<SimplifiedEvent>;
@@ -56,6 +56,8 @@ export function getEventInfo(e: Event$Properties): SimplifiedEvent {
     TableName: string,
     User: string,
     ViewName: string,
+    SettingName: string,
+    Value: string,
   } = protobuf.util.isset(e, "info") ? JSON.parse(e.info) : {};
   const targetId: number = e.target_id ? e.target_id.toNumber() : null;
   let content: React.ReactNode;
@@ -99,13 +101,25 @@ export function getEventInfo(e: Event$Properties): SimplifiedEvent {
       content = <span>Schema Change Reversed: Schema change with ID {info.MutationID} was reversed.</span>;
       break;
     case eventTypes.FINISH_SCHEMA_CHANGE:
-      content = <span>Schema Change Finished: Schema Change Completed: Schema change with ID {info.MutationID} was completed.</span>;
+      content = <span>Schema Change Completed: Schema change with ID {info.MutationID} was completed.</span>;
+      break;
+    case eventTypes.FINISH_SCHEMA_CHANGE_ROLLBACK:
+      content = <span>Schema Change Rollback Completed: Rollback of schema change with ID {info.MutationID} was completed.</span>;
       break;
     case eventTypes.NODE_JOIN:
       content = <span>Node Joined: Node {targetId} joined the cluster</span>;
       break;
+    case eventTypes.NODE_DECOMMISSIONED:
+      content = <span>Node Decommissioned: Node {targetId} was decommissioned</span>;
+      break;
+    case eventTypes.NODE_RECOMMISSIONED:
+      content = <span>Node Recommissioned: Node {targetId} was recommissioned</span>;
+      break;
     case eventTypes.NODE_RESTART:
       content = <span>Node Rejoined: Node {targetId} rejoined the cluster</span>;
+      break;
+    case eventTypes.SET_CLUSTER_SETTING:
+      content = <span>Cluster Setting Changed: User {info.User} set {info.SettingName} to {info.Value}</span>;
       break;
     default:
       content = <span>Unknown Event Type: {e.event_type}, content: {s(info)}</span>;
@@ -202,8 +216,8 @@ export class EventPageUnconnected extends React.Component<EventPageProps, {}> {
       <section className="section parent-link">
         <Link to="/cluster">&lt; Back to Cluster</Link>
       </section>
-      <section className="header header--subsection">
-        Events
+      <section className="section section--heading">
+        <h2>Events</h2>
       </section>
       <section className="section l-columns">
         <div className="l-columns__left events-table">

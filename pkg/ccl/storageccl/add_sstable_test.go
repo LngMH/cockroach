@@ -10,12 +10,17 @@ package storageccl
 
 import (
 	"bytes"
+	"fmt"
+	"math/rand"
 	"reflect"
+	"sort"
 	"testing"
 
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -24,6 +29,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/kr/pretty"
 )
 
@@ -42,94 +49,126 @@ func singleKVSSTable(key engine.MVCCKey, value []byte) ([]byte, error) {
 
 func TestDBAddSSTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	t.Run("store=in-memory", func(t *testing.T) {
+		s, _, db := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
+		ctx := context.Background()
+		defer s.Stopper().Stop(ctx)
+		runTestDBAddSSTable(ctx, t, db)
+	})
+	t.Run("store=on-disk", func(t *testing.T) {
+		dir, dirCleanupFn := testutils.TempDir(t)
+		defer dirCleanupFn()
 
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
-	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
+		storeSpec := base.DefaultTestStoreSpec
+		storeSpec.InMemory = false
+		storeSpec.Path = dir
+		s, _, db := serverutils.StartServer(t, base.TestServerArgs{
+			Insecure:   true,
+			StoreSpecs: []base.StoreSpec{storeSpec},
+		})
+		ctx := context.Background()
+		defer s.Stopper().Stop(ctx)
+		runTestDBAddSSTable(ctx, t, db)
+	})
+}
 
+func runTestDBAddSSTable(ctx context.Context, t *testing.T, db *client.DB) {
 	{
-		key := engine.MVCCKey{Key: []byte("bb"), Timestamp: hlc.Timestamp{WallTime: 1}}
+		key := engine.MVCCKey{Key: []byte("bb"), Timestamp: hlc.Timestamp{WallTime: 2}}
 		data, err := singleKVSSTable(key, roachpb.MakeValueFromString("1").RawBytes)
 		if err != nil {
 			t.Fatalf("%+v", err)
 		}
 
 		// Key is before the range in the request span.
-		if err := db.ExperimentalAddSSTable(
+		if err := db.AddSSTable(
 			ctx, "d", "e", data,
 		); !testutils.IsError(err, "not in request range") {
 			t.Fatalf("expected request range error got: %+v", err)
 		}
 		// Key is after the range in the request span.
-		if err := db.ExperimentalAddSSTable(
+		if err := db.AddSSTable(
 			ctx, "a", "b", data,
 		); !testutils.IsError(err, "not in request range") {
 			t.Fatalf("expected request range error got: %+v", err)
 		}
 
-		ingestCtx, collect := testutils.MakeRecordCtx()
-		defer collect()
-		if err := db.ExperimentalAddSSTable(ingestCtx, "b", "c", data); err != nil {
+		// Do an initial ingest.
+		ingestCtx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, "test-recording")
+		defer cancel()
+		if err := db.AddSSTable(ingestCtx, "b", "c", data); err != nil {
 			t.Fatalf("%+v", err)
 		}
-		if err := testutils.MatchInOrder(collect(),
+		if err := testutils.MatchInOrder(tracing.FormatRecordedSpans(collect()),
 			"evaluating AddSSTable",
-			"key range is empty; commencing with SSTable proposal",
 			"sideloadable proposal detected",
 			"ingested SSTable at index",
 		); err != nil {
 			t.Fatal(err)
 		}
 
-		if result, err := db.Get(ctx, "bb"); err != nil {
+		if r, err := db.Get(ctx, "bb"); err != nil {
 			t.Fatalf("%+v", err)
-		} else if result := result.ValueBytes(); !bytes.Equal([]byte("1"), result) {
-			t.Errorf("expected %q, got %q", []byte("1"), result)
+		} else if expected := []byte("1"); !bytes.Equal(expected, r.ValueBytes()) {
+			t.Errorf("expected %q, got %q", expected, r.ValueBytes())
 		}
 	}
 
-	// Key range in request span is not empty.
-	//
-	// Doing the same ingestion multiple times highlights the case in which the
-	// deletion of existing data overlaps the data being ingested. This case is
-	// central in that it's likely the scenario in practice, and that a lot of
-	// special care goes into handling it (TL;DR is we can't ingest and clear
-	// overlapping data safely; instead we don't use sideloading).
-	ingestCtx, collect := testutils.MakeRecordCtx()
-	defer collect()
-	for i := 0; i < 2; i++ {
-		key := engine.MVCCKey{Key: []byte("bb2"), Timestamp: hlc.Timestamp{WallTime: 1}}
+	// Check that ingesting a key with an earlier mvcc timestamp doesn't affect
+	// the value returned by Get.
+	{
+		key := engine.MVCCKey{Key: []byte("bb"), Timestamp: hlc.Timestamp{WallTime: 1}}
 		data, err := singleKVSSTable(key, roachpb.MakeValueFromString("2").RawBytes)
 		if err != nil {
 			t.Fatalf("%+v", err)
 		}
-		if err := db.ExperimentalAddSSTable(ingestCtx, "b", "c", data); err != nil {
+
+		if err := db.AddSSTable(ctx, "b", "c", data); err != nil {
 			t.Fatalf("%+v", err)
 		}
-
-		if result, err := db.Get(ctx, "bb2"); err != nil {
+		if r, err := db.Get(ctx, "bb"); err != nil {
 			t.Fatalf("%+v", err)
-		} else if result := result.ValueBytes(); !bytes.Equal([]byte("2"), result) {
-			t.Errorf("expected %q, got %q", []byte("2"), result)
-		}
-
-		if result, err := db.Get(ctx, "bb"); err != nil {
-			t.Fatalf("%+v", err)
-		} else if result := result.ValueBytes(); result != nil {
-			t.Errorf("expected nil, got %q", result)
+		} else if expected := []byte("1"); !bytes.Equal(expected, r.ValueBytes()) {
+			t.Errorf("expected %q, got %q", expected, r.ValueBytes())
 		}
 	}
-	if err := testutils.MatchInOrder(collect(),
-		"evaluating AddSSTable",
-		"target key range not empty, will clear existing data",
-		"key range contains existing data",
-		"falling back to regular WriteBatch",
-		"evaluating AddSSTable",
-		"target key range not empty, will clear existing data",
-		"key range contains existing data",
-		"falling back to regular WriteBatch",
-	); err != nil {
-		t.Fatal(err)
+
+	// Key range in request span is not empty. First time through a different
+	// key is present. Second time through checks the idempotency.
+	{
+		key := engine.MVCCKey{Key: []byte("bc"), Timestamp: hlc.Timestamp{WallTime: 1}}
+		data, err := singleKVSSTable(key, roachpb.MakeValueFromString("3").RawBytes)
+		if err != nil {
+			t.Fatalf("%+v", err)
+		}
+
+		for i := 0; i < 2; i++ {
+			ingestCtx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, "test-recording")
+			defer cancel()
+
+			if err := db.AddSSTable(ingestCtx, "b", "c", data); err != nil {
+				t.Fatalf("%+v", err)
+			}
+			if err := testutils.MatchInOrder(tracing.FormatRecordedSpans(collect()),
+				"evaluating AddSSTable",
+				"target key range not empty, will merge existing data with sstable",
+				"sideloadable proposal detected",
+				"ingested SSTable at index",
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			if r, err := db.Get(ctx, "bb"); err != nil {
+				t.Fatalf("%+v", err)
+			} else if expected := []byte("1"); !bytes.Equal(expected, r.ValueBytes()) {
+				t.Errorf("expected %q, got %q", expected, r.ValueBytes())
+			}
+			if r, err := db.Get(ctx, "bc"); err != nil {
+				t.Fatalf("%+v", err)
+			} else if expected := []byte("3"); !bytes.Equal(expected, r.ValueBytes()) {
+				t.Errorf("expected %q, got %q", expected, r.ValueBytes())
+			}
+		}
 	}
 
 	// Invalid key/value entry checksum.
@@ -142,72 +181,164 @@ func TestDBAddSSTable(t *testing.T) {
 			t.Fatalf("%+v", err)
 		}
 
-		if err := db.ExperimentalAddSSTable(ctx, "b", "c", data); !testutils.IsError(err, "invalid checksum") {
+		if err := db.AddSSTable(ctx, "b", "c", data); !testutils.IsError(err, "invalid checksum") {
 			t.Fatalf("expected 'invalid checksum' error got: %+v", err)
 		}
 	}
 }
 
+func randomMVCCKeyValues(rng *rand.Rand, numKVs int) []engine.MVCCKeyValue {
+	kvs := make([]engine.MVCCKeyValue, numKVs)
+	for i := range kvs {
+		kvs[i] = engine.MVCCKeyValue{
+			Key: engine.MVCCKey{
+				Key:       randutil.RandBytes(rng, 1),
+				Timestamp: hlc.Timestamp{WallTime: 1 + rand.Int63n(10)},
+			},
+			Value: roachpb.MakeValueFromBytes(randutil.RandBytes(rng, rng.Intn(10))).RawBytes,
+		}
+		if rng.Intn(100) < 25 {
+			// 25% of the time, make the entry a deletion tombstone.
+			kvs[i].Value = nil
+		}
+	}
+	return kvs
+}
+
+type mvccKeyValues []engine.MVCCKeyValue
+
+func (kvs mvccKeyValues) Len() int           { return len(kvs) }
+func (kvs mvccKeyValues) Less(i, j int) bool { return kvs[i].Key.Less(kvs[j].Key) }
+func (kvs mvccKeyValues) Swap(i, j int)      { kvs[i], kvs[j] = kvs[j], kvs[i] }
+
 func TestAddSSTableMVCCStats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	rng, seed := randutil.NewPseudoRand()
+	t.Logf("random seed: %d", seed)
+
+	const numIterations, maxKVs = 10, 100
 
 	ctx := context.Background()
 	e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
 	defer e.Close()
 
-	key := engine.MVCCKey{Key: []byte("bb"), Timestamp: hlc.Timestamp{WallTime: 1}}
-	data, err := singleKVSSTable(key, roachpb.MakeValueFromString("1").RawBytes)
-	if err != nil {
-		t.Fatalf("%+v", err)
-	}
-	span := roachpb.Span{Key: []byte("b"), EndKey: []byte("c")}
+	// This test repeatedly:
+	// - puts some random data in an engine
+	// - randomly makes one key an intent
+	// - puts some random data in an sst
+	// - computes pre-ingest mvcc stats for the engine
+	// - gets the mvcc stats diff from evalAddSSTable for the sst
+	// - ingests the sstable into the engine
+	// - computes post-ingest mvcc stats for the engine
+	// - compares pre-ingest + diff stats vs post-ingest stats
+	//
+	// Each time through, the engine accumulates more directly Put keys and more
+	// ingested sstables.
+	var nowNanos int64
+	for i := 0; i < numIterations; i++ {
+		nowNanos += rng.Int63n(1e9)
+		for _, kv := range randomMVCCKeyValues(rng, 1+rand.Intn(maxKVs)) {
+			if err := e.Put(kv.Key, kv.Value); err != nil {
+				t.Fatalf("%+v", err)
+			}
+		}
+		// Add in a random metadata key.
+		ts := hlc.Timestamp{WallTime: nowNanos}
+		txn := roachpb.MakeTransaction(
+			"test",
+			nil, // baseKey
+			roachpb.NormalUserPriority,
+			enginepb.SERIALIZABLE,
+			ts,
+			base.DefaultMaxClockOffset.Nanoseconds(),
+		)
+		if err := engine.MVCCPut(
+			ctx, e, nil, randutil.RandBytes(rng, 1), ts,
+			roachpb.MakeValueFromBytes(randutil.RandBytes(rng, rng.Intn(10))),
+			&txn,
+		); err != nil {
+			if _, isWriteIntentErr := err.(*roachpb.WriteIntentError); !isWriteIntentErr {
+				t.Fatalf("%+v", err)
+			}
+		}
 
-	// AddSSTable deletes any data that exists in the keyrange before applying
-	// the batch. Put something there to delete. The mvcc stats should be
-	// adjusted accordingly.
-	const numInitialEntries = 100
-	for i := 0; i < numInitialEntries; i++ {
-		if err := e.Put(engine.MVCCKey{Key: append([]byte("b"), byte(i))}, nil); err != nil {
+		sstBytes := func() []byte {
+			sst, err := engine.MakeRocksDBSstFileWriter()
+			if err != nil {
+				t.Fatalf("%+v", err)
+			}
+			defer sst.Close()
+			sstKVs := mvccKeyValues(randomMVCCKeyValues(rng, 1+rand.Intn(maxKVs)))
+			sort.Sort(sstKVs)
+			var prevKey engine.MVCCKey
+			for _, kv := range sstKVs {
+				if kv.Key.Equal(prevKey) {
+					// RocksDB doesn't let us add the same key twice.
+					continue
+				}
+				prevKey.Key = append(prevKey.Key[:0], kv.Key.Key...)
+				prevKey.Timestamp = kv.Key.Timestamp
+				if err := sst.Add(kv); err != nil {
+					t.Fatalf("%+v", err)
+				}
+			}
+			sstBytes, err := sst.Finish()
+			if err != nil {
+				t.Fatalf("%+v", err)
+			}
+			return sstBytes
+		}()
+
+		nowNanos += rng.Int63n(1e9)
+		cArgs := storage.CommandArgs{
+			Header: roachpb.Header{
+				Timestamp: hlc.Timestamp{WallTime: nowNanos},
+			},
+			Args: &roachpb.AddSSTableRequest{
+				Span: roachpb.Span{Key: keys.MinKey, EndKey: keys.MaxKey},
+				Data: sstBytes,
+			},
+			Stats: &enginepb.MVCCStats{},
+		}
+		_, err := evalAddSSTable(ctx, e, cArgs, nil)
+		if err != nil {
 			t.Fatalf("%+v", err)
 		}
-	}
 
-	cArgs := storage.CommandArgs{
-		Args: &roachpb.AddSSTableRequest{
-			Span: span,
-			Data: data,
-		},
-		// Start with some stats to represent data throughout the replica's
-		// keyrange.
-		Stats: &enginepb.MVCCStats{
-			LiveBytes: 10000,
-			LiveCount: 10000,
-			KeyBytes:  10000,
-			KeyCount:  10000,
-			ValBytes:  10000,
-			ValCount:  10000,
-		},
-	}
-	if _, err := evalAddSSTable(ctx, e, cArgs, nil); err != nil {
-		t.Fatalf("%+v", err)
-	}
+		// After evalAddSSTable, cArgs.Stats contains a diff to the existing
+		// stats. Make sure recomputing from scratch gets the same answer as
+		// applying the diff to the stats
+		beforeStats := func() enginepb.MVCCStats {
+			iter := e.NewIterator(false)
+			defer iter.Close()
+			beforeStats, err := engine.ComputeStatsGo(iter, engine.NilKey, engine.MVCCKeyMax, nowNanos)
+			if err != nil {
+				t.Fatalf("%+v", err)
+			}
+			return beforeStats
+		}()
+		beforeStats.Add(*cArgs.Stats)
 
-	expectedStats := &enginepb.MVCCStats{
-		LiveBytes:       9721,
-		LiveCount:       9901,
-		KeyBytes:        9715,
-		KeyCount:        9901,
-		ValBytes:        10006,
-		ValCount:        10001,
-		LastUpdateNanos: key.Timestamp.WallTime,
-	}
+		filename := fmt.Sprintf("/%d.sst", i)
+		if err := e.WriteFile(filename, sstBytes); err != nil {
+			t.Fatalf("%+v", err)
+		}
+		if err := e.IngestExternalFile(ctx, filename, false /* move */); err != nil {
+			t.Fatalf("%+v", err)
+		}
 
-	if !reflect.DeepEqual(expectedStats, cArgs.Stats) {
-		t.Errorf("mvcc stats mismatch: diff(expected, actual): %s", pretty.Diff(expectedStats, cArgs.Stats))
-	}
+		afterStats := func() enginepb.MVCCStats {
+			iter := e.NewIterator(false)
+			defer iter.Close()
+			afterStats, err := engine.ComputeStatsGo(iter, engine.NilKey, engine.MVCCKeyMax, nowNanos)
+			if err != nil {
+				t.Fatalf("%+v", err)
+			}
+			return afterStats
+		}()
 
-	// TODO(dan): The WriteBatch test runs this again to test the idempotence,
-	// but AddSSTable requires the ReplicatedEvalResult to be resolved before
-	// this will work. Rewrite this test to use TestServer and add the
-	// idempotence test back.
+		if !reflect.DeepEqual(beforeStats, afterStats) {
+			t.Errorf("mvcc stats mismatch: diff(expected, actual): %s", pretty.Diff(afterStats, beforeStats))
+		}
+	}
 }

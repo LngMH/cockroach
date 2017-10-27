@@ -11,15 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrew Bonventre (andybons@gmail.com)
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Jiang-Ming Yang (jiangming.yang@gmail.com)
 
 package engine
 
 import (
-	"github.com/gogo/protobuf/proto"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -86,7 +81,7 @@ type Iterator interface {
 	Value() []byte
 	// ValueProto unmarshals the value the iterator is currently
 	// pointing to using a protobuf decoder.
-	ValueProto(msg proto.Message) error
+	ValueProto(msg protoutil.Message) error
 	// Less returns true if the key the iterator is currently positioned at is
 	// less than the specified key.
 	Less(key MVCCKey) bool
@@ -98,6 +93,14 @@ type Iterator interface {
 	// The nowNanos arg specifies the wall time in nanoseconds since the
 	// epoch and is used to compute the total age of all intents.
 	ComputeStats(start, end MVCCKey, nowNanos int64) (enginepb.MVCCStats, error)
+	// FindSplitKey finds a key from the given span such that the left side of
+	// the split is roughly targetSize bytes. The returned key will never be
+	// chosen from the key ranges listed in keys.NoSplitSpans if
+	// allowMeta2Splits is true and keys.NoSplitSpansWithoutMeta2Splits if
+	// allowMeta2Splits is false.
+	//
+	// TODO: remove allowMeta2Splits in version 1.3.
+	FindSplitKey(start, end, minSplitKey MVCCKey, targetSize int64, allowMeta2Splits bool) (MVCCKey, error)
 }
 
 // Reader is the read interface to an engine's data.
@@ -118,7 +121,7 @@ type Reader interface {
 	// using a protobuf decoder. Returns true on success or false if the
 	// key was not found. On success, returns the length in bytes of the
 	// key and the value.
-	GetProto(key MVCCKey, msg proto.Message) (ok bool, keyBytes, valBytes int64, err error)
+	GetProto(key MVCCKey, msg protoutil.Message) (ok bool, keyBytes, valBytes int64, err error)
 	// Iterate scans from start to end keys, visiting at most max
 	// key/value pairs. On each key value pair, the function f is
 	// invoked. If f returns an error or if the scan itself encounters
@@ -201,10 +204,6 @@ type Engine interface {
 	//
 	// Not thread safe.
 	GetAuxiliaryDir() string
-	// SetAuxiliaryDir changes the path returned by GetAuxiliaryDir.
-	//
-	// Not thread safe.
-	SetAuxiliaryDir(string) error
 	// NewBatch returns a new instance of a batched engine which wraps
 	// this engine. Batched engines accumulate all mutations and apply
 	// them atomically on a call to Commit().
@@ -266,24 +265,25 @@ type Batch interface {
 // This is a good resource describing RocksDB's memory-related stats:
 // https://github.com/facebook/rocksdb/wiki/Memory-usage-in-RocksDB
 type Stats struct {
-	BlockCacheHits           int64
-	BlockCacheMisses         int64
-	BlockCacheUsage          int64
-	BlockCachePinnedUsage    int64
-	BloomFilterPrefixChecked int64
-	BloomFilterPrefixUseful  int64
-	MemtableHits             int64
-	MemtableMisses           int64
-	MemtableTotalSize        int64
-	Flushes                  int64
-	Compactions              int64
-	TableReadersMemEstimate  int64
+	BlockCacheHits                 int64
+	BlockCacheMisses               int64
+	BlockCacheUsage                int64
+	BlockCachePinnedUsage          int64
+	BloomFilterPrefixChecked       int64
+	BloomFilterPrefixUseful        int64
+	MemtableTotalSize              int64
+	Flushes                        int64
+	Compactions                    int64
+	TableReadersMemEstimate        int64
+	PendingCompactionBytesEstimate int64
 }
 
 // PutProto sets the given key to the protobuf-serialized byte string
 // of msg and the provided timestamp. Returns the length in bytes of
 // key and the value.
-func PutProto(engine Writer, key MVCCKey, msg proto.Message) (keyBytes, valBytes int64, err error) {
+func PutProto(
+	engine Writer, key MVCCKey, msg protoutil.Message,
+) (keyBytes, valBytes int64, err error) {
 	bytes, err := protoutil.Marshal(msg)
 	if err != nil {
 		return 0, 0, err

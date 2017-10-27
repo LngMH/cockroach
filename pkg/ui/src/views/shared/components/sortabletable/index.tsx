@@ -48,6 +48,10 @@ interface TableProps {
   // Callback that should be invoked when the user want to change the sort
   // setting.
   onChangeSortSetting?: { (ss: SortSetting): void };
+  // className to be applied to the table element.
+  className?: string;
+  // A function that returns the class to apply to a given row.
+  rowClass?: (rowIndex: number) => string;
 }
 
 /**
@@ -61,13 +65,14 @@ interface TableProps {
  */
 export class SortableTable extends React.Component<TableProps, {}> {
   static defaultProps: TableProps = {
-      count: 0,
-      columns: [],
-      sortSetting: {
-        sortKey: null,
-        ascending: false,
-      },
-      onChangeSortSetting: (_ss) => {},
+    count: 0,
+    columns: [],
+    sortSetting: {
+      sortKey: null,
+      ascending: false,
+    },
+    onChangeSortSetting: (_ss) => { },
+    rowClass: (_rowIndex) => "",
   };
 
   clickSort(clickedSortKey: any) {
@@ -93,9 +98,8 @@ export class SortableTable extends React.Component<TableProps, {}> {
 
   render() {
     const { sortSetting, columns } = this.props;
-
-    return <table className="sort-table">
-     <thead>
+    return <table className={classNames("sort-table", this.props.className)}>
+      <thead>
         <tr className="sort-table__row sort-table__row--header">
           {_.map(columns, (c: SortableColumn, colIndex: number) => {
             const classes = ["sort-table__cell"];
@@ -120,13 +124,20 @@ export class SortableTable extends React.Component<TableProps, {}> {
       </thead>
       <tbody>
         {_.times(this.props.count, (rowIndex) => {
-          return <tr key={rowIndex} className="sort-table__row sort-table__row--body">
-            {
-              _.map(columns, (c: SortableColumn, colIndex: number) => {
-                return <td className={classNames("sort-table__cell", c.className)} key={colIndex}>{c.cell(rowIndex)}</td>;
-              })
-            }
-            </tr>;
+          const classes = classNames(
+            "sort-table__row",
+            "sort-table__row--body",
+            this.props.rowClass(rowIndex),
+          );
+          return (
+            <tr key={rowIndex} className={classes}>
+              {
+                _.map(columns, (c: SortableColumn, colIndex: number) => {
+                  return <td className={classNames("sort-table__cell", c.className)} key={colIndex}>{c.cell(rowIndex)}</td>;
+                })
+              }
+            </tr>
+          );
         })}
       </tbody>
     </table>;

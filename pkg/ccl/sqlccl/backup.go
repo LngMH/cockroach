@@ -26,15 +26,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -42,28 +46,71 @@ const (
 	// BackupDescriptorName is the file name used for serialized
 	// BackupDescriptor protos.
 	BackupDescriptorName = "BACKUP"
+	// BackupDescriptorCheckpointName is the file name used to store the
+	// serialized BackupDescriptor proto while the backup is in progress.
+	BackupDescriptorCheckpointName = "BACKUP-CHECKPOINT"
 	// BackupFormatInitialVersion is the first version of backup and its files.
 	BackupFormatInitialVersion uint32 = 0
 )
 
+const (
+	backupOptRevisionHistory = "revision_history"
+)
+
+var backupOptionExpectValues = map[string]bool{
+	backupOptRevisionHistory: false,
+}
+
+// BackupCheckpointInterval is the interval at which backup progress is saved
+// to durable storage.
+var BackupCheckpointInterval = time.Minute
+
+// BackupImplicitSQLDescriptors are descriptors for tables that are implicitly
+// included in every backup, plus their parent database descriptors.
+var BackupImplicitSQLDescriptors = []sqlbase.Descriptor{
+	*sqlbase.WrapDescriptor(&sqlbase.SystemDB),
+	*sqlbase.WrapDescriptor(&sqlbase.DescriptorTable),
+	*sqlbase.WrapDescriptor(&sqlbase.UsersTable),
+}
+
 // exportStorageFromURI returns an ExportStorage for the given URI.
-func exportStorageFromURI(ctx context.Context, uri string) (storageccl.ExportStorage, error) {
+func exportStorageFromURI(
+	ctx context.Context, uri string, settings *cluster.Settings,
+) (storageccl.ExportStorage, error) {
 	conf, err := storageccl.ExportStorageConfFromURI(uri)
 	if err != nil {
 		return nil, err
 	}
-	return storageccl.MakeExportStorage(ctx, conf)
+	return storageccl.MakeExportStorage(ctx, conf, settings)
 }
 
-// readBackupDescriptor reads and unmarshals a BackupDescriptor from given base.
-func readBackupDescriptor(ctx context.Context, uri string) (BackupDescriptor, error) {
-	dir, err := exportStorageFromURI(ctx, uri)
+// ReadBackupDescriptorFromURI creates an export store from the given URI, then
+// reads and unmarshals a BackupDescriptor at the standard location in the
+// export storage.
+func ReadBackupDescriptorFromURI(
+	ctx context.Context, uri string, settings *cluster.Settings,
+) (BackupDescriptor, error) {
+	exportStore, err := exportStorageFromURI(ctx, uri, settings)
 	if err != nil {
 		return BackupDescriptor{}, err
 	}
-	defer dir.Close()
-	conf := dir.Conf()
-	r, err := dir.ReadFile(ctx, BackupDescriptorName)
+	defer exportStore.Close()
+	backupDesc, err := readBackupDescriptor(ctx, exportStore, BackupDescriptorName)
+	if err != nil {
+		return BackupDescriptor{}, err
+	}
+	backupDesc.Dir = exportStore.Conf()
+	// TODO(dan): Sanity check this BackupDescriptor: non-empty EndTime,
+	// non-empty Paths, and non-overlapping Spans and keyranges in Files.
+	return backupDesc, nil
+}
+
+// readBackupDescriptor reads and unmarshals a BackupDescriptor from filename in
+// the provided export store.
+func readBackupDescriptor(
+	ctx context.Context, exportStore storageccl.ExportStorage, filename string,
+) (BackupDescriptor, error) {
+	r, err := exportStore.ReadFile(ctx, filename)
 	if err != nil {
 		return BackupDescriptor{}, err
 	}
@@ -73,27 +120,26 @@ func readBackupDescriptor(ctx context.Context, uri string) (BackupDescriptor, er
 		return BackupDescriptor{}, err
 	}
 	var backupDesc BackupDescriptor
-	if err := backupDesc.Unmarshal(descBytes); err != nil {
+	if err := protoutil.Unmarshal(descBytes, &backupDesc); err != nil {
 		return BackupDescriptor{}, err
 	}
-	backupDesc.Dir = conf
-	// TODO(dan): Sanity check this BackupDescriptor: non-empty EndTime,
-	// non-empty Paths, and non-overlapping Spans and keyranges in Files.
-	return backupDesc, nil
+	return backupDesc, err
 }
 
 // ValidatePreviousBackups checks that the timestamps of previous backups are
-// consistent. The most recently backed-up time is returned.
-func ValidatePreviousBackups(ctx context.Context, uris []string) (hlc.Timestamp, error) {
+// consistent and covers `spans`. The most recently backed-up time is returned.
+func ValidatePreviousBackups(
+	ctx context.Context, uris []string, settings *cluster.Settings, spans []roachpb.Span,
+) (hlc.Timestamp, error) {
 	if len(uris) == 0 || len(uris) == 1 && uris[0] == "" {
 		// Full backup.
 		return hlc.Timestamp{}, nil
 	}
 	backups := make([]BackupDescriptor, len(uris))
 	for i, uri := range uris {
-		desc, err := readBackupDescriptor(ctx, uri)
+		desc, err := ReadBackupDescriptorFromURI(ctx, uri, settings)
 		if err != nil {
-			return hlc.Timestamp{}, err
+			return hlc.Timestamp{}, errors.Wrapf(err, "failed to read backup from %q", uri)
 		}
 		backups[i] = desc
 	}
@@ -101,8 +147,9 @@ func ValidatePreviousBackups(ctx context.Context, uris []string) (hlc.Timestamp,
 	// This reuses Restore's logic for lining up all the start and end
 	// timestamps to validate the previous backups that this one is incremental
 	// from.
-	_, endTime, err := makeImportRequests(nil, backups)
-	return endTime, err
+	lowWaterMark := keys.MinKey
+	_, endTime, err := makeImportSpans(spans, backups, lowWaterMark)
+	return endTime, errors.Wrap(err, "invalid previous backups (a new full backup may be required if a table has been created, dropped or truncated)")
 }
 
 func allSQLDescriptors(ctx context.Context, txn *client.Txn) ([]sqlbase.Descriptor, error) {
@@ -110,6 +157,10 @@ func allSQLDescriptors(ctx context.Context, txn *client.Txn) ([]sqlbase.Descript
 	endKey := startKey.PrefixEnd()
 	rows, err := txn.Scan(ctx, startKey, endKey, 0)
 	if err != nil {
+		// NB: Don't wrap this error, as wrapped HandledRetryableTxnErrors are not
+		// automatically retried by db.Txn.
+		//
+		// TODO(benesch): teach the KV layer to use errors.Cause.
 		return nil, err
 	}
 
@@ -125,7 +176,11 @@ func allSQLDescriptors(ctx context.Context, txn *client.Txn) ([]sqlbase.Descript
 func allRangeDescriptors(ctx context.Context, txn *client.Txn) ([]roachpb.RangeDescriptor, error) {
 	rows, err := txn.Scan(ctx, keys.Meta2Prefix, keys.MetaMax, 0)
 	if err != nil {
-		return nil, errors.Wrap(err, "unable to scan range descriptors")
+		// NB: Don't wrap this error, as wrapped HandledRetryableTxnErrors are not
+		// automatically retried by db.Txn.
+		//
+		// TODO(benesch): teach the KV layer to use errors.Cause.
+		return nil, err
 	}
 
 	rangeDescs := make([]roachpb.RangeDescriptor, len(rows))
@@ -160,20 +215,31 @@ func spansForAllTableIndexes(tables []*sqlbase.TableDescriptor) []roachpb.Span {
 	return spans
 }
 
-// splitSpansByRanges takes a slice of non-overlapping spans and a slice of
-// range descriptors and returns a new slice of spans in which each span has
-// been split so that no single span extends beyond the boundaries of a range.
-func splitSpansByRanges(spans []roachpb.Span, ranges []roachpb.RangeDescriptor) []roachpb.Span {
-	type spanMarker struct{}
-
-	var spanCovering intervalccl.Covering
+// coveringFromSpans creates an intervalccl.Covering with a fixed payload from a
+// slice of roachpb.Spans.
+func coveringFromSpans(spans []roachpb.Span, payload interface{}) intervalccl.Covering {
+	var covering intervalccl.Covering
 	for _, span := range spans {
-		spanCovering = append(spanCovering, intervalccl.Range{
+		covering = append(covering, intervalccl.Range{
 			Start:   []byte(span.Key),
 			End:     []byte(span.EndKey),
-			Payload: spanMarker{},
+			Payload: payload,
 		})
 	}
+	return covering
+}
+
+// splitAndFilterSpans returns the spans that represent the set difference
+// (includes - excludes) while also guaranteeing that each output span does not
+// cross the endpoint of a RangeDescriptor in ranges.
+func splitAndFilterSpans(
+	includes []roachpb.Span, excludes []roachpb.Span, ranges []roachpb.RangeDescriptor,
+) []roachpb.Span {
+	type includeMarker struct{}
+	type excludeMarker struct{}
+
+	includeCovering := coveringFromSpans(includes, includeMarker{})
+	excludeCovering := coveringFromSpans(excludes, excludeMarker{})
 
 	var rangeCovering intervalccl.Covering
 	for _, rangeDesc := range ranges {
@@ -183,30 +249,36 @@ func splitSpansByRanges(spans []roachpb.Span, ranges []roachpb.RangeDescriptor) 
 		})
 	}
 
-	splits := intervalccl.OverlapCoveringMerge([]intervalccl.Covering{spanCovering, rangeCovering})
+	splits := intervalccl.OverlapCoveringMerge(
+		[]intervalccl.Covering{includeCovering, excludeCovering, rangeCovering},
+	)
 
-	var splitSpans []roachpb.Span
+	var out []roachpb.Span
 	for _, split := range splits {
-		needed := false
+		include := false
+		exclude := false
 		for _, payload := range split.Payload.([]interface{}) {
-			if _, needed = payload.(spanMarker); needed {
-				break
+			switch payload.(type) {
+			case includeMarker:
+				include = true
+			case excludeMarker:
+				exclude = true
 			}
 		}
-		if needed {
-			splitSpans = append(splitSpans, roachpb.Span{
+		if include && !exclude {
+			out = append(out, roachpb.Span{
 				Key:    roachpb.Key(split.Start),
 				EndKey: roachpb.Key(split.End),
 			})
 		}
 	}
-	return splitSpans
+	return out
 }
 
 func backupJobDescription(
 	backup *parser.Backup, to string, incrementalFrom []string,
 ) (string, error) {
-	b := parser.Backup{
+	b := &parser.Backup{
 		AsOf:    backup.AsOf,
 		Options: backup.Options,
 		Targets: backup.Targets,
@@ -225,8 +297,7 @@ func backupJobDescription(
 		}
 		b.IncrementalFrom = append(b.IncrementalFrom, parser.NewDString(sanitizedFrom))
 	}
-
-	return b.String(), nil
+	return parser.AsStringWithFlags(b, parser.FmtSimpleQualified), nil
 }
 
 // clusterNodeCount returns the approximate number of nodes in the cluster.
@@ -251,88 +322,100 @@ func (r backupFileDescriptors) Less(i, j int) bool {
 	return bytes.Compare(r[i].Span.EndKey, r[j].Span.EndKey) < 0
 }
 
-// Backup exports a snapshot of every kv entry into ranged sstables.
+func writeBackupDescriptor(
+	ctx context.Context,
+	exportStore storageccl.ExportStorage,
+	filename string,
+	desc *BackupDescriptor,
+) error {
+	sort.Sort(backupFileDescriptors(desc.Files))
+
+	descBuf, err := protoutil.Marshal(desc)
+	if err != nil {
+		return err
+	}
+
+	return exportStore.WriteFile(ctx, filename, bytes.NewReader(descBuf))
+}
+
+func resolveTargetsToDescriptors(
+	ctx context.Context, p sql.PlanHookState, endTime hlc.Timestamp, targets parser.TargetList,
+) ([]sqlbase.Descriptor, error) {
+	var err error
+	var sqlDescs []sqlbase.Descriptor
+
+	db := p.ExecCfg().DB
+
+	{
+		// TODO(andrei): Plumb a gatewayNodeID in here and also find a way to
+		// express that whatever this txn does should not count towards lease
+		// placement stats.
+		txn := client.NewTxn(db, 0 /* gatewayNodeID */)
+		opt := client.TxnExecOptions{AutoRetry: true, AutoCommit: true}
+		err := txn.Exec(ctx, opt, func(ctx context.Context, txn *client.Txn, opt *client.TxnExecOptions) error {
+			var err error
+			txn.SetFixedTimestamp(ctx, endTime)
+			sqlDescs, err = allSQLDescriptors(ctx, txn)
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	sessionDatabase := p.EvalContext().Database
+	if sqlDescs, _, err = descriptorsMatchingTargets(sessionDatabase, sqlDescs, targets); err != nil {
+		return nil, err
+	}
+
+	sqlDescs = append(sqlDescs, BackupImplicitSQLDescriptors...)
+
+	// Dedupe. Duplicate descriptors will cause restore to fail.
+	{
+		descsByID := make(map[sqlbase.ID]sqlbase.Descriptor)
+		for _, sqlDesc := range sqlDescs {
+			descsByID[sqlDesc.GetID()] = sqlDesc
+		}
+		sqlDescs = sqlDescs[:0]
+		for _, sqlDesc := range descsByID {
+			sqlDescs = append(sqlDescs, sqlDesc)
+		}
+	}
+
+	// Ensure interleaved tables appear after their parent. Since parents must be
+	// created before their children, simply sorting by ID accomplishes this.
+	sort.Slice(sqlDescs, func(i, j int) bool { return sqlDescs[i].GetID() < sqlDescs[j].GetID() })
+	return sqlDescs, nil
+}
+
+// backup exports a snapshot of every kv entry into ranged sstables.
 //
 // The output is an sstable per range with files in the following locations:
 // - <dir>/<unique_int>.sst
 // - <dir> is given by the user and may be cloud storage
 // - Each file contains data for a key range that doesn't overlap with any other
 //   file.
-func Backup(
+func backup(
 	ctx context.Context,
-	p sql.PlanHookState,
-	uri string,
-	targets parser.TargetList,
-	startTime, endTime hlc.Timestamp,
-	_ parser.KVOptions,
-	jobLogger *jobs.JobLogger,
-) (BackupDescriptor, error) {
+	db *client.DB,
+	gossip *gossip.Gossip,
+	exportStore storageccl.ExportStorage,
+	job *jobs.Job,
+	backupDesc *BackupDescriptor,
+	checkpointDesc *BackupDescriptor,
+) error {
 	// TODO(dan): Figure out how permissions should work. #6713 is tracking this
 	// for grpc.
 
-	var sqlDescs []sqlbase.Descriptor
+	mu := struct {
+		syncutil.Mutex
+		files          []BackupDescriptor_File
+		exported       roachpb.BulkOpSummary
+		lastCheckpoint time.Time
+		checkpointed   bool
+	}{}
 
-	exportStore, err := exportStorageFromURI(ctx, uri)
-	if err != nil {
-		return BackupDescriptor{}, err
-	}
-	defer exportStore.Close()
-
-	// Ensure there isn't already a readable backup desc.
-	{
-		r, err := exportStore.ReadFile(ctx, BackupDescriptorName)
-		// TODO(dt): If we audit exactly what not-exists error each ExportStorage
-		// returns (and then wrap/tag them), we could narrow this check.
-		if err == nil {
-			r.Close()
-			return BackupDescriptor{}, errors.Errorf("a %s file already appears to exist in %s",
-				BackupDescriptorName, uri)
-		}
-	}
-
-	db := p.ExecCfg().DB
-
-	{
-		txn := client.NewTxn(db)
-		opt := client.TxnExecOptions{AutoRetry: true, AutoCommit: true}
-		err := txn.Exec(ctx, opt, func(ctx context.Context, txn *client.Txn, opt *client.TxnExecOptions) error {
-			var err error
-			txn.SetFixedTimestamp(endTime)
-			sqlDescs, err = allSQLDescriptors(ctx, txn)
-			return err
-		})
-		if err != nil {
-			return BackupDescriptor{}, err
-		}
-	}
-
-	// TODO(dan): Plumb the session database down.
-	sessionDatabase := ""
-	if sqlDescs, err = descriptorsMatchingTargets(sessionDatabase, sqlDescs, targets); err != nil {
-		return BackupDescriptor{}, err
-	}
-
-	for _, desc := range sqlDescs {
-		if dbDesc := desc.GetDatabase(); dbDesc != nil {
-			if err := p.CheckPrivilege(dbDesc, privilege.SELECT); err != nil {
-				return BackupDescriptor{}, err
-			}
-		}
-	}
-
-	// Backup users, descriptors, and the entire keyspace for user data.
-	tables := []*sqlbase.TableDescriptor{&sqlbase.DescriptorTable, &sqlbase.UsersTable}
-	for _, desc := range sqlDescs {
-		if tableDesc := desc.GetTable(); tableDesc != nil {
-			tables = append(tables, tableDesc)
-		}
-	}
-
-	for _, desc := range tables {
-		if err := p.CheckPrivilege(desc, privilege.SELECT); err != nil {
-			return BackupDescriptor{}, err
-		}
-	}
+	var checkpointMu syncutil.Mutex
 
 	var ranges []roachpb.RangeDescriptor
 	if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
@@ -343,32 +426,39 @@ func Backup(
 		ranges, err = allRangeDescriptors(ctx, txn)
 		return err
 	}); err != nil {
-		return BackupDescriptor{}, err
+		return errors.Wrap(err, "fetching range descriptors")
 	}
 
-	// We split the spans into range-sized pieces so that we can use the number of
-	// completed requests as a rough measure of progress.
-	spans := splitSpansByRanges(spansForAllTableIndexes(tables), ranges)
+	var completedSpans []roachpb.Span
+	if checkpointDesc != nil {
+		// TODO(benesch): verify these files, rather than accepting them as truth
+		// blindly.
+		// No concurrency yet, so these assignments are safe.
+		mu.checkpointed = true
+		mu.files = checkpointDesc.Files
+		mu.exported = checkpointDesc.EntryCounts
+		for _, file := range checkpointDesc.Files {
+			completedSpans = append(completedSpans, file.Span)
+		}
+	}
 
-	mu := struct {
-		syncutil.Mutex
-		files    []BackupDescriptor_File
-		exported roachpb.BulkOpSummary
-	}{}
+	// Subtract out any completed spans and split the remaining spans into
+	// range-sized pieces so that we can use the number of completed requests as a
+	// rough measure of progress.
+	spans := splitAndFilterSpans(backupDesc.Spans, completedSpans, ranges)
 
 	progressLogger := jobProgressLogger{
-		jobLogger:   jobLogger,
-		totalChunks: len(spans),
+		job:           job,
+		totalChunks:   len(spans),
+		startFraction: job.Payload().FractionCompleted,
 	}
 
-	for _, desc := range tables {
-		jobLogger.Job.DescriptorIDs = append(jobLogger.Job.DescriptorIDs, desc.GetID())
+	ctx, cancel := context.WithCancel(ctx)
+	if err := job.Created(ctx, cancel); err != nil {
+		return err
 	}
-	if err := jobLogger.Created(ctx); err != nil {
-		return BackupDescriptor{}, err
-	}
-	if err := jobLogger.Started(ctx); err != nil {
-		return BackupDescriptor{}, err
+	if err := job.Started(ctx); err != nil {
+		return err
 	}
 
 	// We're already limiting these on the server-side, but sending all the
@@ -387,16 +477,22 @@ func Backup(
 	// TODO(dan): Make this limiting per node.
 	//
 	// TODO(dan): See if there's some better solution than rate-limiting #14798.
-	maxConcurrentExports := clusterNodeCount(p.ExecCfg().Gossip) * storageccl.ExportRequestLimit
+	maxConcurrentExports := clusterNodeCount(gossip) * storageccl.ExportRequestLimit
 	exportsSem := make(chan struct{}, maxConcurrentExports)
 
-	header := roachpb.Header{Timestamp: endTime}
+	header := roachpb.Header{Timestamp: backupDesc.EndTime}
 	g, gCtx := errgroup.WithContext(ctx)
+
+	requestFinishedCh := make(chan struct{}, len(spans)) // enough buffer to never block
+	g.Go(func() error {
+		return progressLogger.loop(gCtx, requestFinishedCh)
+	})
+
 	for i := range spans {
 		select {
 		case exportsSem <- struct{}{}:
 		case <-ctx.Done():
-			return BackupDescriptor{}, ctx.Err()
+			return ctx.Err()
 		}
 
 		span := spans[i]
@@ -404,74 +500,87 @@ func Backup(
 			defer func() { <-exportsSem }()
 
 			req := &roachpb.ExportRequest{
-				Span:      span,
-				Storage:   exportStore.Conf(),
-				StartTime: startTime,
+				Span:       span,
+				Storage:    exportStore.Conf(),
+				StartTime:  backupDesc.StartTime,
+				MVCCFilter: roachpb.MVCCFilter(backupDesc.MVCCFilter),
 			}
 			res, pErr := client.SendWrappedWith(gCtx, db.GetSender(), header, req)
 			if pErr != nil {
 				return pErr.GoError()
 			}
+
 			mu.Lock()
 			for _, file := range res.(*roachpb.ExportResponse).Files {
 				mu.files = append(mu.files, BackupDescriptor_File{
-					Span:   file.Span,
-					Path:   file.Path,
-					Sha512: file.Sha512,
+					Span:        file.Span,
+					Path:        file.Path,
+					Sha512:      file.Sha512,
+					EntryCounts: file.Exported,
 				})
 				mu.exported.Add(file.Exported)
 			}
+			var checkpointFiles backupFileDescriptors
+			if timeutil.Since(mu.lastCheckpoint) > BackupCheckpointInterval {
+				// We optimistically assume the checkpoint will succeed to prevent
+				// multiple threads from attempting to checkpoint.
+				mu.lastCheckpoint = timeutil.Now()
+				checkpointFiles = append(checkpointFiles, mu.files...)
+			}
 			mu.Unlock()
-			if err := progressLogger.chunkFinished(ctx); err != nil {
-				// Errors while updating progress are not important enough to merit
-				// failing the entire backup.
-				log.Errorf(ctx, "BACKUP ignoring error while updating progress on job %d (%s): %+v",
-					jobLogger.JobID(), jobLogger.Job.Description, err)
+
+			requestFinishedCh <- struct{}{}
+
+			if checkpointFiles != nil {
+				checkpointMu.Lock()
+				backupDesc.Files = checkpointFiles
+				err := writeBackupDescriptor(
+					ctx, exportStore, BackupDescriptorCheckpointName, backupDesc,
+				)
+				checkpointMu.Unlock()
+				if err != nil {
+					log.Errorf(ctx, "unable to checkpoint backup descriptor: %+v", err)
+					mu.Lock()
+					mu.checkpointed = true
+					mu.Unlock()
+				}
 			}
 			return nil
 		})
 	}
 
-	if err = g.Wait(); err != nil {
-		return BackupDescriptor{}, errors.Wrapf(err, "exporting %d ranges", len(spans))
-	}
-	files, summary := mu.files, mu.exported // No more concurrency, so this is safe.
-
-	desc := BackupDescriptor{
-		StartTime:     startTime,
-		EndTime:       endTime,
-		Descriptors:   sqlDescs,
-		Spans:         spans,
-		Files:         files,
-		EntryCounts:   summary,
-		FormatVersion: BackupFormatInitialVersion,
-		BuildInfo:     build.GetInfo(),
-		NodeID:        p.ExecCfg().NodeID.Get(),
-		ClusterID:     p.ExecCfg().ClusterID(),
-	}
-	sort.Sort(backupFileDescriptors(desc.Files))
-
-	descBuf, err := desc.Marshal()
-	if err != nil {
-		return BackupDescriptor{}, err
+	if err := g.Wait(); err != nil {
+		return errors.Wrapf(err, "exporting %d ranges", len(spans))
 	}
 
-	if err := exportStore.WriteFile(ctx, BackupDescriptorName, bytes.NewReader(descBuf)); err != nil {
-		return BackupDescriptor{}, err
+	// No more concurrency, so no need to acquire locks below.
+
+	backupDesc.Files = mu.files
+	backupDesc.EntryCounts = mu.exported
+
+	if err := writeBackupDescriptor(ctx, exportStore, BackupDescriptorName, backupDesc); err != nil {
+		return err
 	}
-	return desc, nil
+
+	if mu.checkpointed {
+		if err := exportStore.Delete(ctx, BackupDescriptorCheckpointName); err != nil {
+			log.Warningf(ctx, "unable to delete checkpointed backup descriptor: %+v", err)
+		}
+	}
+
+	return nil
 }
 
 func backupPlanHook(
 	stmt parser.Statement, p sql.PlanHookState,
-) (func(context.Context) ([]parser.Datums, error), sqlbase.ResultColumns, error) {
-	backup, ok := stmt.(*parser.Backup)
+) (func(context.Context, chan<- parser.Datums) error, sqlbase.ResultColumns, error) {
+	backupStmt, ok := stmt.(*parser.Backup)
 	if !ok {
 		return nil, nil, nil
 	}
 
 	if err := utilccl.CheckEnterpriseEnabled(
-		p.ExecCfg().ClusterID(), p.ExecCfg().Organization.Get(), "BACKUP",
+		p.ExecCfg().Settings, p.ExecCfg().ClusterID(), p.ExecCfg().Organization(), "BACKUP",
 	); err != nil {
 		return nil, nil, err
 	}
@@ -480,11 +589,15 @@ func backupPlanHook(
 		return nil, nil, err
 	}
 
-	toFn, err := p.TypeAsString(backup.To, "BACKUP")
+	toFn, err := p.TypeAsString(backupStmt.To, "BACKUP")
 	if err != nil {
 		return nil, nil, err
 	}
-	incrementalFromFn, err := p.TypeAsStringArray(backup.IncrementalFrom, "BACKUP")
+	incrementalFromFn, err := p.TypeAsStringArray(backupStmt.IncrementalFrom, "BACKUP")
+	if err != nil {
+		return nil, nil, err
+	}
+	optsFn, err := p.TypeAsStringOpts(backupStmt.Options, backupOptionExpectValues)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -498,88 +611,234 @@ func backupPlanHook(
 		{Name: "system_records", Typ: parser.TypeInt},
 		{Name: "bytes", Typ: parser.TypeInt},
 	}
-	fn := func(ctx context.Context) ([]parser.Datums, error) {
+
+	fn := func(ctx context.Context, resultsCh chan<- parser.Datums) error {
 		// TODO(dan): Move this span into sql.
 		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
 		defer tracing.FinishSpan(span)
 
+		if err := backupStmt.Targets.NormalizeTablesWithDatabase(p.EvalContext().Database); err != nil {
+			return err
+		}
+
 		to, err := toFn()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		incrementalFrom, err := incrementalFromFn()
 		if err != nil {
-			return nil, err
+			return err
 		}
 
-		var startTime hlc.Timestamp
-		if backup.IncrementalFrom != nil {
-			var err error
-			startTime, err = ValidatePreviousBackups(ctx, incrementalFrom)
-			if err != nil {
-				return nil, err
-			}
-		}
 		endTime := p.ExecCfg().Clock.Now()
-		if backup.AsOf.Expr != nil {
+		if backupStmt.AsOf.Expr != nil {
 			var err error
-			if endTime, err = sql.EvalAsOfTimestamp(nil, backup.AsOf, endTime); err != nil {
-				return nil, err
+			if endTime, err = sql.EvalAsOfTimestamp(nil, backupStmt.AsOf, endTime); err != nil {
+				return err
 			}
 		}
-		description, err := backupJobDescription(backup, to, incrementalFrom)
+
+		exportStore, err := exportStorageFromURI(ctx, to, p.ExecCfg().Settings)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		jobLogger := jobs.NewJobLogger(p.ExecCfg().DB, sql.InternalExecutor{LeaseManager: p.LeaseMgr()}, jobs.JobRecord{
+		defer exportStore.Close()
+
+		// Ensure there isn't already a readable backup desc.
+		{
+			r, err := exportStore.ReadFile(ctx, BackupDescriptorName)
+			// TODO(dt): If we audit exactly what not-exists error each ExportStorage
+			// returns (and then wrap/tag them), we could narrow this check.
+			if err == nil {
+				r.Close()
+				return errors.Errorf("a %s file already appears to exist in %s",
+					BackupDescriptorName, to)
+			}
+		}
+
+		opts, err := optsFn()
+		if err != nil {
+			return err
+		}
+
+		targetDescs, err := resolveTargetsToDescriptors(ctx, p, endTime, backupStmt.Targets)
+		if err != nil {
+			return err
+		}
+
+		var tables []*sqlbase.TableDescriptor
+		for _, desc := range targetDescs {
+			if dbDesc := desc.GetDatabase(); dbDesc != nil {
+				if err := p.CheckPrivilege(dbDesc, privilege.SELECT); err != nil {
+					return err
+				}
+			}
+			if tableDesc := desc.GetTable(); tableDesc != nil {
+				if err := p.CheckPrivilege(tableDesc, privilege.SELECT); err != nil {
+					return err
+				}
+				tables = append(tables, tableDesc)
+			}
+		}
+
+		spans := spansForAllTableIndexes(tables)
+
+		var startTime hlc.Timestamp
+		if backupStmt.IncrementalFrom != nil {
+			var err error
+			startTime, err = ValidatePreviousBackups(ctx, incrementalFrom, p.ExecCfg().Settings, spans)
+			if err != nil {
+				return err
+			}
+		}
+
+		mvccFilter := MVCCFilter_Latest
+		if _, ok := opts[backupOptRevisionHistory]; ok {
+			mvccFilter = MVCCFilter_All
+		}
+
+		backupDesc := BackupDescriptor{
+			StartTime:     startTime,
+			EndTime:       endTime,
+			MVCCFilter:    mvccFilter,
+			Descriptors:   targetDescs,
+			Spans:         spans,
+			FormatVersion: BackupFormatInitialVersion,
+			BuildInfo:     build.GetInfo(),
+			NodeID:        p.ExecCfg().NodeID.Get(),
+			ClusterID:     p.ExecCfg().ClusterID(),
+		}
+
+		description, err := backupJobDescription(backupStmt, to, incrementalFrom)
+		if err != nil {
+			return err
+		}
+		job := p.ExecCfg().JobRegistry.NewJob(jobs.Record{
 			Description: description,
 			Username:    p.User(),
-			Details:     jobs.BackupJobDetails{},
+			DescriptorIDs: func() (sqlDescIDs []sqlbase.ID) {
+				for _, sqlDesc := range backupDesc.Descriptors {
+					sqlDescIDs = append(sqlDescIDs, sqlDesc.GetID())
+				}
+				return sqlDescIDs
+			}(),
+			Details: jobs.BackupDetails{
+				StartTime: startTime,
+				EndTime:   endTime,
+				URI:       to,
+			},
 		})
-		desc, err := Backup(ctx,
-			p,
-			to,
-			backup.Targets,
-			startTime, endTime,
-			backup.Options,
-			jobLogger,
+		var checkpointDesc *BackupDescriptor
+		backupErr := backup(ctx,
+			p.ExecCfg().DB,
+			p.ExecCfg().Gossip,
+			exportStore,
+			job,
+			&backupDesc,
+			checkpointDesc,
 		)
-		if err != nil {
-			jobLogger.Failed(ctx, err)
-			return nil, err
+		if err := job.FinishedWith(ctx, backupErr); err != nil {
+			return err
 		}
-		if err := jobLogger.Succeeded(ctx); err != nil {
-			// An error while marking the job as successful is not important enough to
-			// merit failing the entire backup.
-			log.Errorf(ctx, "BACKUP ignoring error while marking job %d (%s) as successful: %+v",
-				jobLogger.JobID(), description, err)
+		if backupErr != nil {
+			return backupErr
 		}
-		// TODO(benesch): emit periodic progress updates once we have the
-		// infrastructure to stream responses.
-		ret := []parser.Datums{{
-			parser.NewDInt(parser.DInt(*jobLogger.JobID())),
-			parser.NewDString(string(jobs.JobStatusSucceeded)),
+		// TODO(benesch): emit periodic progress updates.
+		resultsCh <- parser.Datums{
+			parser.NewDInt(parser.DInt(*job.ID())),
+			parser.NewDString(string(jobs.StatusSucceeded)),
 			parser.NewDFloat(parser.DFloat(1.0)),
-			parser.NewDInt(parser.DInt(desc.EntryCounts.Rows)),
-			parser.NewDInt(parser.DInt(desc.EntryCounts.IndexEntries)),
-			parser.NewDInt(parser.DInt(desc.EntryCounts.SystemRecords)),
-			parser.NewDInt(parser.DInt(desc.EntryCounts.DataSize)),
-		}}
-		return ret, nil
+			parser.NewDInt(parser.DInt(backupDesc.EntryCounts.Rows)),
+			parser.NewDInt(parser.DInt(backupDesc.EntryCounts.IndexEntries)),
+			parser.NewDInt(parser.DInt(backupDesc.EntryCounts.SystemRecords)),
+			parser.NewDInt(parser.DInt(backupDesc.EntryCounts.DataSize)),
+		}
+		return nil
 	}
 	return fn, header, nil
 }
 
+func backupResumeHook(
+	typ jobs.Type, settings *cluster.Settings,
+) func(context.Context, *jobs.Job) error {
+	if typ != jobs.TypeBackup {
+		return nil
+	}
+
+	return func(ctx context.Context, job *jobs.Job) error {
+		details := job.Record.Details.(jobs.BackupDetails)
+
+		var sqlDescs []sqlbase.Descriptor
+		var tables []*sqlbase.TableDescriptor
+
+		{
+			// TODO(andrei): Plumb a gatewayNodeID in here and also find a way to
+			// express that whatever this txn does should not count towards lease
+			// placement stats.
+			txn := client.NewTxn(job.DB(), 0 /* gatewayNodeID */)
+			opt := client.TxnExecOptions{AutoRetry: true, AutoCommit: true}
+			if err := txn.Exec(ctx, opt, func(ctx context.Context, txn *client.Txn, opt *client.TxnExecOptions) error {
+				txn.SetFixedTimestamp(ctx, details.EndTime)
+				for _, sqlDescID := range job.Payload().DescriptorIDs {
+					desc := &sqlbase.Descriptor{}
+					descKey := sqlbase.MakeDescMetadataKey(sqlDescID)
+					if err := txn.GetProto(ctx, descKey, desc); err != nil {
+						return err
+					}
+					sqlDescs = append(sqlDescs, *desc)
+					if tableDesc := desc.GetTable(); tableDesc != nil {
+						tables = append(tables, tableDesc)
+					}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+
+		backupDesc := BackupDescriptor{
+			StartTime:     details.StartTime,
+			EndTime:       details.EndTime,
+			Descriptors:   sqlDescs,
+			Spans:         spansForAllTableIndexes(tables),
+			FormatVersion: BackupFormatInitialVersion,
+			BuildInfo:     build.GetInfo(),
+			NodeID:        job.NodeID(),
+			ClusterID:     job.ClusterID(),
+		}
+		conf, err := storageccl.ExportStorageConfFromURI(details.URI)
+		if err != nil {
+			return err
+		}
+		exportStore, err := storageccl.MakeExportStorage(ctx, conf, settings)
+		if err != nil {
+			return nil
+		}
+		var checkpointDesc *BackupDescriptor
+		if desc, err := readBackupDescriptor(ctx, exportStore, BackupDescriptorCheckpointName); err == nil {
+			checkpointDesc = &desc
+		} else {
+			// TODO(benesch): distinguish between a missing checkpoint, which simply
+			// indicates the prior backup attempt made no progress, and a corrupted
+			// checkpoint, which is more troubling. Sadly, storageccl doesn't provide a
+			// "not found" error that's consistent across all ExportStorage
+			// implementations.
+			log.Warningf(ctx, "unable to load backup checkpoint while resuming job %d: %v", *job.ID(), err)
+		}
+		return backup(ctx, job.DB(), job.Gossip(), exportStore, job, &backupDesc, checkpointDesc)
+	}
+}
+
 func showBackupPlanHook(
 	stmt parser.Statement, p sql.PlanHookState,
-) (func(context.Context) ([]parser.Datums, error), sqlbase.ResultColumns, error) {
+) (func(context.Context, chan<- parser.Datums) error, sqlbase.ResultColumns, error) {
 	backup, ok := stmt.(*parser.ShowBackup)
 	if !ok {
 		return nil, nil, nil
 	}
 
 	if err := utilccl.CheckEnterpriseEnabled(
-		p.ExecCfg().ClusterID(), p.ExecCfg().Organization.Get(), "SHOW BACKUP",
+		p.ExecCfg().Settings, p.ExecCfg().ClusterID(), p.ExecCfg().Organization(), "SHOW BACKUP",
 	); err != nil {
 		return nil, nil, err
 	}
@@ -597,21 +856,22 @@ func showBackupPlanHook(
 		{Name: "table", Typ: parser.TypeString},
 		{Name: "start_time", Typ: parser.TypeTimestamp},
 		{Name: "end_time", Typ: parser.TypeTimestamp},
+		{Name: "size_bytes", Typ: parser.TypeInt},
+		{Name: "rows", Typ: parser.TypeInt},
 	}
-	fn := func(ctx context.Context) ([]parser.Datums, error) {
+	fn := func(ctx context.Context, resultsCh chan<- parser.Datums) error {
 		// TODO(dan): Move this span into sql.
 		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
 		defer tracing.FinishSpan(span)
 
 		str, err := toFn()
 		if err != nil {
-			return nil, err
+			return err
 		}
-		desc, err := readBackupDescriptor(ctx, str)
+		desc, err := ReadBackupDescriptorFromURI(ctx, str, p.ExecCfg().Settings)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		var ret []parser.Datums
 		descs := make(map[sqlbase.ID]string)
 		for _, descriptor := range desc.Descriptors {
 			if database := descriptor.GetDatabase(); database != nil {
@@ -620,19 +880,39 @@ func showBackupPlanHook(
 				}
 			}
 		}
+		descSizes := make(map[sqlbase.ID]roachpb.BulkOpSummary)
+		for _, file := range desc.Files {
+			// TODO(dan): This assumes each file in the backup only contains
+			// data from a single table, which is usually but not always
+			// correct. It does not account for interleaved tables or if a
+			// BACKUP happened to catch a newly created table that hadn't yet
+			// been split into its own range.
+			_, tableID, err := encoding.DecodeUvarintAscending(file.Span.Key)
+			if err != nil {
+				continue
+			}
+			s := descSizes[sqlbase.ID(tableID)]
+			s.Add(file.EntryCounts)
+			descSizes[sqlbase.ID(tableID)] = s
+		}
+		start := parser.DNull
+		if desc.StartTime.WallTime != 0 {
+			start = parser.MakeDTimestamp(timeutil.Unix(0, desc.StartTime.WallTime), time.Nanosecond)
+		}
 		for _, descriptor := range desc.Descriptors {
 			if table := descriptor.GetTable(); table != nil {
 				dbName := descs[table.ParentID]
-				temp := parser.Datums{
+				resultsCh <- parser.Datums{
 					parser.NewDString(dbName),
 					parser.NewDString(table.Name),
-					parser.MakeDTimestamp(time.Unix(0, desc.StartTime.WallTime), time.Second),
-					parser.MakeDTimestamp(time.Unix(0, desc.EndTime.WallTime), time.Second),
+					start,
+					parser.MakeDTimestamp(timeutil.Unix(0, desc.EndTime.WallTime), time.Nanosecond),
+					parser.NewDInt(parser.DInt(descSizes[table.ID].DataSize)),
+					parser.NewDInt(parser.DInt(descSizes[table.ID].Rows)),
 				}
-				ret = append(ret, temp)
 			}
 		}
-		return ret, nil
+		return nil
 	}
 	return fn, header, nil
 }
@@ -640,4 +920,5 @@ func showBackupPlanHook(
 func init() {
 	sql.AddPlanHook(backupPlanHook)
 	sql.AddPlanHook(showBackupPlanHook)
+	jobs.AddResumeHook(backupResumeHook)
 }

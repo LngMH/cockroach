@@ -11,32 +11,36 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package acceptance
 
 import (
+	"io/ioutil"
 	"math/rand"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/acceptance/cluster"
+	"github.com/cockroachdb/cockroach/pkg/acceptance/localcluster"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/pkg/errors"
 )
 
-const longWaitTime = 2 * time.Minute
-const shortWaitTime = 20 * time.Second
+const waitTime = 2 * time.Minute
 
 func TestGossipPeerings(t *testing.T) {
 	s := log.Scope(t)
 	defer s.Close(t)
 
-	runTestOnConfigs(t, testGossipPeeringsInner)
+	RunLocal(t, func(t *testing.T) {
+		runTestWithCluster(t, testGossipPeeringsInner)
+	})
 }
 
 func testGossipPeeringsInner(
@@ -46,20 +50,19 @@ func testGossipPeeringsInner(
 
 	deadline := timeutil.Now().Add(cfg.Duration)
 
-	waitTime := longWaitTime
-	if cfg.Duration < waitTime {
-		waitTime = shortWaitTime
-	}
-
 	for timeutil.Now().Before(deadline) {
-		CheckGossip(ctx, t, c, waitTime, HasPeers(num))
+		if err := CheckGossip(ctx, c, waitTime, HasPeers(num)); err != nil {
+			t.Fatal(err)
+		}
 
 		// Restart the first node.
 		log.Infof(ctx, "restarting node 0")
 		if err := c.Restart(ctx, 0); err != nil {
 			t.Fatal(err)
 		}
-		CheckGossip(ctx, t, c, waitTime, HasPeers(num))
+		if err := CheckGossip(ctx, c, waitTime, HasPeers(num)); err != nil {
+			t.Fatal(err)
+		}
 
 		// Restart another node (if there is one).
 		var pickedNode int
@@ -70,7 +73,9 @@ func testGossipPeeringsInner(
 		if err := c.Restart(ctx, pickedNode); err != nil {
 			t.Fatal(err)
 		}
-		CheckGossip(ctx, t, c, waitTime, HasPeers(num))
+		if err := CheckGossip(ctx, c, waitTime, HasPeers(num)); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -81,9 +86,14 @@ func TestGossipRestart(t *testing.T) {
 	s := log.Scope(t)
 	defer s.Close(t)
 
-	// TODO(bram): #4559 Limit this test to only the relevant cases. No chaos
-	// agents should be required.
-	runTestOnConfigs(t, testGossipRestartInner)
+	ctx := context.Background()
+	cfg := readConfigFromFlags()
+	RunLocal(t, func(t *testing.T) {
+		c := StartCluster(ctx, t, cfg)
+		defer c.AssertAndStop(ctx, t)
+
+		testGossipRestartInner(ctx, t, c, cfg)
+	})
 }
 
 func testGossipRestartInner(
@@ -99,16 +109,17 @@ func testGossipRestartInner(
 
 	deadline := timeutil.Now().Add(cfg.Duration)
 
-	waitTime := longWaitTime
-	if cfg.Duration < waitTime {
-		waitTime = shortWaitTime
-	}
-
 	for timeutil.Now().Before(deadline) {
 		log.Infof(ctx, "waiting for initial gossip connections")
-		CheckGossip(ctx, t, c, waitTime, HasPeers(num))
-		CheckGossip(ctx, t, c, waitTime, hasClusterID)
-		CheckGossip(ctx, t, c, waitTime, hasSentinel)
+		if err := CheckGossip(ctx, c, waitTime, HasPeers(num)); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckGossip(ctx, c, waitTime, hasClusterID); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckGossip(ctx, c, waitTime, hasSentinel); err != nil {
+			t.Fatal(err)
+		}
 
 		log.Infof(ctx, "killing all nodes")
 		for i := 0; i < num; i++ {
@@ -118,37 +129,163 @@ func testGossipRestartInner(
 		}
 
 		log.Infof(ctx, "restarting all nodes")
+		var chs []<-chan error
 		for i := 0; i < num; i++ {
-			if err := c.Restart(ctx, i); err != nil {
+			// We need to restart asynchronously because the local cluster nodes
+			// like to wait until they are ready to serve.
+			chs = append(chs, c.(*localcluster.LocalCluster).RestartAsync(ctx, i))
+		}
+		for i, ch := range chs {
+			if err := <-ch; err != nil {
+				t.Errorf("error restarting node %d: %s", i, err)
+			}
+		}
+		if t.Failed() {
+			t.FailNow()
+		}
+
+		testClusterConnectedAndFunctional(ctx, t, c)
+	}
+}
+
+func testClusterConnectedAndFunctional(ctx context.Context, t *testing.T, c cluster.Cluster) {
+	num := c.NumNodes()
+
+	log.Infof(ctx, "waiting for gossip to be connected")
+	if err := CheckGossip(ctx, c, waitTime, HasPeers(num)); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckGossip(ctx, c, waitTime, hasClusterID); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckGossip(ctx, c, waitTime, hasSentinel); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < num; i++ {
+		db, err := c.NewClient(ctx, i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			if err := db.Del(ctx, "count"); err != nil {
 				t.Fatal(err)
 			}
 		}
-
-		log.Infof(ctx, "waiting for gossip to be connected")
-		CheckGossip(ctx, t, c, waitTime, HasPeers(num))
-		CheckGossip(ctx, t, c, waitTime, hasClusterID)
-		CheckGossip(ctx, t, c, waitTime, hasSentinel)
-
-		for i := 0; i < num; i++ {
-			db, err := c.NewClient(ctx, i)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if i == 0 {
-				if err := db.Del(ctx, "count"); err != nil {
-					t.Fatal(err)
-				}
-			}
-			var kv client.KeyValue
-			if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-				var err error
-				kv, err = txn.Inc(ctx, "count", 1)
-				return err
-			}); err != nil {
-				t.Fatal(err)
-			} else if v := kv.ValueInt(); v != int64(i+1) {
-				t.Fatalf("unexpected value %d for write #%d (expected %d)", v, i, i+1)
-			}
+		var kv client.KeyValue
+		if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+			var err error
+			kv, err = txn.Inc(ctx, "count", 1)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		} else if v := kv.ValueInt(); v != int64(i+1) {
+			t.Fatalf("unexpected value %d for write #%d (expected %d)", v, i, i+1)
 		}
 	}
+}
+
+// This test verifies that when the first node is restarted and has no valid
+// join flags or persisted Gossip bootstrap records (achieved through restarting
+// the other nodes and thus randomizing their ports), it will still be able to
+// accept incoming Gossip connections and manages to bootstrap that way.
+//
+// See https://github.com/cockroachdb/cockroach/issues/18027.
+func TestGossipRestartFirstNodeNeedsIncoming(t *testing.T) {
+	s := log.Scope(t)
+	defer s.Close(t)
+
+	ctx := context.Background()
+	cfg := readConfigFromFlags()
+	RunLocal(t, func(t *testing.T) {
+		c := StartCluster(ctx, t, cfg)
+		defer c.AssertAndStop(ctx, t)
+
+		testGossipRestartFirstNodeNeedsIncomingInner(ctx, t, c, cfg)
+	})
+}
+
+func testGossipRestartFirstNodeNeedsIncomingInner(
+	ctx context.Context, t *testing.T, c cluster.Cluster, cfg cluster.TestConfig,
+) {
+	num := c.NumNodes()
+
+	if err := c.Kill(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Configure the first node to repel all replicas.
+
+	lc := c.(*localcluster.LocalCluster)
+	lc.Nodes[0].Cfg.ExtraArgs = append(lc.Nodes[0].Cfg.ExtraArgs, "--attrs", "empty")
+
+	if err := c.Restart(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	const zoneCfg = "constraints: [-empty]"
+	zoneFile := filepath.Join(lc.Nodes[0].Cfg.DataDir, ".customzone")
+
+	if err := ioutil.WriteFile(zoneFile, []byte(zoneCfg), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := c.ExecCLI(ctx, 0, []string{"zone", "set", ".default", "-f", zoneFile}); err != nil {
+		t.Fatal(err)
+	}
+
+	db := makePGClient(t, c.PGUrl(ctx, 0))
+	defer db.Close()
+
+	testutils.SucceedsSoon(t, func() error {
+		const query = "SELECT COUNT(replicas) FROM crdb_internal.ranges WHERE ARRAY_POSITION(replicas, 1) IS NOT NULL"
+		var count int
+		if err := db.QueryRow(query).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count > 0 {
+			err := errors.Errorf("first node still has %d replicas", count)
+			log.Info(ctx, err)
+			return err
+		}
+		return nil
+	})
+
+	log.Infof(ctx, "killing all nodes")
+	for i := 0; i < num; i++ {
+		if err := c.Kill(ctx, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	log.Infof(ctx, "restarting only first node so that it writes its advertised address")
+
+	// Note that at this point, the first node has no join flags and no useful
+	// persisted Gossip info (since all other nodes are down and they'll get new
+	// ports when they respawn).
+	chs := []<-chan error{lc.RestartAsync(ctx, 0)}
+
+	testutils.SucceedsSoon(t, func() error {
+		if lc.Nodes[0].AdvertiseAddr() != "" {
+			return nil
+		}
+		return errors.New("no advertised addr yet")
+	})
+
+	// The other nodes will be joined to the first node, so they can
+	// reach out to it (and in fact they will, since that's the only
+	// reachable peer they have -- their persisted info is outdated, too!)
+	log.Infof(ctx, "restarting the other nodes")
+	for i := 1; i < num; i++ {
+		chs = append(chs, lc.RestartAsync(ctx, i))
+	}
+
+	log.Infof(ctx, "waiting for healthy cluster")
+	for i, ch := range chs {
+		if err := <-ch; err != nil {
+			t.Errorf("error restarting node %d: %s", i, err)
+		}
+	}
+
+	testClusterConnectedAndFunctional(ctx, t, c)
 }

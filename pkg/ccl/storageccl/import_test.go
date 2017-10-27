@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -37,6 +37,29 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
+
+func TestMaxImportBatchSize(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		importBatchSize int64
+		maxCommandSize  int64
+		expected        int64
+	}{
+		{importBatchSize: 2 << 20, maxCommandSize: 64 << 20, expected: 2 << 20},
+		{importBatchSize: 128 << 20, maxCommandSize: 64 << 20, expected: 63 << 20},
+		{importBatchSize: 64 << 20, maxCommandSize: 64 << 20, expected: 63 << 20},
+		{importBatchSize: 63 << 20, maxCommandSize: 64 << 20, expected: 63 << 20},
+	}
+	for i, testCase := range testCases {
+		st := cluster.MakeTestingClusterSettings()
+		importBatchSize.Override(&st.SV, testCase.importBatchSize)
+		storage.MaxCommandSize.Override(&st.SV, testCase.maxCommandSize)
+		if e, a := maxImportBatchSize(st), testCase.expected; e != a {
+			t.Errorf("%d: expected max batch size %d, but got %d", i, e, a)
+		}
+	}
+}
 
 func slurpSSTablesLatestKey(
 	t *testing.T, dir string, paths []string, kr prefixRewriter,
@@ -63,7 +86,7 @@ func slurpSSTablesLatestKey(
 			var ok bool
 			kv.Key.Key, ok = kr.rewriteKey(kv.Key.Key)
 			if !ok {
-				return true, errors.Errorf("could not rewrite key: %s", roachpb.Key(kv.Key.Key))
+				return true, errors.Errorf("could not rewrite key: %s", kv.Key.Key)
 			}
 			v := roachpb.Value{RawBytes: kv.Value}
 			v.ClearChecksum()
@@ -108,28 +131,20 @@ func clientKVsToEngineKVs(kvs []client.KeyValue) []engine.MVCCKeyValue {
 
 func TestImport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Run("WriteBatch", func(t *testing.T) {
-		t.Run("batch=default", runTestImport)
-		t.Run("batch=1", func(t *testing.T) {
-			// The test normally doesn't trigger the batching behavior, so lower
-			// the threshold to force it.
-			defer settings.TestingSetByteSize(&importBatchSize, 1)()
-			runTestImport(t)
-		})
+	t.Run("batch=default", func(t *testing.T) {
+		runTestImport(t, func(_ *cluster.Settings) {})
 	})
-	t.Run("AddSSTable", func(t *testing.T) {
-		defer settings.TestingSetBool(&AddSSTableEnabled, true)()
-		t.Run("batch=default", runTestImport)
-		t.Run("batch=1", func(t *testing.T) {
-			// The test normally doesn't trigger the batching behavior, so lower
-			// the threshold to force it.
-			defer settings.TestingSetByteSize(&importBatchSize, 1)()
-			runTestImport(t)
-		})
+	t.Run("batch=1", func(t *testing.T) {
+		// The test normally doesn't trigger the batching behavior, so lower
+		// the threshold to force it.
+		init := func(st *cluster.Settings) {
+			importBatchSize.Override(&st.SV, 1)
+		}
+		runTestImport(t, init)
 	})
 }
 
-func runTestImport(t *testing.T) {
+func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 	defer leaktest.AfterTest(t)()
 
 	dir, dirCleanupFn := testutils.TempDir(t)
@@ -237,6 +252,8 @@ func runTestImport(t *testing.T) {
 	args.StoreSpecs = []base.StoreSpec{{InMemory: false, Path: filepath.Join(dir, "testserver")}}
 	s, _, kvDB := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(ctx)
+
+	init(s.ClusterSettings())
 
 	storage, err := ExportStorageConfFromURI("nodelocal://" + dir)
 	if err != nil {

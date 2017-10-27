@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Kathy Spradlin (kathyspradlin@gmail.com)
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package rpc
 
@@ -37,7 +34,7 @@ func (*PingRequest) GetUser() string {
 }
 
 func (r RemoteOffset) measuredAt() time.Time {
-	return time.Unix(0, r.MeasuredAt).UTC()
+	return timeutil.Unix(0, r.MeasuredAt)
 }
 
 // String formats the RemoteOffset for human readability.

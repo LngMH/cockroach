@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package parser
 
@@ -40,13 +38,13 @@ func TestTypeCheck(t *testing.T) {
 		{`NULL + 1.1`, `NULL`},
 		{`NULL + '2006-09-23'::date`, `NULL`},
 		{`NULL + '1h'::interval`, `NULL`},
-		{`NULL + 'hello'`, `NULL`},
+		{`NULL || 'hello'`, `NULL`},
+		{`NULL || 'hello'::bytes`, `NULL`},
 		{`NULL::int`, `NULL::INT`},
-		{`NULL + 'hello'::bytes`, `NULL`},
 		{`INTERVAL '1s'`, `'1s':::INTERVAL`},
-		{`(1.1::decimal)::decimal`, `(1.1:::DECIMAL::DECIMAL)::DECIMAL`},
-		{`NULL = 1`, `NULL = 1:::INT`},
-		{`1 = NULL`, `1:::INT = NULL`},
+		{`(1.1::decimal)::decimal`, `1.1:::DECIMAL::DECIMAL::DECIMAL`},
+		{`NULL = 1`, `NULL`},
+		{`1 = NULL`, `NULL`},
 		{`true AND NULL`, `true AND NULL`},
 		{`NULL OR false`, `NULL OR false`},
 		{`1 IN (1, 2, 3)`, `1:::INT IN (1:::INT, 2:::INT, 3:::INT)`},
@@ -83,18 +81,18 @@ func TestTypeCheck(t *testing.T) {
 		{`ARRAY['a', 'b', 'c']`, `ARRAY['a':::STRING, 'b':::STRING, 'c':::STRING]`},
 		{`ARRAY[1.5, 2.5, 3.5]`, `ARRAY[1.5:::DECIMAL, 2.5:::DECIMAL, 3.5:::DECIMAL]`},
 		{`ARRAY[NULL]`, `ARRAY[NULL]`},
-		{`1 = ANY ARRAY[1.5, 2.5, 3.5]`, `1:::DECIMAL = ANY ARRAY[1.5:::DECIMAL, 2.5:::DECIMAL, 3.5:::DECIMAL]`},
+		{`1 = ANY ARRAY[1.5, 2.5, 3.5]`, `1:::DECIMAL = ANY (ARRAY[1.5:::DECIMAL, 2.5:::DECIMAL, 3.5:::DECIMAL])`},
 		{`true = SOME (ARRAY[true, false])`, `true = SOME (ARRAY[true, false])`},
-		{`1.3 = ALL ARRAY[1, 2, 3]`, `1.3:::DECIMAL = ALL ARRAY[1:::DECIMAL, 2:::DECIMAL, 3:::DECIMAL]`},
-		{`1.3 = ALL ((ARRAY[]))`, `1.3:::DECIMAL = ALL ((ARRAY[]))`},
-		{`NULL = ALL ARRAY[1.5, 2.5, 3.5]`, `NULL = ALL ARRAY[1.5:::DECIMAL, 2.5:::DECIMAL, 3.5:::DECIMAL]`},
-		{`NULL = ALL ARRAY[NULL, NULL]`, `NULL = ALL ARRAY[NULL, NULL]`},
-		{`1 = ALL NULL`, `1:::INT = ALL NULL`},
-		{`'a' = ALL CURRENT_SCHEMAS(true)`, `'a':::STRING = ALL current_schemas(true)`},
-		{`NULL = ALL CURRENT_SCHEMAS(true)`, `NULL = ALL current_schemas(true)`},
+		{`1.3 = ALL ARRAY[1, 2, 3]`, `1.3:::DECIMAL = ALL (ARRAY[1:::DECIMAL, 2:::DECIMAL, 3:::DECIMAL])`},
+		{`1.3 = ALL ((ARRAY[]))`, `1.3:::DECIMAL = ALL (ARRAY[])`},
+		{`NULL = ALL ARRAY[1.5, 2.5, 3.5]`, `NULL`},
+		{`NULL = ALL ARRAY[NULL, NULL]`, `NULL`},
+		{`1 = ALL NULL`, `NULL`},
+		{`'a' = ALL CURRENT_SCHEMAS(true)`, `'a':::STRING = ALL (current_schemas(true))`},
+		{`NULL = ALL CURRENT_SCHEMAS(true)`, `NULL`},
 
 		{`INTERVAL '1'`, `'1s':::INTERVAL`},
-		{`DECIMAL '1.0'`, `'1.0':::STRING::DECIMAL`},
+		{`DECIMAL '1.0'`, `1.0:::DECIMAL::DECIMAL`},
 
 		{`1 + 2`, `3:::INT`},
 		{`1:::decimal + 2`, `1:::DECIMAL + 2:::DECIMAL`},
@@ -106,10 +104,15 @@ func TestTypeCheck(t *testing.T) {
 		{`1:::DECIMAL + $1`, `1:::DECIMAL + $1:::DECIMAL`},
 		{`$1:::INT`, `$1:::INT`},
 
-		{`'NaN'::decimal`, `'NaN':::STRING::DECIMAL`},
-		{`'-NaN'::decimal`, `'-NaN':::STRING::DECIMAL`},
-		{`'Inf'::decimal`, `'Inf':::STRING::DECIMAL`},
-		{`'-Inf'::decimal`, `'-Inf':::STRING::DECIMAL`},
+		// These outputs, while bizarre looking, are correct and expected. The
+		// type annotation is caused by the call to Serialize, which formats the
+		// output using the Parseable formatter which inserts type annotations
+		// at the end of all well-typed datums. And the second cast is caused by
+		// the test itself.
+		{`'NaN'::decimal`, `'NaN':::DECIMAL::DECIMAL`},
+		{`'-NaN'::decimal`, `'NaN':::DECIMAL::DECIMAL`},
+		{`'Inf'::decimal`, `'Infinity':::DECIMAL::DECIMAL`},
+		{`'-Inf'::decimal`, `'-Infinity':::DECIMAL::DECIMAL`},
 	}
 	for _, d := range testData {
 		expr, err := ParseExpr(d.expr)
@@ -127,15 +130,31 @@ func TestTypeCheck(t *testing.T) {
 	}
 }
 
+func BenchmarkTypeCheck(b *testing.B) {
+	// random example from TPCC
+	sql := `CASE 1 >= $1 + 10 WHEN true THEN 1-$1 ELSE (1-$1)+91 END`
+	expr, err := ParseExpr(sql)
+	if err != nil {
+		b.Fatalf("%s: %v", expr, err)
+	}
+	ctx := MakeSemaContext(false)
+	for i := 0; i < b.N; i++ {
+		_, err := TypeCheck(expr, &ctx, TypeInt)
+		if err != nil {
+			b.Fatalf("unexpected error: %s", err)
+		}
+	}
+}
+
 func TestTypeCheckNormalize(t *testing.T) {
 	testData := []struct {
 		expr     string
 		expected string
 	}{
-		{`'NaN'::decimal`, `'NaN'::DECIMAL:::DECIMAL`},
-		{`'-NaN'::decimal`, `'NaN'::DECIMAL:::DECIMAL`},
-		{`'Inf'::decimal`, `'Infinity'::DECIMAL:::DECIMAL`},
-		{`'-Inf'::decimal`, `'-Infinity'::DECIMAL:::DECIMAL`},
+		{`'NaN'::decimal`, `'NaN':::DECIMAL`},
+		{`'-NaN'::decimal`, `'NaN':::DECIMAL`},
+		{`'Inf'::decimal`, `'Infinity':::DECIMAL`},
+		{`'-Inf'::decimal`, `'-Infinity':::DECIMAL`},
 	}
 	for _, d := range testData {
 		t.Run(d.expr, func(t *testing.T) {
@@ -167,18 +186,16 @@ func TestTypeCheckError(t *testing.T) {
 		expected string
 	}{
 		{`'1' + '2'`, `unsupported binary operator:`},
-		// This strange error is a result of the <date> + <int> overload and because
-		// of the limitation described on StrVal.AvailableTypes.
-		{`'a' + 0`, `could not parse 'a' as type date`},
+		{`'a' + 0`, `unsupported binary operator:`},
 		{`1.1 # 3.1`, `unsupported binary operator:`},
 		{`~0.1`, `unsupported unary operator:`},
-		{`'10' > 2`, `unsupported comparison operator:`},
+		{`'a' > 2`, `unsupported comparison operator:`},
 		{`a`, `name "a" is not defined`},
 		{`COS(*)`, `cannot use "*" in this context`},
 		{`a.*`, `cannot use "a.*" in this context`},
 		{`1 AND true`, `incompatible AND argument type: int`},
 		{`1.0 AND true`, `incompatible AND argument type: decimal`},
-		{`'a' OR true`, `could not parse 'a' as type bool`},
+		{`'a' OR true`, `could not parse "a" as type bool`},
 		{`(1, 2) OR true`, `incompatible OR argument type: tuple`},
 		{`NOT 1`, `incompatible NOT argument type: int`},
 		{`lower()`, `unknown signature: lower()`},
@@ -190,21 +207,21 @@ func TestTypeCheckError(t *testing.T) {
 		{`CASE 1 WHEN 1 THEN 'one' WHEN 2 THEN 2 END`, `incompatible value type`},
 		{`CASE 1 WHEN 1 THEN 'one' ELSE 2 END`, `incompatible value type`},
 		{`(1, 2, 3) = (1, 2)`, `expected tuple (1, 2) to have a length of 3`},
-		{`(1, 2) = (1, 'a')`, `tuples (1, 2), (1, 'a') are not comparable at index 2: unsupported comparison operator: <int> = <string>`},
-		{`1 IN ('a', 'b')`, `unsupported comparison operator: 1 IN ('a', 'b'): expected 'a' to be of type int, found type string`},
-		{`1 IN (1, 'a')`, `unsupported comparison operator: 1 IN (1, 'a'): expected 'a' to be of type int, found type string`},
-		{`1 = ANY 2`, `unsupported comparison operator: 1 = ANY 2: op ANY array requires array on right side`},
-		{`1 = ANY ARRAY[2, '3']`, `unsupported comparison operator: 1 ANY = ARRAY[2, '3']: expected '3' to be of type int, found type string`},
+		{`(1, 2) = (1, 'a')`, `tuples (1, 2), (1, 'a') are not comparable at index 2: unsupported comparison operator:`},
+		{`1 IN ('a', 'b')`, `unsupported comparison operator: 1 IN ('a', 'b'): could not parse "a" as type int`},
+		{`1 IN (1, 'a')`, `unsupported comparison operator: 1 IN (1, 'a'): could not parse "a" as type int`},
+		{`1 = ANY 2`, `unsupported comparison operator: 1 = ANY 2: op ANY <right> requires array, tuple or subquery on right side`},
+		{`1 = ANY ARRAY[2, 'a']`, `unsupported comparison operator: 1 = ANY ARRAY[2, 'a']: could not parse "a" as type int`},
 		{`1 = ALL CURRENT_SCHEMAS(true)`, `unsupported comparison operator: <int> = ALL <string[]>`},
-		{`1.0 BETWEEN 2 AND '5'`, `unsupported comparison operator: <decimal> < <string>`},
+		{`1.0 BETWEEN 2 AND 'a'`, `unsupported comparison operator: <decimal> < <string>`},
 		{`IF(1, 2, 3)`, `incompatible IF condition type: int`},
-		{`IF(true, '5', 2)`, `incompatible IF expressions: expected 2 to be of type string, found type int`},
-		{`IF(true, 2, '5')`, `incompatible IF expressions: expected '5' to be of type int, found type string`},
-		{`IFNULL(1, '5')`, `incompatible IFNULL expressions: expected '5' to be of type int, found type string`},
-		{`NULLIF(1, '5')`, `incompatible NULLIF expressions: expected '5' to be of type int, found type string`},
-		{`COALESCE(1, 2, 3, 4, '5')`, `incompatible COALESCE expressions: expected '5' to be of type int, found type string`},
+		{`IF(true, 'a', 2)`, `incompatible IF expressions: could not parse "a" as type int`},
+		{`IF(true, 2, 'a')`, `incompatible IF expressions: could not parse "a" as type int`},
+		{`IFNULL(1, 'a')`, `incompatible IFNULL expressions: could not parse "a" as type int`},
+		{`NULLIF(1, 'a')`, `incompatible NULLIF expressions: could not parse "a" as type int`},
+		{`COALESCE(1, 2, 3, 4, 'a')`, `incompatible COALESCE expressions: could not parse "a" as type int`},
 		{`ARRAY[]`, `cannot determine type of empty array`},
-		{`ANNOTATE_TYPE('a', int)`, `incompatible type annotation for 'a' as int, found type: string`},
+		{`ANNOTATE_TYPE('a', int)`, `could not parse "a" as type int`},
 		{`ANNOTATE_TYPE(ANNOTATE_TYPE(1, int), decimal)`, `incompatible type annotation for ANNOTATE_TYPE(1, INT) as decimal, found type: int`},
 		{`3:::int[]`, `incompatible type annotation for 3 as int[], found type: int`},
 	}
@@ -317,7 +334,7 @@ func attemptTypeCheckSameTypedExprs(t *testing.T, idx int, test sameTypedExprsTe
 	}
 	forEachPerm(test.exprs, 0, func(exprs []copyableExpr) {
 		ctx := MakeSemaContext(false)
-		ctx.Placeholders.SetTypes(clonePlaceholderTypes(test.ptypes))
+		ctx.Placeholders.SetTypeHints(clonePlaceholderTypes(test.ptypes))
 		desired := TypeAny
 		if test.desired != nil {
 			desired = test.desired
@@ -446,9 +463,7 @@ func TestTypeCheckSameTypedExprsError(t *testing.T) {
 		// Single type mismatches.
 		{nil, nil, exprs(dint(1), decConst("1.1")), decimalIntMismatchErr},
 		{nil, nil, exprs(dint(1), ddecimal(1)), decimalIntMismatchErr},
-		{mapPTypesInt, nil, exprs(ddecimal(1.1), placeholder("a")), decimalIntMismatchErr},
 		{mapPTypesInt, nil, exprs(decConst("1.1"), placeholder("a")), decimalIntMismatchErr},
-		{mapPTypesIntAndDecimal, nil, exprs(placeholder("b"), placeholder("a")), decimalIntMismatchErr},
 		// Tuple type mismatches.
 		{nil, nil, exprs(tuple(dint(1)), tuple(ddecimal(1))), tupleFloatIntMismatchErr},
 		{nil, nil, exprs(tuple(dint(1)), dint(1), dint(1)), tupleIntMismatchErr},
@@ -458,7 +473,7 @@ func TestTypeCheckSameTypedExprsError(t *testing.T) {
 	}
 	for i, d := range testData {
 		ctx := MakeSemaContext(false)
-		ctx.Placeholders.SetTypes(d.ptypes)
+		ctx.Placeholders.SetTypeHints(d.ptypes)
 		desired := TypeAny
 		if d.desired != nil {
 			desired = d.desired

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package roachpb
 
@@ -351,10 +349,13 @@ func NewTransactionAbortedError() *TransactionAbortedError {
 }
 
 // NewHandledRetryableTxnError initializes a new HandledRetryableTxnError.
+//
+// txnID is the ID of the transaction being restarted.
+// txn is the transaction that the client should use for the next attempts.
 func NewHandledRetryableTxnError(
-	msg string, txnID *uuid.UUID, txn Transaction,
+	msg string, txnID uuid.UUID, txn Transaction,
 ) *HandledRetryableTxnError {
-	return &HandledRetryableTxnError{Msg: msg, TxnID: txnID, Transaction: &txn}
+	return &HandledRetryableTxnError{Msg: msg, TxnID: txnID, Transaction: txn}
 }
 
 // NewTransactionPushError initializes a new TransactionPushError.
@@ -391,11 +392,11 @@ func NewTransactionRetryError(reason TransactionRetryReason) *TransactionRetryEr
 }
 
 func (e *TransactionRetryError) Error() string {
-	return fmt.Sprintf("TransactionRetryError: retry txn")
+	return fmt.Sprintf("TransactionRetryError: retry txn (%s)", e.Reason)
 }
 
 func (e *TransactionRetryError) message(pErr *Error) string {
-	return fmt.Sprintf("TransactionRetryError: retry txn %s", pErr.GetTxn())
+	return fmt.Sprintf("TransactionRetryError: retry txn (%s): %s", e.Reason, pErr.GetTxn())
 }
 
 var _ ErrorDetailInterface = &TransactionRetryError{}
@@ -597,3 +598,23 @@ func (e *StoreNotFoundError) message(_ *Error) string {
 }
 
 var _ ErrorDetailInterface = &StoreNotFoundError{}
+
+func (e *UntrackedTxnError) Error() string {
+	return e.message(nil)
+}
+
+func (*UntrackedTxnError) message(_ *Error) string {
+	return "writing transaction timed out or ran on multiple coordinators"
+}
+
+var _ ErrorDetailInterface = &UntrackedTxnError{}
+
+func (e *TxnPrevAttemptError) Error() string {
+	return e.message(nil)
+}
+
+func (*TxnPrevAttemptError) message(_ *Error) string {
+	return "response meant for previous incarnation of transaction"
+}
+
+var _ ErrorDetailInterface = &TxnPrevAttemptError{}

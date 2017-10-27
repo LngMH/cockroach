@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Cuong Do (cdo@cockroachlabs.com)
 
 package sql_test
 
@@ -78,8 +76,9 @@ func TestQueryCounts(t *testing.T) {
 	// Initialize accum while accounting for system migrations that may have run
 	// DDL statements.
 	accum := queryCounter{
-		ddlCount:  s.MustGetSQLCounter(sql.MetaDdl.Name),
-		miscCount: s.MustGetSQLCounter(sql.MetaMisc.Name),
+		insertCount: 1, // version setting population migration
+		ddlCount:    s.MustGetSQLCounter(sql.MetaDdl.Name),
+		miscCount:   s.MustGetSQLCounter(sql.MetaMisc.Name),
 	}
 
 	for _, tc := range testcases {
@@ -161,7 +160,7 @@ func TestAbortCountConflictingWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Run a batch of statements to move the txn out of the FirstBatch state,
+	// Run a batch of statements to move the txn out of the AutoRetry state,
 	// otherwise the INSERT below would be automatically retried.
 	if _, err := txn.Exec("SELECT 1"); err != nil {
 		t.Fatal(err)
@@ -188,7 +187,7 @@ func TestAbortCountConflictingWrites(t *testing.T) {
 	if err := checkCounterEQ(s, sql.MetaTxnCommit, 0); err != nil {
 		t.Error(err)
 	}
-	if err := checkCounterEQ(s, sql.MetaInsert, 1); err != nil {
+	if err := checkCounterEQ(s, sql.MetaInsert, 2); err != nil {
 		t.Error(err)
 	}
 }

@@ -39,6 +39,7 @@ query T colnames
 SHOW DATABASE
 ----
 database
+·
 
 
 statement error no database specified
@@ -78,20 +79,22 @@ SHOW ALL
 ----
 application_name               helloworld
 client_encoding                UTF8
-client_min_messages
+client_min_messages            ·
 database                       foo
 datestyle                      ISO
 default_transaction_isolation  SERIALIZABLE
 distsql                        off
-extra_float_digits
+extra_float_digits             ·
 max_index_keys                 32
 node_id                        1
-search_path                    pg_catalog
+search_path                    ·
 server_version                 9.5.0
+server_version_num             90500
 session_user                   root
+sql_safe_updates               false
 standard_conforming_strings    on
 time zone                      UTC
-trace                          off
+tracing                        off
 transaction isolation level    SERIALIZABLE
 transaction priority           NORMAL
 transaction status             NoTxn
@@ -174,6 +177,12 @@ SHOW SERVER_VERSION
 ----
 server_version
 9.5.0
+
+query T colnames
+SHOW SERVER_VERSION_NUM
+----
+server_version_num
+90500
 
 # Test read-only variables
 statement error variable "max_index_keys" cannot be changed

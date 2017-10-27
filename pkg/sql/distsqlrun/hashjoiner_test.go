@@ -11,23 +11,26 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package distsqlrun
 
 import (
 	"fmt"
+	math "math"
 	"sort"
 	"strings"
 	"testing"
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/pkg/errors"
 )
 
@@ -42,10 +45,13 @@ func TestHashJoiner(t *testing.T) {
 	null := sqlbase.EncDatum{Datum: parser.DNull}
 
 	testCases := []struct {
-		spec     HashJoinerSpec
-		outCols  []uint32
-		inputs   []sqlbase.EncDatumRows
-		expected sqlbase.EncDatumRows
+		spec       HashJoinerSpec
+		outCols    []uint32
+		leftTypes  []sqlbase.ColumnType
+		leftInput  sqlbase.EncDatumRows
+		rightTypes []sqlbase.ColumnType
+		rightInput sqlbase.EncDatumRows
+		expected   sqlbase.EncDatumRows
 	}{
 		{
 			spec: HashJoinerSpec{
@@ -54,21 +60,21 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_INNER,
 				// Implicit @1 = @3 constraint.
 			},
-			outCols: []uint32{0, 3, 4},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[0], v[0]},
-					{v[1], v[4]},
-					{v[2], v[4]},
-					{v[3], v[1]},
-					{v[4], v[5]},
-					{v[5], v[5]},
-				},
-				{
-					{v[1], v[0], v[4]},
-					{v[3], v[4], v[1]},
-					{v[4], v[4], v[5]},
-				},
+			outCols:   []uint32{0, 3, 4},
+			leftTypes: twoIntCols,
+			leftInput: sqlbase.EncDatumRows{
+				{v[0], v[0]},
+				{v[1], v[4]},
+				{v[2], v[4]},
+				{v[3], v[1]},
+				{v[4], v[5]},
+				{v[5], v[5]},
+			},
+			rightTypes: threeIntCols,
+			rightInput: sqlbase.EncDatumRows{
+				{v[1], v[0], v[4]},
+				{v[3], v[4], v[1]},
+				{v[4], v[4], v[5]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[1], v[0], v[4]},
@@ -83,19 +89,19 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_INNER,
 				// Implicit @1 = @3 constraint.
 			},
-			outCols: []uint32{0, 1, 3},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[0], v[0]},
-					{v[0], v[1]},
-				},
-				{
-					{v[0], v[4]},
-					{v[0], v[1]},
-					{v[0], v[0]},
-					{v[0], v[5]},
-					{v[0], v[4]},
-				},
+			outCols:   []uint32{0, 1, 3},
+			leftTypes: twoIntCols,
+			leftInput: sqlbase.EncDatumRows{
+				{v[0], v[0]},
+				{v[0], v[1]},
+			},
+			rightTypes: twoIntCols,
+			rightInput: sqlbase.EncDatumRows{
+				{v[0], v[4]},
+				{v[0], v[1]},
+				{v[0], v[0]},
+				{v[0], v[5]},
+				{v[0], v[4]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[0], v[0], v[4]},
@@ -119,26 +125,26 @@ func TestHashJoiner(t *testing.T) {
 				OnExpr:         Expression{Expr: "@4 >= 4"},
 				// Implicit AND @1 = @3 constraint.
 			},
-			outCols: []uint32{0, 1, 3},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[0], v[0]},
-					{v[0], v[1]},
-					{v[1], v[0]},
-					{v[1], v[1]},
-				},
-				{
-					{v[0], v[4]},
-					{v[0], v[1]},
-					{v[0], v[0]},
-					{v[0], v[5]},
-					{v[0], v[4]},
-					{v[1], v[4]},
-					{v[1], v[1]},
-					{v[1], v[0]},
-					{v[1], v[5]},
-					{v[1], v[4]},
-				},
+			outCols:   []uint32{0, 1, 3},
+			leftTypes: twoIntCols,
+			leftInput: sqlbase.EncDatumRows{
+				{v[0], v[0]},
+				{v[0], v[1]},
+				{v[1], v[0]},
+				{v[1], v[1]},
+			},
+			rightTypes: twoIntCols,
+			rightInput: sqlbase.EncDatumRows{
+				{v[0], v[4]},
+				{v[0], v[1]},
+				{v[0], v[0]},
+				{v[0], v[5]},
+				{v[0], v[4]},
+				{v[1], v[4]},
+				{v[1], v[1]},
+				{v[1], v[0]},
+				{v[1], v[5]},
+				{v[1], v[4]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[0], v[0], v[4]},
@@ -162,21 +168,21 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_LEFT_OUTER,
 				// Implicit @1 = @3 constraint.
 			},
-			outCols: []uint32{0, 3, 4},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[0], v[0]},
-					{v[1], v[4]},
-					{v[2], v[4]},
-					{v[3], v[1]},
-					{v[4], v[5]},
-					{v[5], v[5]},
-				},
-				{
-					{v[1], v[0], v[4]},
-					{v[3], v[4], v[1]},
-					{v[4], v[4], v[5]},
-				},
+			outCols:   []uint32{0, 3, 4},
+			leftTypes: twoIntCols,
+			leftInput: sqlbase.EncDatumRows{
+				{v[0], v[0]},
+				{v[1], v[4]},
+				{v[2], v[4]},
+				{v[3], v[1]},
+				{v[4], v[5]},
+				{v[5], v[5]},
+			},
+			rightTypes: threeIntCols,
+			rightInput: sqlbase.EncDatumRows{
+				{v[1], v[0], v[4]},
+				{v[3], v[4], v[1]},
+				{v[4], v[4], v[5]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[0], null, null},
@@ -194,21 +200,21 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_RIGHT_OUTER,
 				// Implicit @1 = @4 constraint.
 			},
-			outCols: []uint32{3, 1, 2},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[1], v[0], v[4]},
-					{v[3], v[4], v[1]},
-					{v[4], v[4], v[5]},
-				},
-				{
-					{v[0], v[0]},
-					{v[1], v[4]},
-					{v[2], v[4]},
-					{v[3], v[1]},
-					{v[4], v[5]},
-					{v[5], v[5]},
-				},
+			outCols:   []uint32{3, 1, 2},
+			leftTypes: threeIntCols,
+			leftInput: sqlbase.EncDatumRows{
+				{v[1], v[0], v[4]},
+				{v[3], v[4], v[1]},
+				{v[4], v[4], v[5]},
+			},
+			rightTypes: twoIntCols,
+			rightInput: sqlbase.EncDatumRows{
+				{v[0], v[0]},
+				{v[1], v[4]},
+				{v[2], v[4]},
+				{v[3], v[1]},
+				{v[4], v[5]},
+				{v[5], v[5]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[0], null, null},
@@ -226,21 +232,21 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_FULL_OUTER,
 				// Implicit @1 = @3 constraint.
 			},
-			outCols: []uint32{0, 3, 4},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[0], v[0]},
-					{v[1], v[4]},
-					{v[2], v[4]},
-					{v[3], v[1]},
-					{v[4], v[5]},
-				},
-				{
-					{v[1], v[0], v[4]},
-					{v[3], v[4], v[1]},
-					{v[4], v[4], v[5]},
-					{v[5], v[5], v[1]},
-				},
+			outCols:   []uint32{0, 3, 4},
+			leftTypes: twoIntCols,
+			leftInput: sqlbase.EncDatumRows{
+				{v[0], v[0]},
+				{v[1], v[4]},
+				{v[2], v[4]},
+				{v[3], v[1]},
+				{v[4], v[5]},
+			},
+			rightTypes: threeIntCols,
+			rightInput: sqlbase.EncDatumRows{
+				{v[1], v[0], v[4]},
+				{v[3], v[4], v[1]},
+				{v[4], v[4], v[5]},
+				{v[5], v[5], v[1]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[0], null, null},
@@ -258,20 +264,20 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_INNER,
 				// Implicit @1 = @3 constraint.
 			},
-			outCols: []uint32{0, 3, 4},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[0], v[0]},
-					{v[2], v[4]},
-					{v[3], v[1]},
-					{v[4], v[5]},
-					{v[5], v[5]},
-				},
-				{
-					{v[1], v[0], v[4]},
-					{v[3], v[4], v[1]},
-					{v[4], v[4], v[5]},
-				},
+			outCols:   []uint32{0, 3, 4},
+			leftTypes: twoIntCols,
+			leftInput: sqlbase.EncDatumRows{
+				{v[0], v[0]},
+				{v[2], v[4]},
+				{v[3], v[1]},
+				{v[4], v[5]},
+				{v[5], v[5]},
+			},
+			rightTypes: threeIntCols,
+			rightInput: sqlbase.EncDatumRows{
+				{v[1], v[0], v[4]},
+				{v[3], v[4], v[1]},
+				{v[4], v[4], v[5]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[3], v[4], v[1]},
@@ -286,33 +292,33 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_LEFT_OUTER,
 				OnExpr:         Expression{Expr: "@3 = 9"},
 			},
-			outCols: []uint32{0, 1},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[1]},
-					{v[2]},
-					{v[3]},
-					{v[5]},
-					{v[6]},
-					{v[7]},
-				},
-				{
-					{v[2], v[8]},
-					{v[3], v[9]},
-					{v[4], v[9]},
+			outCols:   []uint32{0, 1},
+			leftTypes: oneIntCol,
+			leftInput: sqlbase.EncDatumRows{
+				{v[1]},
+				{v[2]},
+				{v[3]},
+				{v[5]},
+				{v[6]},
+				{v[7]},
+			},
+			rightTypes: twoIntCols,
+			rightInput: sqlbase.EncDatumRows{
+				{v[2], v[8]},
+				{v[3], v[9]},
+				{v[4], v[9]},
 
-					// Rows that match v[5].
-					{v[5], v[9]},
-					{v[5], v[9]},
+				// Rows that match v[5].
+				{v[5], v[9]},
+				{v[5], v[9]},
 
-					// Rows that match v[6] but the ON condition fails.
-					{v[6], v[8]},
-					{v[6], v[8]},
+				// Rows that match v[6] but the ON condition fails.
+				{v[6], v[8]},
+				{v[6], v[8]},
 
-					// Rows that match v[7], ON condition fails for one.
-					{v[7], v[8]},
-					{v[7], v[9]},
-				},
+				// Rows that match v[7], ON condition fails for one.
+				{v[7], v[8]},
+				{v[7], v[9]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[1], null},
@@ -332,18 +338,18 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_RIGHT_OUTER,
 				OnExpr:         Expression{Expr: "@2 > 1"},
 			},
-			outCols: []uint32{0, 1},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[0]},
-					{v[1]},
-					{v[2]},
-				},
-				{
-					{v[1]},
-					{v[2]},
-					{v[3]},
-				},
+			outCols:   []uint32{0, 1},
+			leftTypes: oneIntCol,
+			leftInput: sqlbase.EncDatumRows{
+				{v[0]},
+				{v[1]},
+				{v[2]},
+			},
+			rightTypes: oneIntCol,
+			rightInput: sqlbase.EncDatumRows{
+				{v[1]},
+				{v[2]},
+				{v[3]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{null, v[1]},
@@ -359,18 +365,18 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_FULL_OUTER,
 				OnExpr:         Expression{Expr: "@2 > 1"},
 			},
-			outCols: []uint32{0, 1},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[0]},
-					{v[1]},
-					{v[2]},
-				},
-				{
-					{v[1]},
-					{v[2]},
-					{v[3]},
-				},
+			outCols:   []uint32{0, 1},
+			leftTypes: oneIntCol,
+			leftInput: sqlbase.EncDatumRows{
+				{v[0]},
+				{v[1]},
+				{v[2]},
+			},
+			rightTypes: oneIntCol,
+			rightInput: sqlbase.EncDatumRows{
+				{v[1]},
+				{v[2]},
+				{v[3]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[0], null},
@@ -389,20 +395,20 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_INNER,
 				// Implicit @1,@2 = @3,@4 constraint.
 			},
-			outCols: []uint32{0, 1, 2, 3, 4},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[0], v[0]},
-					{v[1], null},
-					{null, v[2]},
-					{null, null},
-				},
-				{
-					{v[0], v[0], v[4]},
-					{v[1], null, v[5]},
-					{null, v[2], v[6]},
-					{null, null, v[7]},
-				},
+			outCols:   []uint32{0, 1, 2, 3, 4},
+			leftTypes: twoIntCols,
+			leftInput: sqlbase.EncDatumRows{
+				{v[0], v[0]},
+				{v[1], null},
+				{null, v[2]},
+				{null, null},
+			},
+			rightTypes: threeIntCols,
+			rightInput: sqlbase.EncDatumRows{
+				{v[0], v[0], v[4]},
+				{v[1], null, v[5]},
+				{null, v[2], v[6]},
+				{null, null, v[7]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[0], v[0], v[0], v[0], v[4]},
@@ -416,20 +422,20 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_LEFT_OUTER,
 				// Implicit @1,@2 = @3,@4 constraint.
 			},
-			outCols: []uint32{0, 1, 2, 3, 4},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[0], v[0]},
-					{v[1], null},
-					{null, v[2]},
-					{null, null},
-				},
-				{
-					{v[0], v[0], v[4]},
-					{v[1], null, v[5]},
-					{null, v[2], v[6]},
-					{null, null, v[7]},
-				},
+			outCols:   []uint32{0, 1, 2, 3, 4},
+			leftTypes: twoIntCols,
+			leftInput: sqlbase.EncDatumRows{
+				{v[0], v[0]},
+				{v[1], null},
+				{null, v[2]},
+				{null, null},
+			},
+			rightTypes: threeIntCols,
+			rightInput: sqlbase.EncDatumRows{
+				{v[0], v[0], v[4]},
+				{v[1], null, v[5]},
+				{null, v[2], v[6]},
+				{null, null, v[7]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[0], v[0], v[0], v[0], v[4]},
@@ -446,20 +452,20 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_RIGHT_OUTER,
 				// Implicit @1,@2 = @3,@4 constraint.
 			},
-			outCols: []uint32{0, 1, 2, 3, 4},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[0], v[0]},
-					{v[1], null},
-					{null, v[2]},
-					{null, null},
-				},
-				{
-					{v[0], v[0], v[4]},
-					{v[1], null, v[5]},
-					{null, v[2], v[6]},
-					{null, null, v[7]},
-				},
+			outCols:   []uint32{0, 1, 2, 3, 4},
+			leftTypes: twoIntCols,
+			leftInput: sqlbase.EncDatumRows{
+				{v[0], v[0]},
+				{v[1], null},
+				{null, v[2]},
+				{null, null},
+			},
+			rightTypes: threeIntCols,
+			rightInput: sqlbase.EncDatumRows{
+				{v[0], v[0], v[4]},
+				{v[1], null, v[5]},
+				{null, v[2], v[6]},
+				{null, null, v[7]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[0], v[0], v[0], v[0], v[4]},
@@ -476,20 +482,20 @@ func TestHashJoiner(t *testing.T) {
 				Type:           JoinType_FULL_OUTER,
 				// Implicit @1,@2 = @3,@4 constraint.
 			},
-			outCols: []uint32{0, 1, 2, 3, 4},
-			inputs: []sqlbase.EncDatumRows{
-				{
-					{v[0], v[0]},
-					{v[1], null},
-					{null, v[2]},
-					{null, null},
-				},
-				{
-					{v[0], v[0], v[4]},
-					{v[1], null, v[5]},
-					{null, v[2], v[6]},
-					{null, null, v[7]},
-				},
+			outCols:   []uint32{0, 1, 2, 3, 4},
+			leftTypes: twoIntCols,
+			leftInput: sqlbase.EncDatumRows{
+				{v[0], v[0]},
+				{v[1], null},
+				{null, v[2]},
+				{null, null},
+			},
+			rightTypes: threeIntCols,
+			rightInput: sqlbase.EncDatumRows{
+				{v[0], v[0], v[4]},
+				{v[1], null, v[5]},
+				{null, v[2], v[6]},
+				{null, null, v[7]},
 			},
 			expected: sqlbase.EncDatumRows{
 				{v[0], v[0], v[0], v[0], v[4]},
@@ -503,46 +509,102 @@ func TestHashJoiner(t *testing.T) {
 		},
 	}
 
+	ctx := context.Background()
+	tempEngine, err := engine.NewTempEngine(base.DefaultTestTempStorageConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tempEngine.Close()
+
+	evalCtx := parser.MakeTestingEvalContext()
+	defer evalCtx.Stop(ctx)
+	diskMonitor := mon.MakeMonitor(
+		"test-disk",
+		mon.DiskResource,
+		nil, /* curCount */
+		nil, /* maxHist */
+		-1,  /* increment: use default block size */
+		math.MaxInt64,
+	)
+	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	defer diskMonitor.Stop(ctx)
+
 	for _, c := range testCases {
-		t.Run("", func(t *testing.T) {
-			// Run tests with a variety of initial buffer sizes.
-			for _, initialBuffer := range []int64{0, 32, 64, 128, 1024 * 1024} {
-				t.Run(fmt.Sprintf("%d", initialBuffer), func(t *testing.T) {
-					hs := c.spec
-					leftInput := NewRowBuffer(nil /* types */, c.inputs[0], RowBufferArgs{})
-					rightInput := NewRowBuffer(nil /* types */, c.inputs[1], RowBufferArgs{})
-					out := &RowBuffer{}
-					evalCtx := parser.MakeTestingEvalContext()
-					defer evalCtx.Stop(context.Background())
-					flowCtx := FlowCtx{evalCtx: evalCtx}
+		// testFunc is a helper function that runs a hashJoin with the current
+		// test case after running the provided setup function.
+		testFunc := func(t *testing.T, setup func(h *hashJoiner)) error {
+			leftInput := NewRowBuffer(c.leftTypes, c.leftInput, RowBufferArgs{})
+			rightInput := NewRowBuffer(c.rightTypes, c.rightInput, RowBufferArgs{})
+			out := &RowBuffer{}
+			flowCtx := FlowCtx{
+				Settings:    cluster.MakeTestingClusterSettings(),
+				EvalCtx:     evalCtx,
+				TempStorage: tempEngine,
+				diskMonitor: &diskMonitor,
+			}
 
-					post := PostProcessSpec{Projection: true, OutputColumns: c.outCols}
-					h, err := newHashJoiner(&flowCtx, &hs, leftInput, rightInput, &post, out)
-					if err != nil {
-						t.Fatal(err)
-					}
+			post := PostProcessSpec{Projection: true, OutputColumns: c.outCols}
+			h, err := newHashJoiner(&flowCtx, &c.spec, leftInput, rightInput, &post, out)
+			if err != nil {
+				return err
+			}
+			outTypes := h.OutputTypes()
+			setup(h)
+			h.Run(ctx, nil)
+
+			if !out.ProducerClosed {
+				return errors.New("output RowReceiver not closed")
+			}
+
+			return checkExpectedRows(outTypes, c.expected, out)
+		}
+
+		// Run test with a variety of initial buffer sizes.
+		for _, initialBuffer := range []int64{0, 32, 64, 128, 1024 * 1024} {
+			t.Run(fmt.Sprintf("InitialBuffer=%d", initialBuffer), func(t *testing.T) {
+				if err := testFunc(t, func(h *hashJoiner) {
 					h.initialBufferSize = initialBuffer
+				}); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
 
-					h.Run(context.Background(), nil)
-
-					if !out.ProducerClosed {
-						t.Fatalf("output RowReceiver not closed")
-					}
-
-					if err := checkExpectedRows(c.expected, out); err != nil {
-						fmt.Println(err)
+		// Run tests with a probability of the run failing with a memory error.
+		// These verify that the hashJoiner falls back to disk correctly in all
+		// cases.
+		for _, memFailPoint := range []hashJoinPhase{buffer, build} {
+			for i := 0; i < 5; i++ {
+				t.Run(fmt.Sprintf("MemFailPoint=%s", memFailPoint), func(t *testing.T) {
+					if err := testFunc(t, func(h *hashJoiner) {
+						h.testingKnobMemFailPoint = memFailPoint
+						h.testingKnobFailProbability = 0.5
+					}); err != nil {
 						t.Fatal(err)
 					}
 				})
 			}
-		})
+		}
+
+		// Run test with a variety of memory limits.
+		for _, memLimit := range []int64{1, 256, 512, 1024, 2048} {
+			t.Run(fmt.Sprintf("MemLimit=%d", memLimit), func(t *testing.T) {
+				if err := testFunc(t, func(h *hashJoiner) {
+					h.flowCtx.testingKnobs.MemoryLimitBytes = memLimit
+				}); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
 	}
 }
 
-func checkExpectedRows(expectedRows sqlbase.EncDatumRows, results *RowBuffer) error {
+func checkExpectedRows(
+	types []sqlbase.ColumnType, expectedRows sqlbase.EncDatumRows, results *RowBuffer,
+) error {
 	var expected []string
 	for _, row := range expectedRows {
-		expected = append(expected, row.String())
+		expected = append(expected, row.String(types))
 	}
 	sort.Strings(expected)
 	expStr := strings.Join(expected, "")
@@ -556,7 +618,7 @@ func checkExpectedRows(expectedRows sqlbase.EncDatumRows, results *RowBuffer) er
 		if row == nil {
 			break
 		}
-		rets = append(rets, row.String())
+		rets = append(rets, row.String(types))
 	}
 	sort.Strings(rets)
 	retStr := strings.Join(rets, "")
@@ -603,10 +665,10 @@ func TestHashJoinerDrain(t *testing.T) {
 	}
 	leftInputDrainNotification := make(chan error, 1)
 	leftInputConsumerDone := func(rb *RowBuffer) {
-		// Check that draining occurs before the left input has been consumer, not
-		// at the end.
-		// The left input started with 2 rows and 1 was consumed to find out that we
-		// need to drain. So we expect 1 to be left.
+		// Check that draining occurs before the left input has been consumed,
+		// not at the end.
+		// The left input started with 2 rows and 1 was consumed to find out
+		// that we need to drain. So we expect 1 to be left.
 		rb.mu.Lock()
 		defer rb.mu.Unlock()
 		if len(rb.mu.records) != 1 {
@@ -617,16 +679,25 @@ func TestHashJoinerDrain(t *testing.T) {
 		leftInputDrainNotification <- nil
 	}
 	leftInput := NewRowBuffer(
-		nil, /* types */
+		oneIntCol,
 		inputs[0],
-		RowBufferArgs{OnConsumerDone: leftInputConsumerDone})
-	rightInput := NewRowBuffer(nil /* types */, inputs[1], RowBufferArgs{})
+		RowBufferArgs{OnConsumerDone: leftInputConsumerDone},
+	)
+	rightInput := NewRowBuffer(oneIntCol, inputs[1], RowBufferArgs{})
 	out := NewRowBuffer(
-		nil /* types */, nil, /* rows */
-		RowBufferArgs{AccumulateRowsWhileDraining: true})
+		oneIntCol,
+		nil, /* rows */
+		RowBufferArgs{AccumulateRowsWhileDraining: true},
+	)
 	evalCtx := parser.MakeTestingEvalContext()
-	defer evalCtx.Stop(context.Background())
-	flowCtx := FlowCtx{evalCtx: evalCtx}
+	ctx := context.Background()
+	defer evalCtx.Stop(ctx)
+
+	// Since the use of external storage overrides h.initialBufferSize, disable
+	// it for this test.
+	settings := cluster.MakeTestingClusterSettings()
+	settingUseTempStorageJoins.Override(&settings.SV, false)
+	flowCtx := FlowCtx{Settings: settings, EvalCtx: evalCtx}
 
 	post := PostProcessSpec{Projection: true, OutputColumns: outCols}
 	h, err := newHashJoiner(&flowCtx, &spec, leftInput, rightInput, &post, out)
@@ -634,10 +705,12 @@ func TestHashJoinerDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Disable initial buffering. We always store the right stream in this case.
+	// If not disabled, both streams will be fully consumed before outputting
+	// any rows.
 	h.initialBufferSize = 0
 
 	out.ConsumerDone()
-	h.Run(context.Background(), nil)
+	h.Run(ctx, nil)
 
 	if !out.ProducerClosed {
 		t.Fatalf("output RowReceiver not closed")
@@ -654,7 +727,7 @@ func TestHashJoinerDrain(t *testing.T) {
 		t.Fatalf("left input not drained; still %d rows in it", len(leftInput.mu.records))
 	}
 
-	if err := checkExpectedRows(expected, out); err != nil {
+	if err := checkExpectedRows(oneIntCol, expected, out); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -724,20 +797,26 @@ func TestHashJoinerDrainAfterBuildPhaseError(t *testing.T) {
 		return nil, ProducerMetadata{}
 	}
 	leftInput := NewRowBuffer(
-		nil, /* types */
+		oneIntCol,
 		inputs[0],
-		RowBufferArgs{OnConsumerDone: leftInputConsumerDone})
+		RowBufferArgs{OnConsumerDone: leftInputConsumerDone},
+	)
 	rightInput := NewRowBuffer(
-		nil /* types */, inputs[1],
+		oneIntCol,
+		inputs[1],
 		RowBufferArgs{
 			OnConsumerDone: rightInputConsumerDone,
-			OnNext:         rightInputNext})
+			OnNext:         rightInputNext,
+		},
+	)
 	out := NewRowBuffer(
-		nil /* types */, nil, /* rows */
-		RowBufferArgs{})
+		oneIntCol,
+		nil, /* rows */
+		RowBufferArgs{},
+	)
 	evalCtx := parser.MakeTestingEvalContext()
 	defer evalCtx.Stop(context.Background())
-	flowCtx := FlowCtx{evalCtx: evalCtx}
+	flowCtx := FlowCtx{Settings: cluster.MakeTestingClusterSettings(), EvalCtx: evalCtx}
 
 	post := PostProcessSpec{Projection: true, OutputColumns: outCols}
 	h, err := newHashJoiner(&flowCtx, &spec, leftInput, rightInput, &post, out)
@@ -771,5 +850,62 @@ func TestHashJoinerDrainAfterBuildPhaseError(t *testing.T) {
 	}
 	if !testutils.IsError(out.mu.records[0].Meta.Err, "Test error. Please drain.") {
 		t.Fatalf("expected %q, got: %v", "Test error", out.mu.records[0].Meta.Err)
+	}
+}
+
+// BenchmarkHashJoiner times how long it takes to join two tables of the same
+// variable size. There is a 1:1 relationship between the rows of each table.
+// TODO(asubiotto): More complex benchmarks.
+func BenchmarkHashJoiner(b *testing.B) {
+	ctx := context.Background()
+	evalCtx := parser.MakeTestingEvalContext()
+	defer evalCtx.Stop(ctx)
+	flowCtx := FlowCtx{
+		Settings: cluster.MakeTestingClusterSettings(),
+		EvalCtx:  evalCtx,
+	}
+
+	spec := HashJoinerSpec{
+		LeftEqColumns:  []uint32{0},
+		RightEqColumns: []uint32{0},
+		Type:           JoinType_INNER,
+	}
+	post := PostProcessSpec{Projection: true, OutputColumns: []uint32{0}}
+
+	columnTypeInt := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
+	numCols := 4
+	for _, inputSize := range []int{0, 1 << 2, 1 << 4, 1 << 8, 1 << 12, 1 << 16} {
+		b.Run(fmt.Sprintf("InputSize=%d", inputSize), func(b *testing.B) {
+			types := make([]sqlbase.ColumnType, numCols)
+			for i := 0; i < numCols; i++ {
+				types[i] = columnTypeInt
+			}
+			// makeInputTable constructs an inputSize x numCols table where
+			// input[i][j] = i + j.
+			makeInputTable := func() sqlbase.EncDatumRows {
+				input := make(sqlbase.EncDatumRows, inputSize)
+				for i := range input {
+					input[i] = make(sqlbase.EncDatumRow, numCols)
+					for j := 0; j < numCols; j++ {
+						input[i][j] = sqlbase.DatumToEncDatum(columnTypeInt, parser.NewDInt(parser.DInt(i+j)))
+					}
+				}
+				return input
+			}
+			leftInput := NewRepeatableRowSource(types, makeInputTable())
+			rightInput := NewRepeatableRowSource(types, makeInputTable())
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				// TODO(asubiotto): Get rid of uncleared state between
+				// hashJoiner Run()s to omit instantiation time from benchmarks.
+				h, err := newHashJoiner(&flowCtx, &spec, leftInput, rightInput, &post, &RowDisposer{})
+				if err != nil {
+					b.Fatal(err)
+				}
+				h.Run(ctx, nil)
+				leftInput.Reset()
+				rightInput.Reset()
+			}
+		})
 	}
 }

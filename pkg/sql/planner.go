@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
@@ -21,13 +19,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
@@ -45,14 +43,25 @@ type planner struct {
 	// As the planner executes statements, it may change the current user session.
 	session *Session
 
+	// Reference to the corresponding sql Statement for this query.
+	stmt *Statement
+
 	// Contexts for different stages of planning and execution.
 	semaCtx parser.SemaContext
 	evalCtx parser.EvalContext
 
-	// If set, table descriptors will only be fetched at the time of the
-	// transaction, not leased. This is used for things like AS OF SYSTEM TIME
-	// queries and building query plans for views when they're created.
-	// It's used in layers below the executor to modify the behavior of SELECT.
+	// avoidCachedDescriptors, when true, instructs all code that
+	// accesses table/view descriptors to force reading the descriptors
+	// within the transaction. This is necessary to:
+	// - ensure that queries ran with AS OF SYSTEM TIME get the right
+	//   version of descriptors.
+	// - queries that create/update descriptors read all their dependencies
+	//   in the same txn that they write new descriptors or update their
+	//   dependencies, so that update/creation appears transactional
+	//   to the rest of the cluster.
+	// Code that sets this to true should probably also check that
+	// the txn isolation level is SERIALIZABLE, and reject any update
+	// if it is SNAPSHOT.
 	avoidCachedDescriptors bool
 
 	// If set, the planner should skip checking for the SELECT privilege when
@@ -70,12 +79,36 @@ type planner struct {
 	// See executor_statement_metrics.go for details.
 	phaseTimes phaseTimes
 
+	// cancelChecker is used by planNodes to check for cancellation of the associated
+	// query.
+	cancelChecker *sqlbase.CancelChecker
+
+	// planDeps, if non-nil, collects the table/view dependencies for this query.
+	// Any planNode constructors that resolves a table name or reference in the query
+	// to a descriptor must register this descriptor into planDeps.
+	// This is (currently) used by CREATE VIEW.
+	// TODO(knz): Remove this in favor of a better encapsulated mechanism.
+	planDeps planDependencies
+
+	// hasStar collects whether any star expansion has occurred during
+	// logical plan construction. This is used by CREATE VIEW until
+	// #10028 is addressed.
+	hasStar bool
+	// hasSubqueries collects whether any subqueries expansion has
+	// occurred during logical plan construction.
+	hasSubqueries bool
+
 	// Avoid allocations by embedding commonly used objects and visitors.
 	parser                parser.Parser
 	subqueryVisitor       subqueryVisitor
 	subqueryPlanVisitor   subqueryPlanVisitor
 	nameResolutionVisitor nameResolutionVisitor
 	srfExtractionVisitor  srfExtractionVisitor
+
+	// Use a common datum allocator across all the plan nodes. This separates the
+	// plan lifetime from the lifetime of returned results allowing plan nodes to
+	// be pool allocated.
+	alloc sqlbase.DatumAlloc
 }
 
 var emptyPlanner planner
@@ -100,19 +133,21 @@ func makeInternalPlanner(
 		context:  ctx,
 		tables:   TableCollection{databaseCache: newDatabaseCache(config.SystemConfig{})},
 	}
-
 	s.mon = mon.MakeUnlimitedMonitor(ctx,
 		"internal-root",
+		mon.MemoryResource,
 		memMetrics.CurBytesCount, memMetrics.MaxBytesHist,
 		noteworthyInternalMemoryUsageBytes)
 
 	s.sessionMon = mon.MakeMonitor("internal-session",
+		mon.MemoryResource,
 		memMetrics.SessionCurBytesCount,
 		memMetrics.SessionMaxBytesHist,
 		-1, noteworthyInternalMemoryUsageBytes/5)
 	s.sessionMon.Start(ctx, &s.mon, mon.BoundAccount{})
 
 	s.TxnState.mon = mon.MakeMonitor("internal-txn",
+		mon.MemoryResource,
 		memMetrics.TxnCurBytesCount,
 		memMetrics.TxnMaxBytesHist,
 		-1, noteworthyInternalMemoryUsageBytes/5)
@@ -151,11 +186,23 @@ func (p *planner) User() string {
 	return p.session.User
 }
 
+func (p *planner) EvalContext() parser.EvalContext {
+	return p.evalCtx
+}
+
+// TODO(dan): This is here to implement PlanHookState, but it's not clear that
+// this is the right abstraction. We could also export DistSQLPlanner, for
+// example. Revisit.
+func (p *planner) DistLoader() *DistLoader {
+	return &DistLoader{distSQLPlanner: p.session.distSQLPlanner}
+}
+
 // setTxn resets the current transaction in the planner and
 // initializes the timestamps used by SQL built-in functions from
 // the new txn object, if any.
 func (p *planner) setTxn(txn *client.Txn) {
 	p.txn = txn
+	p.evalCtx.Txn = txn
 	if txn != nil {
 		p.evalCtx.SetClusterTimestamp(txn.OrigTimestamp())
 	} else {
@@ -215,37 +262,21 @@ func (p *planner) queryRows(
 	if err := p.startPlan(ctx, plan); err != nil {
 		return nil, err
 	}
-	if next, err := plan.Next(ctx); err != nil || !next {
-		return nil, err
+	params := runParams{
+		ctx: ctx,
+		p:   p,
 	}
-
 	var rows []parser.Datums
-	for {
-		if values := plan.Values(); values != nil {
+	if err = forEachRow(params, plan, func(values parser.Datums) error {
+		if values != nil {
 			valCopy := append(parser.Datums(nil), values...)
 			rows = append(rows, valCopy)
 		}
-
-		next, err := plan.Next(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if !next {
-			break
-		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return rows, nil
-}
-
-// queryRowsAsRoot executes a SQL query string using security.RootUser
-// and multiple result rows are returned.
-func (p *planner) queryRowsAsRoot(
-	ctx context.Context, sql string, args ...interface{},
-) ([]parser.Datums, error) {
-	currentUser := p.session.User
-	defer func() { p.session.User = currentUser }()
-	p.session.User = security.RootUser
-	return p.queryRows(ctx, sql, args...)
 }
 
 // exec executes a SQL query string and returns the number of rows
@@ -259,7 +290,11 @@ func (p *planner) exec(ctx context.Context, sql string, args ...interface{}) (in
 	if err := p.startPlan(ctx, plan); err != nil {
 		return 0, err
 	}
-	return countRowsAffected(ctx, plan)
+	params := runParams{
+		ctx: ctx,
+		p:   p,
+	}
+	return countRowsAffected(params, plan)
 }
 
 func (p *planner) fillFKTableMap(ctx context.Context, m sqlbase.TableLookupsByID) error {
@@ -306,7 +341,63 @@ func (p *planner) TypeAsString(e parser.Expr, op string) (func() (string, error)
 		if err != nil {
 			return "", err
 		}
-		return parser.AsStringWithFlags(d, parser.FmtBareStrings), nil
+		str, ok := d.(*parser.DString)
+		if !ok {
+			return "", errors.Errorf("failed to cast %T to string", d)
+		}
+		return string(*str), nil
+	}
+	return fn, nil
+}
+
+// TypeAsStringOpts enforces (not hints) that the given expressions
+// typecheck as strings, and returns a function that can be called to
+// get the string value during (planNode).Start.
+func (p *planner) TypeAsStringOpts(
+	opts parser.KVOptions, expectValues map[string]bool,
+) (func() (map[string]string, error), error) {
+	typed := make(map[string]parser.TypedExpr, len(opts))
+	for _, opt := range opts {
+		k := string(opt.Key)
+		takesValue, ok := expectValues[k]
+		if !ok {
+			return nil, errors.Errorf("invalid option %q", k)
+		}
+
+		if opt.Value == nil {
+			if takesValue {
+				return nil, errors.Errorf("option %q requires a value", k)
+			}
+			typed[k] = nil
+			continue
+		}
+		if !takesValue {
+			return nil, errors.Errorf("option %q does not take a value", k)
+		}
+		r, err := parser.TypeCheckAndRequire(opt.Value, &p.semaCtx, parser.TypeString, k)
+		if err != nil {
+			return nil, err
+		}
+		typed[k] = r
+	}
+	fn := func() (map[string]string, error) {
+		res := make(map[string]string, len(typed))
+		for name, e := range typed {
+			if e == nil {
+				res[name] = ""
+				continue
+			}
+			d, err := e.Eval(&p.evalCtx)
+			if err != nil {
+				return nil, err
+			}
+			str, ok := d.(*parser.DString)
+			if !ok {
+				return res, errors.Errorf("failed to cast %T to string", d)
+			}
+			res[name] = string(*str)
+		}
+		return res, nil
 	}
 	return fn, nil
 }
@@ -332,7 +423,11 @@ func (p *planner) TypeAsStringArray(
 			if err != nil {
 				return nil, err
 			}
-			strs[i] = parser.AsStringWithFlags(d, parser.FmtBareStrings)
+			str, ok := d.(*parser.DString)
+			if !ok {
+				return strs, errors.Errorf("failed to cast %T to string", d)
+			}
+			strs[i] = string(*str)
 		}
 		return strs, nil
 	}

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
@@ -158,7 +156,7 @@ func (sd *StreamDecoder) GetRow(
 	for i := range rowBuf {
 		var err error
 		rowBuf[i], sd.data, err = sqlbase.EncDatumFromBuffer(
-			sd.typing[i].Type, sd.typing[i].Encoding, sd.data,
+			&sd.typing[i].Type, sd.typing[i].Encoding, sd.data,
 		)
 		if err != nil {
 			// Reset sd because it is no longer usable.
@@ -167,4 +165,17 @@ func (sd *StreamDecoder) GetRow(
 		}
 	}
 	return rowBuf, ProducerMetadata{}, nil
+}
+
+// Types returns the types of the columns; can only be used after we received at
+// least one row.
+func (sd *StreamDecoder) Types() []sqlbase.ColumnType {
+	if !sd.typingReceived {
+		panic("no typing info received yet")
+	}
+	types := make([]sqlbase.ColumnType, len(sd.typing))
+	for i := range types {
+		types[i] = sd.typing[i].Type
+	}
+	return types
 }

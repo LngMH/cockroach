@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package engine
 
@@ -132,7 +130,7 @@ func testBatchBasics(t *testing.T, writeOnly bool, commit func(e Engine, b Batch
 func TestBatchBasics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	testBatchBasics(t, false /* writeOnly */, func(e Engine, b Batch) error {
-		return b.Commit(false /* !sync */)
+		return b.Commit(false /* sync */)
 	})
 }
 
@@ -246,8 +244,14 @@ func TestBatchRepr(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%+v", err)
 		}
-		if count, expected := r.Count(), 3; count != expected {
-			t.Fatalf("bad count: expected %d, but found %d", expected, count)
+		const expectedCount = 3
+		if count := r.Count(); count != expectedCount {
+			t.Fatalf("bad count: RocksDBBatchReader.Count expected %d, but found %d", expectedCount, count)
+		}
+		if count, err := RocksDBBatchCount(repr); err != nil {
+			t.Fatal(err)
+		} else if count != expectedCount {
+			t.Fatalf("bad count: RocksDBBatchCount expected %d, but found %d", expectedCount, count)
 		}
 
 		var ops []string
@@ -257,12 +261,12 @@ func TestBatchRepr(t *testing.T) {
 			}
 			switch r.BatchType() {
 			case BatchTypeDeletion:
-				ops = append(ops, fmt.Sprintf("delete(%s)", string(r.UnsafeKey())))
+				ops = append(ops, fmt.Sprintf("delete(%s)", string(r.Key())))
 			case BatchTypeValue:
-				ops = append(ops, fmt.Sprintf("put(%s,%s)", string(r.UnsafeKey()), string(r.UnsafeValue())))
+				ops = append(ops, fmt.Sprintf("put(%s,%s)", string(r.Key()), string(r.Value())))
 			case BatchTypeMerge:
 				// The merge value is a protobuf and not easily displayable.
-				ops = append(ops, fmt.Sprintf("merge(%s)", string(r.UnsafeKey())))
+				ops = append(ops, fmt.Sprintf("merge(%s)", string(r.Key())))
 			}
 		}
 		if err != nil {
@@ -279,14 +283,14 @@ func TestBatchRepr(t *testing.T) {
 			t.Fatalf("expected %v, but found %v", expOps, ops)
 		}
 
-		return e.ApplyBatchRepr(repr, false /* !sync */)
+		return e.ApplyBatchRepr(repr, false /* sync */)
 	})
 }
 
 func TestWriteBatchBasics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	testBatchBasics(t, true /* writeOnly */, func(e Engine, b Batch) error {
-		return b.Commit(false /* !sync */)
+		return b.Commit(false /* sync */)
 	})
 }
 
@@ -312,7 +316,7 @@ func TestApplyBatchRepr(t *testing.T) {
 
 		b2 := e.NewBatch()
 		defer b2.Close()
-		if err := b2.ApplyBatchRepr(repr1, false /* !sync */); err != nil {
+		if err := b2.ApplyBatchRepr(repr1, false /* sync */); err != nil {
 			t.Fatal(err)
 		}
 		repr2 := b2.Repr()
@@ -338,11 +342,11 @@ func TestApplyBatchRepr(t *testing.T) {
 
 		b4 := e.NewBatch()
 		defer b4.Close()
-		if err := b4.ApplyBatchRepr(repr, false /* !sync */); err != nil {
+		if err := b4.ApplyBatchRepr(repr, false /* sync */); err != nil {
 			t.Fatal(err)
 		}
 		// Intentionally don't call Repr() because the expected user wouldn't.
-		if err := b4.Commit(false /* !sync */); err != nil {
+		if err := b4.Commit(false /* sync */); err != nil {
 			t.Fatal(err)
 		}
 
@@ -400,10 +404,10 @@ func TestBatchGet(t *testing.T) {
 
 func compareMergedValues(t *testing.T, result, expected []byte) bool {
 	var resultV, expectedV enginepb.MVCCMetadata
-	if err := proto.Unmarshal(result, &resultV); err != nil {
+	if err := protoutil.Unmarshal(result, &resultV); err != nil {
 		t.Fatal(err)
 	}
-	if err := proto.Unmarshal(expected, &expectedV); err != nil {
+	if err := protoutil.Unmarshal(expected, &expectedV); err != nil {
 		t.Fatal(err)
 	}
 	return reflect.DeepEqual(resultV, expectedV)
@@ -504,7 +508,7 @@ func TestBatchProto(t *testing.T) {
 		t.Fatalf("expected GetProto to fail ok=%t: %s", ok, err)
 	}
 	// Commit and verify the proto can be read directly from the engine.
-	if err := b.Commit(false /* !sync */); err != nil {
+	if err := b.Commit(false /* sync */); err != nil {
 		t.Fatal(err)
 	}
 	if ok, _, _, err := e.GetProto(mvccKey("proto"), getVal); !ok || err != nil {
@@ -593,7 +597,7 @@ func TestBatchScan(t *testing.T) {
 	}
 
 	// Now, commit batch and re-scan using engine direct to compare results.
-	if err := b.Commit(false /* !sync */); err != nil {
+	if err := b.Commit(false /* sync */); err != nil {
 		t.Fatal(err)
 	}
 	for i, scan := range scans {
@@ -1136,7 +1140,7 @@ func TestDecodeKey(t *testing.T) {
 			if !r.Next() {
 				t.Fatalf("could not get the first entry: %+v", r.Error())
 			}
-			decodedKey, err := DecodeKey(r.UnsafeKey())
+			decodedKey, err := DecodeKey(r.Key())
 			if err != nil {
 				t.Fatalf("unexpected err: %+v", err)
 			}

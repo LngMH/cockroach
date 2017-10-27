@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Veteran Lu (23907238@qq.com)
 
 package keys
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"testing"
@@ -31,7 +30,6 @@ import (
 )
 
 func TestPrettyPrint(t *testing.T) {
-
 	tm, _ := time.Parse(time.RFC3339Nano, "2016-03-30T13:40:35.053725008Z")
 	duration := duration.Duration{Months: 1, Days: 1, Nanos: 1 * time.Second.Nanoseconds()}
 	durationAsc, _ := encoding.EncodeDurationAscending(nil, duration)
@@ -48,8 +46,9 @@ func TestPrettyPrint(t *testing.T) {
 		// local
 		{StoreIdentKey(), "/Local/Store/storeIdent"},
 		{StoreGossipKey(), "/Local/Store/gossipBootstrap"},
+		{StoreClusterVersionKey(), "/Local/Store/clusterVersion"},
 
-		{AbortCacheKey(roachpb.RangeID(1000001), txnID), fmt.Sprintf(`/Local/RangeID/1000001/r/AbortCache/%q`, txnID)},
+		{AbortSpanKey(roachpb.RangeID(1000001), txnID), fmt.Sprintf(`/Local/RangeID/1000001/r/AbortSpan/%q`, txnID)},
 		{RaftTombstoneKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftTombstone"},
 		{RaftAppliedIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftAppliedIndex"},
 		{LeaseAppliedIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/LeaseAppliedIndex"},
@@ -66,17 +65,17 @@ func TestPrettyPrint(t *testing.T) {
 		{RangeLastReplicaGCTimestampKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RangeLastReplicaGCTimestamp"},
 		{RangeLastVerificationTimestampKeyDeprecated(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RangeLastVerificationTimestamp"},
 
-		{MakeRangeKeyPrefix(roachpb.RKey("ok")), `/Local/Range/"ok"`},
-		{RangeDescriptorKey(roachpb.RKey("111")), `/Local/Range/"111"/RangeDescriptor`},
-		{TransactionKey(roachpb.Key("111"), txnID), fmt.Sprintf(`/Local/Range/"111"/Transaction/addrKey:/id:%q`, txnID)},
-		{QueueLastProcessedKey(roachpb.RKey("111"), "foo"), `/Local/Range/"111"/QueueLastProcessed/addrKey:/id:"foo"`},
+		{MakeRangeKeyPrefix(roachpb.RKey(MakeTablePrefix(42))), `/Local/Range/Table/42`},
+		{RangeDescriptorKey(roachpb.RKey(MakeTablePrefix(42))), `/Local/Range/Table/42/RangeDescriptor`},
+		{TransactionKey(roachpb.Key(MakeTablePrefix(42)), txnID), fmt.Sprintf(`/Local/Range/Table/42/Transaction/%q`, txnID)},
+		{QueueLastProcessedKey(roachpb.RKey(MakeTablePrefix(42)), "foo"), `/Local/Range/Table/42/QueueLastProcessed/"foo"`},
 
 		{LocalMax, `/Meta1/""`}, // LocalMax == Meta1Prefix
 
 		// system
 		{makeKey(Meta2Prefix, roachpb.Key("foo")), `/Meta2/"foo"`},
 		{makeKey(Meta1Prefix, roachpb.Key("foo")), `/Meta1/"foo"`},
-		{RangeMetaKey(roachpb.RKey("f")), `/Meta2/"f"`},
+		{RangeMetaKey(roachpb.RKey("f")).AsRawKey(), `/Meta2/"f"`},
 
 		{NodeLivenessKey(10033), "/System/NodeLiveness/10033"},
 		{NodeStatusKey(1111), "/System/StatusNode/1111"},
@@ -84,9 +83,9 @@ func TestPrettyPrint(t *testing.T) {
 		{SystemMax, "/System/Max"},
 
 		// key of key
-		{RangeMetaKey(roachpb.RKey(MakeRangeKeyPrefix(roachpb.RKey("ok")))), `/Meta2/Local/Range/"ok"`},
-		{RangeMetaKey(roachpb.RKey(makeKey(MakeTablePrefix(42), roachpb.RKey("foo")))), `/Meta2/Table/42/"foo"`},
-		{RangeMetaKey(roachpb.RKey(makeKey(Meta2Prefix, roachpb.Key("foo")))), `/Meta1/"foo"`},
+		{RangeMetaKey(roachpb.RKey(MakeRangeKeyPrefix(MakeTablePrefix(42)))).AsRawKey(), `/Meta2/Local/Range/Table/42`},
+		{RangeMetaKey(roachpb.RKey(makeKey(MakeTablePrefix(42), roachpb.RKey("foo")))).AsRawKey(), `/Meta2/Table/42/"foo"`},
+		{RangeMetaKey(roachpb.RKey(makeKey(Meta2Prefix, roachpb.Key("foo")))).AsRawKey(), `/Meta1/"foo"`},
 
 		// table
 		{SystemConfigSpan.Key, "/Table/SystemConfigSpan/Start"},
@@ -209,5 +208,18 @@ func TestPrettyPrintRange(t *testing.T) {
 		if str != tc.expected {
 			t.Errorf("%d: expected \"%s\", got \"%s\"", i, tc.expected, str)
 		}
+	}
+}
+
+func TestFormatHexKey(t *testing.T) {
+	// Verify that we properly handling the 'x' formatting verb in
+	// roachpb.Key.Format.
+	key := StoreIdentKey()
+	decoded, err := hex.DecodeString(fmt.Sprintf("%x", key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(key, decoded) {
+		t.Fatalf("expected %s, but found %s", key, decoded)
 	}
 }

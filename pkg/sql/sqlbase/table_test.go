@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Daniel Harrison (daniel.harrison@gmail.com)
 
 package sqlbase
 
 import (
 	"bytes"
+	"reflect"
 	"testing"
 
 	"golang.org/x/net/context"
@@ -28,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
@@ -90,12 +90,13 @@ func makeTableDescForTest(test indexKeyTest) (TableDescriptor, map[ColumnID]int)
 }
 
 func decodeIndex(
-	a *DatumAlloc, tableDesc *TableDescriptor, index *IndexDescriptor, key []byte,
+	tableDesc *TableDescriptor, index *IndexDescriptor, key []byte,
 ) ([]parser.Datum, error) {
-	values, err := MakeEncodedKeyVals(tableDesc, index.ColumnIDs)
+	types, err := GetColumnTypes(tableDesc, index.ColumnIDs)
 	if err != nil {
 		return nil, err
 	}
+	values := make([]EncDatum, len(index.ColumnIDs))
 	colDirs := make([]encoding.Direction, len(index.ColumnDirections))
 	for i, dir := range index.ColumnDirections {
 		colDirs[i], err = dir.ToEncodingDirection()
@@ -103,7 +104,7 @@ func decodeIndex(
 			return nil, err
 		}
 	}
-	_, ok, err := DecodeIndexKey(a, tableDesc, index.ID, values, colDirs, key)
+	_, ok, err := DecodeIndexKey(tableDesc, index, types, values, colDirs, key)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +115,7 @@ func decodeIndex(
 	decodedValues := make([]parser.Datum, len(values))
 	var da DatumAlloc
 	for i, value := range values {
-		err := value.EnsureDecoded(&da)
+		err := value.EnsureDecoded(&types[i], &da)
 		if err != nil {
 			return nil, err
 		}
@@ -211,7 +212,7 @@ func TestIndexKey(t *testing.T) {
 		}
 
 		checkEntry := func(index *IndexDescriptor, entry client.KeyValue) {
-			values, err := decodeIndex(&a, &tableDesc, index, entry.Key)
+			values, err := decodeIndex(&tableDesc, index, entry.Key)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -223,7 +224,7 @@ func TestIndexKey(t *testing.T) {
 				}
 			}
 
-			indexID, _, err := DecodeIndexKeyPrefix(&a, &tableDesc, entry.Key)
+			indexID, _, err := DecodeIndexKeyPrefix(&tableDesc, entry.Key)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -242,5 +243,242 @@ func TestIndexKey(t *testing.T) {
 
 		checkEntry(&tableDesc.PrimaryIndex, primaryIndexKV)
 		checkEntry(&tableDesc.Indexes[0], secondaryIndexKV)
+	}
+}
+
+type arrayEncodingTest struct {
+	name     string
+	datum    parser.DArray
+	encoding []byte
+}
+
+func TestArrayEncoding(t *testing.T) {
+	tests := []arrayEncodingTest{
+		{
+			"empty int array",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array:    parser.Datums{},
+			},
+			[]byte{1, 3, 0},
+		}, {
+			"single int array",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array:    parser.Datums{parser.NewDInt(1)},
+			},
+			[]byte{1, 3, 1, 2},
+		}, {
+			"multiple int array",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array:    parser.Datums{parser.NewDInt(1), parser.NewDInt(2), parser.NewDInt(3)},
+			},
+			[]byte{1, 3, 3, 2, 4, 6},
+		}, {
+			"string array",
+			parser.DArray{
+				ParamTyp: parser.TypeString,
+				Array:    parser.Datums{parser.NewDString("foo"), parser.NewDString("bar"), parser.NewDString("baz")},
+			},
+			[]byte{1, 6, 3, 3, 102, 111, 111, 3, 98, 97, 114, 3, 98, 97, 122},
+		}, {
+			"bool array",
+			parser.DArray{
+				ParamTyp: parser.TypeBool,
+				Array:    parser.Datums{parser.MakeDBool(true), parser.MakeDBool(false)},
+			},
+			[]byte{1, 10, 2, 10, 11},
+		}, {
+			"array containing a single null",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array:    parser.Datums{parser.DNull},
+				HasNulls: true,
+			},
+			[]byte{17, 3, 1, 1},
+		}, {
+			"array containing multiple nulls",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array:    parser.Datums{parser.NewDInt(1), parser.DNull, parser.DNull},
+				HasNulls: true,
+			},
+			[]byte{17, 3, 3, 6, 2},
+		}, {
+			"array whose NULL bitmap spans exactly one byte",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array: parser.Datums{
+					parser.NewDInt(1), parser.DNull, parser.DNull, parser.NewDInt(2), parser.NewDInt(3),
+					parser.NewDInt(4), parser.NewDInt(5), parser.NewDInt(6),
+				},
+				HasNulls: true,
+			},
+			[]byte{17, 3, 8, 6, 2, 4, 6, 8, 10, 12},
+		}, {
+			"array whose NULL bitmap spans more than one byte",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array: parser.Datums{
+					parser.NewDInt(1), parser.DNull, parser.DNull, parser.NewDInt(2), parser.NewDInt(3),
+					parser.NewDInt(4), parser.NewDInt(5), parser.NewDInt(6), parser.DNull,
+				},
+				HasNulls: true,
+			},
+			[]byte{17, 3, 9, 6, 1, 2, 4, 6, 8, 10, 12},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run("encode "+test.name, func(t *testing.T) {
+			enc, err := encodeArray(&test.datum, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(enc, test.encoding) {
+				t.Fatalf("expected %s to encode to %v, got %v", test.datum.String(), test.encoding, enc)
+			}
+		})
+
+		t.Run("decode "+test.name, func(t *testing.T) {
+			enc := make([]byte, 0)
+			enc = append(enc, byte(len(test.encoding)))
+			enc = append(enc, test.encoding...)
+			d, _, err := decodeArray(&DatumAlloc{}, test.datum.ParamTyp, enc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d.Compare(parser.NewTestingEvalContext(), &test.datum) != 0 {
+				t.Fatalf("expected %v to decode to %s, got %s", enc, test.datum.String(), d.String())
+			}
+		})
+	}
+}
+
+func BenchmarkArrayEncoding(b *testing.B) {
+	ary := parser.DArray{ParamTyp: parser.TypeInt, Array: parser.Datums{}}
+	for i := 0; i < 10000; i++ {
+		_ = ary.Append(parser.NewDInt(1))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = encodeArray(&ary, nil)
+	}
+}
+
+func TestMarshalColumnValue(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	tests := []struct {
+		kind  ColumnType_SemanticType
+		datum parser.Datum
+		exp   roachpb.Value
+	}{
+		{
+			kind:  ColumnType_BOOL,
+			datum: parser.MakeDBool(true),
+			exp:   func() (v roachpb.Value) { v.SetBool(true); return }(),
+		},
+		{
+			kind:  ColumnType_BOOL,
+			datum: parser.MakeDBool(false),
+			exp:   func() (v roachpb.Value) { v.SetBool(false); return }(),
+		},
+		{
+			kind:  ColumnType_INT,
+			datum: parser.NewDInt(314159),
+			exp:   func() (v roachpb.Value) { v.SetInt(314159); return }(),
+		},
+		{
+			kind:  ColumnType_FLOAT,
+			datum: parser.NewDFloat(3.14159),
+			exp:   func() (v roachpb.Value) { v.SetFloat(3.14159); return }(),
+		},
+		{
+			kind: ColumnType_DECIMAL,
+			datum: func() (v parser.Datum) {
+				v, err := parser.ParseDDecimal("1234567890.123456890")
+				if err != nil {
+					t.Fatalf("Unexpected error while creating expected value: %s", err)
+				}
+				return
+			}(),
+			exp: func() (v roachpb.Value) {
+				dDecimal, err := parser.ParseDDecimal("1234567890.123456890")
+				if err != nil {
+					t.Fatalf("Unexpected error while creating expected value: %s", err)
+				}
+				err = v.SetDecimal(&dDecimal.Decimal)
+				if err != nil {
+					t.Fatalf("Unexpected error while creating expected value: %s", err)
+				}
+				return
+			}(),
+		},
+		{
+			kind:  ColumnType_STRING,
+			datum: parser.NewDString("testing123"),
+			exp:   func() (v roachpb.Value) { v.SetString("testing123"); return }(),
+		},
+		{
+			kind:  ColumnType_NAME,
+			datum: parser.NewDName("testingname123"),
+			exp:   func() (v roachpb.Value) { v.SetString("testingname123"); return }(),
+		},
+		{
+			kind:  ColumnType_BYTES,
+			datum: parser.NewDBytes(parser.DBytes([]byte{0x31, 0x41, 0x59})),
+			exp:   func() (v roachpb.Value) { v.SetBytes([]byte{0x31, 0x41, 0x59}); return }(),
+		},
+		{
+			kind: ColumnType_UUID,
+			datum: func() (v parser.Datum) {
+				v, err := parser.ParseDUuidFromString("63616665-6630-3064-6465-616462656562")
+				if err != nil {
+					t.Fatalf("Unexpected error while creating expected value: %s", err)
+				}
+				return
+			}(),
+			exp: func() (v roachpb.Value) {
+				dUUID, err := parser.ParseDUuidFromString("63616665-6630-3064-6465-616462656562")
+				if err != nil {
+					t.Fatalf("Unexpected error while creating expected value: %s", err)
+				}
+				v.SetBytes(dUUID.GetBytes())
+				return
+			}(),
+		},
+		{
+			kind: ColumnType_INET,
+			datum: func() (v parser.Datum) {
+				v, err := parser.ParseDIPAddrFromINetString("192.168.0.1")
+				if err != nil {
+					t.Fatalf("Unexpected error while creating expected value: %s", err)
+				}
+				return
+			}(),
+			exp: func() (v roachpb.Value) {
+				ipAddr, err := parser.ParseDIPAddrFromINetString("192.168.0.1")
+				if err != nil {
+					t.Fatalf("Unexpected error while creating expected value: %s", err)
+				}
+				data := ipAddr.ToBuffer(nil)
+				v.SetBytes(data)
+				return
+			}(),
+		},
+	}
+
+	for i, testCase := range tests {
+		typ := ColumnType{SemanticType: testCase.kind}
+		col := ColumnDescriptor{ID: ColumnID(testCase.kind + 1), Type: typ}
+
+		if actual, err := MarshalColumnValue(col, testCase.datum); err != nil {
+			t.Errorf("%d: unexpected error with column type %v: %v", i, typ, err)
+		} else if !reflect.DeepEqual(actual, testCase.exp) {
+			t.Errorf("%d: MarshalColumnValue() got %s, expected %v", i, actual, testCase.exp)
+		}
 	}
 }

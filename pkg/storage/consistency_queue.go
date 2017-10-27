@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Vivek Menezes (vivek@cockroachlabs.com)
 
 package storage
 
@@ -24,20 +22,29 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
+var consistencyCheckInterval = settings.RegisterNonNegativeDurationSetting(
+	"server.consistency_check.interval",
+	"the time between range consistency checks; set to 0 to disable consistency checking",
+	24*time.Hour,
+)
+
 type consistencyQueue struct {
 	*baseQueue
-	interval       time.Duration
+	interval       func() time.Duration
 	replicaCountFn func() int
 }
 
 // newConsistencyQueue returns a new instance of consistencyQueue.
 func newConsistencyQueue(store *Store, gossip *gossip.Gossip) *consistencyQueue {
 	q := &consistencyQueue{
-		interval:       store.cfg.ConsistencyCheckInterval,
+		interval: func() time.Duration {
+			return consistencyCheckInterval.Get(&store.ClusterSettings().SV)
+		},
 		replicaCountFn: store.ReplicaCount,
 	}
 	q.baseQueue = newBaseQueue(
@@ -59,13 +66,18 @@ func newConsistencyQueue(store *Store, gossip *gossip.Gossip) *consistencyQueue 
 func (q *consistencyQueue) shouldQueue(
 	ctx context.Context, now hlc.Timestamp, repl *Replica, _ config.SystemConfig,
 ) (bool, float64) {
+	interval := q.interval()
+	if interval <= 0 {
+		return false, 0
+	}
+
 	shouldQ, priority := true, float64(0)
 	if !repl.store.cfg.TestingKnobs.DisableLastProcessedCheck {
 		lpTS, err := repl.getQueueLastProcessed(ctx, q.name)
 		if err != nil {
 			log.ErrEventf(ctx, "consistency queue last processed timestamp: %s", err)
 		}
-		if shouldQ, priority = shouldQueueAgain(now, lpTS, q.interval); !shouldQ {
+		if shouldQ, priority = shouldQueueAgain(now, lpTS, interval); !shouldQ {
 			return false, 0
 		}
 	}
@@ -87,6 +99,9 @@ func (q *consistencyQueue) shouldQueue(
 func (q *consistencyQueue) process(
 	ctx context.Context, repl *Replica, _ config.SystemConfig,
 ) error {
+	if q.interval() <= 0 {
+		return nil
+	}
 	req := roachpb.CheckConsistencyRequest{}
 	if _, pErr := repl.CheckConsistency(ctx, req); pErr != nil {
 		log.Error(ctx, pErr.GoError())
@@ -105,7 +120,7 @@ func (q *consistencyQueue) timer(duration time.Duration) time.Duration {
 	if replicaCount == 0 {
 		return 0
 	}
-	replInterval := q.interval / time.Duration(replicaCount)
+	replInterval := q.interval() / time.Duration(replicaCount)
 	if replInterval < duration {
 		return 0
 	}

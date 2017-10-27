@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Ben Darnell
 
 package storage
 
@@ -26,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -138,6 +135,17 @@ func (rgcq *replicaGCQueue) shouldQueue(
 	var isCandidate bool
 	if raftStatus := repl.RaftStatus(); raftStatus != nil {
 		isCandidate = (raftStatus.SoftState.RaftState == raft.StateCandidate)
+	} else {
+		// If a replica doesn't have an active raft group, we should check whether
+		// we're decommissioning. If so, we should process the replica because it
+		// has probably already been removed from its raft group but doesn't know it.
+		// Without this, node decommissioning can stall on such dormant ranges.
+		// Make sure NodeLiveness isn't nil because it can be in tests/benchmarks.
+		if repl.store.cfg.NodeLiveness != nil {
+			if liveness, _ := repl.store.cfg.NodeLiveness.Self(); liveness != nil && liveness.Decommissioning {
+				return true, replicaGCPriorityDefault
+			}
+		}
 	}
 	return replicaGCShouldQueueImpl(now, lastCheck, lastActivity, isCandidate)
 }
@@ -184,26 +192,18 @@ func (rgcq *replicaGCQueue) process(
 
 	// Calls to RangeLookup typically use inconsistent reads, but we
 	// want to do a consistent read here. This is important when we are
-	// considering one of the metadata ranges: we must not do an
-	// inconsistent lookup in our own copy of the range.
-	b := &client.Batch{}
-	b.AddRawRequest(&roachpb.RangeLookupRequest{
-		Span: roachpb.Span{
-			Key: keys.RangeMetaKey(desc.StartKey),
-		},
-		MaxRanges: 1,
-	})
-	if err := rgcq.db.Run(ctx, b); err != nil {
+	// considering one of the metadata ranges: we must not do an inconsistent
+	// lookup in our own copy of the range.
+	rs, _, err := client.RangeLookupForVersion(ctx, rgcq.store.ClusterSettings(), rgcq.db.GetSender(),
+		desc.StartKey.AsRawKey(), roachpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
+	if err != nil {
 		return err
 	}
-	br := b.RawResponse()
-	reply := br.Responses[0].GetInner().(*roachpb.RangeLookupResponse)
-
-	if len(reply.Ranges) != 1 {
-		return errors.Errorf("expected 1 range descriptor, got %d", len(reply.Ranges))
+	if len(rs) != 1 {
+		return errors.Errorf("expected 1 range descriptor, got %d", len(rs))
 	}
+	replyDesc := rs[0]
 
-	replyDesc := reply.Ranges[0]
 	if currentDesc, currentMember := replyDesc.GetReplicaDescriptor(repl.store.StoreID()); !currentMember {
 		// We are no longer a member of this range; clean up our local data.
 		rgcq.metrics.RemoveReplicaCount.Inc(1)

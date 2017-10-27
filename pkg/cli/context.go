@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package cli
 
@@ -24,8 +22,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 )
 
 // statementsValue is an implementation of pflag.Value that appends any
@@ -51,7 +53,20 @@ type cliContext struct {
 
 	// tableDisplayFormat indicates how to format result tables.
 	tableDisplayFormat tableDisplayFormat
+
+	// showTimes indicates whether to display query times after each result line.
+	showTimes bool
 }
+
+var serverCfg = func() server.Config {
+	st := cluster.MakeClusterSettings(cluster.BinaryMinimumSupportedVersion, cluster.BinaryServerVersion)
+	settings.SetCanonicalValuesContainer(&st.SV)
+
+	return server.MakeConfig(context.Background(), st)
+}()
+
+var baseCfg = serverCfg.Config
+var cliCtx = cliContext{Config: baseCfg}
 
 type tableDisplayFormat int
 
@@ -113,22 +128,31 @@ func (f *tableDisplayFormat) Set(s string) error {
 	return nil
 }
 
-type sqlContext struct {
-	// Embed the cli context.
+// sqlCtx captures the command-line parameters of the `sql` command.
+var sqlCtx = struct {
 	*cliContext
 
 	// execStmts is a list of statements to execute.
 	execStmts statementsValue
-}
 
-type dumpContext struct {
-	// Embed the cli context.
-	*cliContext
+	// unsafeUpdates indicates whether to unset
+	// sql_safe_updates in the CLI shell.
+	unsafeUpdates bool
 
+	// echo, when set, requests that SQL queries sent to the server are
+	// also printed out on the client.
+	echo bool
+}{cliContext: &cliCtx}
+
+// dumpCtx captures the command-line parameters of the `sql` command.
+var dumpCtx = struct {
 	// dumpMode determines which part of the database should be dumped.
 	dumpMode dumpMode
 
+	// asOf determines the time stamp at which the dump should be taken.
 	asOf string
+}{
+	dumpMode: dumpBoth,
 }
 
 type dumpMode int
@@ -260,11 +284,83 @@ func (k *mvccKey) Type() string {
 	return "engine.MVCCKey"
 }
 
-type debugContext struct {
+// debugCtx captures the command-line parameters of the `debug` command.
+var debugCtx = struct {
 	startKey, endKey  engine.MVCCKey
 	values            bool
 	sizes             bool
 	replicated        bool
 	inputFile         string
 	printSystemConfig bool
+}{
+	startKey: engine.NilKey,
+	endKey:   engine.MVCCKeyMax,
+}
+
+// zoneCtx captures the command-line parameters of the `zone` command.
+var zoneCtx struct {
+	zoneConfig             string
+	zoneDisableReplication bool
+}
+
+// startCtx captures the command-line arguments for the `start` command.
+var startCtx struct {
+	// server-specific values of some flags.
+	serverInsecure    bool
+	serverSSLCertsDir string
+}
+
+// quitCtx captures the command-line parameters of the `quit` command.
+var quitCtx struct {
+	serverDecommission bool
+}
+
+// nodeCtx captures the command-line parameters of the `node` command.
+var nodeCtx = struct {
+	nodeDecommissionWait   nodeDecommissionWaitType
+	statusShowRanges       bool
+	statusShowStats        bool
+	statusShowDecommission bool
+	statusShowAll          bool
+}{
+	nodeDecommissionWait: nodeDecommissionWaitAll,
+}
+
+type nodeDecommissionWaitType int
+
+const (
+	nodeDecommissionWaitAll nodeDecommissionWaitType = iota
+	nodeDecommissionWaitLive
+	nodeDecommissionWaitNone
+)
+
+func (s *nodeDecommissionWaitType) String() string {
+	switch *s {
+	case nodeDecommissionWaitAll:
+		return "all"
+	case nodeDecommissionWaitLive:
+		return "live"
+	case nodeDecommissionWaitNone:
+		return "none"
+	}
+	return ""
+}
+
+func (s *nodeDecommissionWaitType) Type() string {
+	return "string"
+}
+
+func (s *nodeDecommissionWaitType) Set(value string) error {
+	switch value {
+	case "all":
+		*s = nodeDecommissionWaitAll
+	case "live":
+		*s = nodeDecommissionWaitLive
+	case "none":
+		*s = nodeDecommissionWaitNone
+	default:
+		return fmt.Errorf("invalid node decommission parameter: %s "+
+			"(possible values: all, live, none)", value)
+	}
+	return nil
 }

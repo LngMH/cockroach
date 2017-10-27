@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Vivek Menezes (vivek@cockroachlabs.com)
 
 package sql
 
@@ -25,22 +23,20 @@ import (
 
 // BeginTransaction starts a new transaction.
 func (p *planner) BeginTransaction(n *parser.BeginTransaction) (planNode, error) {
-	if p.txn == nil {
-		return nil, errors.Errorf("the server should have already created a transaction")
+	if p.session.TxnState.State() != AutoRetry || p.txn == nil {
+		return nil, errors.Errorf("the server should have already created a transaction. "+
+			"state: %s", p.session.TxnState.State())
 	}
 	if err := p.setTransactionModes(n.Modes); err != nil {
 		return nil, err
 	}
 
-	// Enter the FirstBatch state.
-	p.session.TxnState.SetState(FirstBatch)
-
-	return &emptyNode{}, nil
+	return &zeroNode{}, nil
 }
 
 // SetTransaction sets a transaction's isolation level
 func (p *planner) SetTransaction(n *parser.SetTransaction) (planNode, error) {
-	return &emptyNode{}, p.setTransactionModes(n.Modes)
+	return &zeroNode{}, p.setTransactionModes(n.Modes)
 }
 
 func (p *planner) setTransactionModes(modes parser.TransactionModes) error {
@@ -50,10 +46,7 @@ func (p *planner) setTransactionModes(modes parser.TransactionModes) error {
 	if err := p.setUserPriority(modes.UserPriority); err != nil {
 		return err
 	}
-	if err := p.setReadWriteMode(modes.ReadWriteMode); err != nil {
-		return err
-	}
-	return nil
+	return p.setReadWriteMode(modes.ReadWriteMode)
 }
 
 func (p *planner) setIsolationLevel(level parser.IsolationLevel) error {

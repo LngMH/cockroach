@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 // The code below is a modified version of a similar structure found in
 // grpc-go (github.com/grpc/grpc-go/blob/b2fae0c/transport/control.go).
@@ -142,14 +140,16 @@ func (qp *quotaPool) acquire(ctx context.Context, v int64) error {
 	}
 	qp.Unlock()
 	slowTimer := timeutil.NewTimer()
-	slowTimer.Reset(base.SlowRequestThreshold)
 	defer slowTimer.Stop()
 	start := timeutil.Now()
 
+	// Intentionally reset only once, for we care more about the select duration in
+	// goroutine profiles than periodic logging.
+	slowTimer.Reset(base.SlowRequestThreshold)
 	for {
 		select {
 		case now := <-slowTimer.C:
-			slowTimer.Reset(base.SlowRequestThreshold)
+			slowTimer.Read = true
 			log.Warningf(ctx, "have been waiting %s attempting to acquire quota",
 				now.Sub(start))
 			continue
@@ -192,10 +192,11 @@ func (qp *quotaPool) acquire(ctx context.Context, v int64) error {
 	// next in line (if any).
 
 	var acquired int64
+	slowTimer.Reset(base.SlowRequestThreshold)
 	for acquired < v {
 		select {
 		case now := <-slowTimer.C:
-			slowTimer.Reset(base.SlowRequestThreshold)
+			slowTimer.Read = true
 			log.Warningf(ctx, "have been waiting %s attempting to acquire quota",
 				now.Sub(start))
 		case <-ctx.Done():

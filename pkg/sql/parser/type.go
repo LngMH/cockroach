@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package parser
 
@@ -20,6 +18,8 @@ import (
 	"bytes"
 	"fmt"
 	"unsafe"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 
 	"github.com/lib/pq/oid"
 )
@@ -89,21 +89,21 @@ var (
 	TypeTimestampTZ Type = tTimestampTZ{}
 	// TypeInterval is the type of a DInterval. Can be compared with ==.
 	TypeInterval Type = tInterval{}
+	// TypeJSON is the type of a DJSON. Can be compared with ==.
+	TypeJSON Type = tJSON{}
 	// TypeUUID is the type of a DUuid. Can be compared with ==.
 	TypeUUID Type = tUUID{}
+	// TypeINet is the type of a DIPAddr. Can be compared with ==.
+	TypeINet Type = tINet{}
 	// TypeTuple is the type family of a DTuple. CANNOT be compared with ==.
 	TypeTuple Type = TTuple(nil)
+	// TypeArray is the type family of a DArray. CANNOT be compared with ==.
+	TypeArray Type = TArray{}
 	// TypeTable is the type family of a DTable. CANNOT be compared with ==.
 	TypeTable Type = TTable{}
 	// TypePlaceholder is the type family of a placeholder. CANNOT be compared
 	// with ==.
 	TypePlaceholder Type = TPlaceholder{}
-	// TypeStringArray is the type family of a DArray containing strings. Can be
-	// compared with ==.
-	TypeStringArray Type = TArray{TypeString}
-	// TypeIntArray is the type family of a DArray containing ints. Can be
-	// compared with ==.
-	TypeIntArray Type = TArray{TypeInt}
 	// TypeAnyArray is the type of a DArray with a wildcard parameterized type.
 	// Can be compared with ==.
 	TypeAnyArray Type = TArray{TypeAny}
@@ -128,7 +128,7 @@ var (
 	TypeName = wrapTypeWithOid(TypeString, oid.T_name)
 	// TypeIntVector is a type-alias for a TypeIntArray with a different OID. Can
 	// be compared with ==.
-	TypeIntVector = wrapTypeWithOid(TypeIntArray, oid.T_int2vector)
+	TypeIntVector = wrapTypeWithOid(TArray{TypeInt}, oid.T_int2vector)
 	// TypeNameArray is the type family of a DArray containing the Name alias type.
 	// Can be compared with ==.
 	TypeNameArray Type = TArray{TypeName}
@@ -146,6 +146,8 @@ var (
 		TypeTimestampTZ,
 		TypeInterval,
 		TypeUUID,
+		TypeINet,
+		TypeJSON,
 		TypeOid,
 	}
 )
@@ -164,33 +166,49 @@ var (
 var OidToType = map[oid.Oid]Type{
 	oid.T_anyelement:   TypeAny,
 	oid.T_bool:         TypeBool,
+	oid.T__bool:        TArray{TypeBool},
 	oid.T_bytea:        TypeBytes,
+	oid.T__bytea:       TArray{TypeBytes},
 	oid.T_date:         TypeDate,
+	oid.T__date:        TArray{TypeDate},
 	oid.T_float4:       typeFloat4,
+	oid.T__float4:      TArray{typeFloat4},
 	oid.T_float8:       TypeFloat,
+	oid.T__float8:      TArray{TypeFloat},
 	oid.T_int2:         typeInt2,
 	oid.T_int4:         typeInt4,
 	oid.T_int8:         TypeInt,
 	oid.T_int2vector:   TypeIntVector,
 	oid.T_interval:     TypeInterval,
+	oid.T__interval:    TArray{TypeInterval},
+	oid.T_jsonb:        TypeJSON,
 	oid.T_name:         TypeName,
+	oid.T__name:        TArray{TypeName},
 	oid.T_numeric:      TypeDecimal,
+	oid.T__numeric:     TArray{TypeDecimal},
 	oid.T_oid:          TypeOid,
+	oid.T__oid:         TArray{TypeOid},
 	oid.T_regclass:     TypeRegClass,
 	oid.T_regnamespace: TypeRegNamespace,
 	oid.T_regproc:      TypeRegProc,
 	oid.T_regprocedure: TypeRegProcedure,
 	oid.T_regtype:      TypeRegType,
-	oid.T__text:        TypeStringArray,
+	oid.T__text:        TArray{TypeString},
 	oid.T__int2:        typeInt2Array,
 	oid.T__int4:        typeInt4Array,
-	oid.T__int8:        TypeIntArray,
+	oid.T__int8:        TArray{TypeInt},
 	oid.T_record:       TypeTuple,
 	oid.T_text:         TypeString,
 	oid.T_timestamp:    TypeTimestamp,
+	oid.T__timestamp:   TArray{TypeTimestamp},
 	oid.T_timestamptz:  TypeTimestampTZ,
+	oid.T__timestamptz: TArray{TypeTimestampTZ},
 	oid.T_uuid:         TypeUUID,
+	oid.T__uuid:        TArray{TypeUUID},
+	oid.T_inet:         TypeINet,
+	oid.T__inet:        TArray{TypeINet},
 	oid.T_varchar:      typeVarChar,
+	oid.T__varchar:     TArray{typeVarChar},
 }
 
 // AliasedOidToName maps Postgres object IDs to type names for those OIDs that map to
@@ -213,6 +231,21 @@ var aliasedOidToName = map[oid.Oid]string{
 	oid.T__int4:      "_int4",
 	oid.T__int8:      "_int8",
 	oid.T__text:      "_text",
+	// TODO(justin): find a better solution to this than mapping every array type.
+	oid.T__float4:      "_float4",
+	oid.T__float8:      "_float8",
+	oid.T__bool:        "_bool",
+	oid.T__bytea:       "_bytea",
+	oid.T__date:        "_date",
+	oid.T__interval:    "_interval",
+	oid.T__name:        "_name",
+	oid.T__numeric:     "_numeric",
+	oid.T__oid:         "_oid",
+	oid.T__timestamp:   "_timestamp",
+	oid.T__timestamptz: "_timestamptz",
+	oid.T__uuid:        "_uuid",
+	oid.T__inet:        "_inet",
+	oid.T__varchar:     "_varchar",
 }
 
 // PGDisplayName returns the Postgres display name for a given type.
@@ -387,6 +420,18 @@ func (tInterval) Oid() oid.Oid                { return oid.T_interval }
 func (tInterval) SQLName() string             { return "interval" }
 func (tInterval) IsAmbiguous() bool           { return false }
 
+type tJSON struct{}
+
+func (tJSON) String() string { return "jsonb" }
+func (tJSON) Equivalent(other Type) bool {
+	return UnwrapType(other) == TypeJSON || other == TypeAny
+}
+func (tJSON) FamilyEqual(other Type) bool { return UnwrapType(other) == TypeJSON }
+func (tJSON) Size() (uintptr, bool)       { return unsafe.Sizeof(DJSON{}), variableSize }
+func (tJSON) Oid() oid.Oid                { return oid.T_jsonb }
+func (tJSON) SQLName() string             { return "json" }
+func (tJSON) IsAmbiguous() bool           { return false }
+
 type tUUID struct{}
 
 func (tUUID) String() string              { return "uuid" }
@@ -396,6 +441,16 @@ func (tUUID) Size() (uintptr, bool)       { return unsafe.Sizeof(DUuid{}), fixed
 func (tUUID) Oid() oid.Oid                { return oid.T_uuid }
 func (tUUID) SQLName() string             { return "uuid" }
 func (tUUID) IsAmbiguous() bool           { return false }
+
+type tINet struct{}
+
+func (tINet) String() string              { return "inet" }
+func (tINet) Equivalent(other Type) bool  { return UnwrapType(other) == TypeINet || other == TypeAny }
+func (tINet) FamilyEqual(other Type) bool { return UnwrapType(other) == TypeINet }
+func (tINet) Size() (uintptr, bool)       { return unsafe.Sizeof(DIPAddr{}), fixedSize }
+func (tINet) Oid() oid.Oid                { return oid.T_inet }
+func (tINet) SQLName() string             { return "inet" }
+func (tINet) IsAmbiguous() bool           { return false }
 
 // TTuple is the type of a DTuple.
 type TTuple []Type
@@ -532,11 +587,35 @@ func (TArray) Size() (uintptr, bool) {
 
 // oidToArrayOid maps scalar type Oids to their corresponding array type Oid.
 var oidToArrayOid = map[oid.Oid]oid.Oid{
-	oid.T_int2: oid.T__int2,
-	oid.T_int4: oid.T__int4,
-	oid.T_int8: oid.T__int8,
-	oid.T_text: oid.T__text,
-	oid.T_name: oid.T__name,
+	oid.T_bool:        oid.T__bool,
+	oid.T_bytea:       oid.T__bytea,
+	oid.T_name:        oid.T__name,
+	oid.T_int8:        oid.T__int8,
+	oid.T_int2:        oid.T__int2,
+	oid.T_int4:        oid.T__int4,
+	oid.T_text:        oid.T__text,
+	oid.T_oid:         oid.T__oid,
+	oid.T_float4:      oid.T__float4,
+	oid.T_float8:      oid.T__float8,
+	oid.T_inet:        oid.T__inet,
+	oid.T_varchar:     oid.T__varchar,
+	oid.T_date:        oid.T__date,
+	oid.T_timestamp:   oid.T__timestamp,
+	oid.T_timestamptz: oid.T__timestamptz,
+	oid.T_interval:    oid.T__interval,
+	oid.T_numeric:     oid.T__numeric,
+	oid.T_uuid:        oid.T__uuid,
+}
+
+const noArrayType = 0
+
+// ArrayOids is a set of all oids which correspond to an array type.
+var ArrayOids = map[oid.Oid]struct{}{}
+
+func init() {
+	for _, v := range oidToArrayOid {
+		ArrayOids[v] = struct{}{}
+	}
 }
 
 // Oid implements the Type interface.
@@ -544,7 +623,7 @@ func (a TArray) Oid() oid.Oid {
 	if o, ok := oidToArrayOid[a.Typ.Oid()]; ok {
 		return o
 	}
-	return oid.T_anyarray
+	return noArrayType
 }
 
 // SQLName implements the Type interface.
@@ -559,7 +638,10 @@ func (a TArray) IsAmbiguous() bool {
 
 // TTable is the type of a DTable.
 // See the comments at the start of generator_builtins.go for details.
-type TTable struct{ Cols TTuple }
+type TTable struct {
+	Cols   TTuple
+	Labels []string
+}
 
 func (a TTable) String() string { return "setof " + a.Cols.String() }
 
@@ -660,7 +742,7 @@ func (t tOidWrapper) Oid() oid.Oid { return t.oid }
 func wrapTypeWithOid(t Type, oid oid.Oid) Type {
 	switch v := t.(type) {
 	case tNull, tAny, tOidWrapper:
-		panic(fmt.Errorf("cannot wrap %T with an Oid", v))
+		panic(pgerror.NewErrorf(pgerror.CodeInternalError, "cannot wrap %T with an Oid", v))
 	}
 	return tOidWrapper{
 		Type: t,

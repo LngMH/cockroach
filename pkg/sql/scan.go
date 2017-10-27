@@ -11,14 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
 	"bytes"
 	"fmt"
+	"sync"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -31,11 +30,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
+var scanNodePool = sync.Pool{
+	New: func() interface{} {
+		return &scanNode{}
+	},
+}
+
 // A scanNode handles scanning over the key/value pairs for a table and
 // reconstructing them into rows.
 type scanNode struct {
 	p     *planner
-	desc  sqlbase.TableDescriptor
+	desc  *sqlbase.TableDescriptor
 	index *sqlbase.IndexDescriptor
 
 	// Set if an index was explicitly specified.
@@ -67,7 +72,7 @@ type scanNode struct {
 	spans            []roachpb.Span
 	isSecondaryIndex bool
 	reverse          bool
-	ordering         orderingInfo
+	props            physicalProps
 
 	rowIndex int64 // the index of the current row
 
@@ -75,6 +80,12 @@ type scanNode struct {
 	// parser.IndexedVar leaves generated using filterVars.
 	filter     parser.TypedExpr
 	filterVars parser.IndexedVarHelper
+
+	// origFilter is the original filtering expression, which might have gotten
+	// simplified during index selection. For example "k > 0" is converted to a
+	// span and the filter is nil. But we still want to deduce not-null columns
+	// from the original filter.
+	origFilter parser.TypedExpr
 
 	scanInitialized bool
 	fetcher         sqlbase.RowFetcher
@@ -100,7 +111,9 @@ type scanNode struct {
 }
 
 func (p *planner) Scan() *scanNode {
-	return &scanNode{p: p}
+	n := scanNodePool.Get().(*scanNode)
+	n.p = p
+	return n
 }
 
 func (n *scanNode) Values() parser.Datums {
@@ -115,17 +128,20 @@ func (n *scanNode) disableBatchLimit() {
 	n.softLimit = 0
 }
 
-func (n *scanNode) Start(context.Context) error {
-	return n.fetcher.Init(&n.desc, n.colIdxMap, n.index, n.reverse, n.isSecondaryIndex, n.cols,
-		n.valNeededForCol, false /* returnRangeInfo */)
+func (n *scanNode) Start(runParams) error {
+	return n.fetcher.Init(n.desc, n.colIdxMap, n.index, n.reverse, n.isSecondaryIndex, n.cols,
+		n.valNeededForCol, false /* returnRangeInfo */, &n.p.alloc)
 }
 
-func (n *scanNode) Close(context.Context) {}
+func (n *scanNode) Close(context.Context) {
+	*n = scanNode{}
+	scanNodePool.Put(n)
+}
 
 // initScan sets up the rowFetcher and starts a scan.
 func (n *scanNode) initScan(ctx context.Context) error {
 	limitHint := n.limitHint()
-	if err := n.fetcher.StartScan(ctx, n.p.txn, n.spans, !n.disableBatchLimits, limitHint); err != nil {
+	if err := n.fetcher.StartScan(ctx, n.p.txn, n.spans, !n.disableBatchLimits, limitHint, n.p.session.Tracing.KVTracingEnabled()); err != nil {
 		return err
 	}
 	n.scanInitialized = true
@@ -150,10 +166,10 @@ func (n *scanNode) limitHint() int64 {
 	return limitHint
 }
 
-func (n *scanNode) Next(ctx context.Context) (bool, error) {
+func (n *scanNode) Next(params runParams) (bool, error) {
 	tracing.AnnotateTrace()
 	if !n.scanInitialized {
-		if err := n.initScan(ctx); err != nil {
+		if err := n.initScan(params.ctx); err != nil {
 			return false, err
 		}
 	}
@@ -161,7 +177,7 @@ func (n *scanNode) Next(ctx context.Context) (bool, error) {
 	// We fetch one row at a time until we find one that passes the filter.
 	for n.hardLimit == 0 || n.rowIndex < n.hardLimit {
 		var err error
-		n.row, err = n.fetcher.NextRowDecoded(ctx, n.p.session.Tracing.KVTracingEnabled())
+		n.row, err = n.fetcher.NextRowDecoded(params.ctx)
 		if err != nil || n.row == nil {
 			return false, err
 		}
@@ -185,10 +201,10 @@ func (n *scanNode) initTable(
 	scanVisibility scanVisibility,
 	wantedColumns []parser.ColumnID,
 ) error {
-	n.desc = *desc
+	n.desc = desc
 
 	if !p.skipSelectPrivilegeChecks {
-		if err := p.CheckPrivilege(&n.desc, privilege.SELECT); err != nil {
+		if err := p.CheckPrivilege(n.desc, privilege.SELECT); err != nil {
 			return err
 		}
 	}
@@ -198,6 +214,7 @@ func (n *scanNode) initTable(
 			return err
 		}
 	}
+
 	n.noIndexJoin = (indexHints != nil && indexHints.NoIndexJoin)
 	return n.initDescDefaults(scanVisibility, wantedColumns)
 }
@@ -205,19 +222,19 @@ func (n *scanNode) initTable(
 func (n *scanNode) lookupSpecifiedIndex(indexHints *parser.IndexHints) error {
 	if indexHints.Index != "" {
 		// Search index by name.
-		indexName := indexHints.Index.Normalize()
-		if indexName == parser.ReNormalizeName(n.desc.PrimaryIndex.Name) {
+		indexName := string(indexHints.Index)
+		if indexName == n.desc.PrimaryIndex.Name {
 			n.specifiedIndex = &n.desc.PrimaryIndex
 		} else {
 			for i := range n.desc.Indexes {
-				if indexName == parser.ReNormalizeName(n.desc.Indexes[i].Name) {
+				if indexName == n.desc.Indexes[i].Name {
 					n.specifiedIndex = &n.desc.Indexes[i]
 					break
 				}
 			}
 		}
 		if n.specifiedIndex == nil {
-			return errors.Errorf("index \"%s\" not found", indexName)
+			return errors.Errorf("index %q not found", parser.ErrString(indexHints.Index))
 		}
 	} else if indexHints.IndexID != 0 {
 		// Search index by ID.
@@ -232,7 +249,7 @@ func (n *scanNode) lookupSpecifiedIndex(indexHints *parser.IndexHints) error {
 			}
 		}
 		if n.specifiedIndex == nil {
-			return errors.Errorf("index %d not found", indexHints.IndexID)
+			return errors.Errorf("index [%d] not found", indexHints.IndexID)
 		}
 	}
 	return nil
@@ -255,7 +272,7 @@ func filterColumns(
 				}
 			}
 			if !found {
-				return nil, errors.Errorf("column %d does not exist", wc)
+				return nil, errors.Errorf("column [%d] does not exist", wc)
 			}
 		}
 		dst = appendUnselectedColumns(dst, wantedColumns, src)
@@ -299,6 +316,35 @@ func (n *scanNode) initDescDefaults(
 	if err != nil {
 		return err
 	}
+
+	// Register the dependency to the planner, if requested.
+	if n.p.planDeps != nil {
+		indexID := sqlbase.IndexID(0)
+		if n.specifiedIndex != nil {
+			indexID = n.specifiedIndex.ID
+		}
+		var usedColumns []sqlbase.ColumnID
+		if wantedColumns == nil {
+			usedColumns = make([]sqlbase.ColumnID, len(n.desc.Columns))
+			for i := range n.desc.Columns {
+				usedColumns[i] = n.desc.Columns[i].ID
+			}
+		} else {
+			usedColumns = make([]sqlbase.ColumnID, len(wantedColumns))
+			for i, c := range wantedColumns {
+				usedColumns[i] = sqlbase.ColumnID(c)
+			}
+		}
+		deps := n.p.planDeps[n.desc.ID]
+		deps.desc = n.desc
+		deps.deps = append(deps.deps, sqlbase.TableDescriptor_Reference{
+			IndexID:   indexID,
+			ColumnIDs: usedColumns,
+		})
+		n.p.planDeps[n.desc.ID] = deps
+	}
+
+	// Set up the rest of the scanNode.
 	switch scanVisibility {
 	case publicColumns:
 		// Mutations are invisible.
@@ -333,38 +379,46 @@ func (n *scanNode) initOrdering(exactPrefix int) {
 	if n.index == nil {
 		return
 	}
-	n.ordering = n.computeOrdering(n.index, exactPrefix, n.reverse)
+	n.props = n.computePhysicalProps(n.index, exactPrefix, n.reverse)
 }
 
-// computeOrdering calculates ordering information for table columns assuming that:
-//    - we scan a given index (potentially in reverse order), and
-//    - the first `exactPrefix` columns of the index each have an exact (single value) match
-//      (see orderingInfo).
-func (n *scanNode) computeOrdering(
+// computePhysicalProps calculates ordering information for table columns
+// assuming that:
+//   - we scan a given index (potentially in reverse order), and
+//   - the first `exactPrefix` columns of the index each have a constant value
+//     (see physicalProps).
+func (n *scanNode) computePhysicalProps(
 	index *sqlbase.IndexDescriptor, exactPrefix int, reverse bool,
-) orderingInfo {
-	var ordering orderingInfo
+) physicalProps {
+	var pp physicalProps
 
 	columnIDs, dirs := index.FullColumnIDs()
 
+	var keySet util.FastIntSet
 	for i, colID := range columnIDs {
 		idx, ok := n.colIdxMap[colID]
 		if !ok {
 			panic(fmt.Sprintf("index refers to unknown column id %d", colID))
 		}
 		if i < exactPrefix {
-			ordering.addExactMatchColumn(idx)
+			pp.addConstantColumn(idx)
 		} else {
 			dir := dirs[i]
 			if reverse {
 				dir = dir.Reverse()
 			}
-			ordering.addColumn(idx, dir)
+			pp.addOrderColumn(idx, dir)
 		}
+		if !n.cols[idx].Nullable {
+			pp.addNotNullColumn(idx)
+		}
+		keySet.Add(idx)
 	}
-	// We included any implicit columns, so the results are unique.
-	ordering.unique = true
-	return ordering
+	// We included any implicit columns, so the columns form a (possibly weak)
+	// key.
+	pp.addWeakKey(keySet)
+	pp.applyExpr(&n.p.evalCtx, n.origFilter)
+	return pp
 }
 
 // scanNode implements parser.IndexedVarContainer.

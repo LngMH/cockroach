@@ -11,34 +11,34 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package distsqlrun
 
 import (
 	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"golang.org/x/net/context"
 )
 
 type distinct struct {
+	processorBase
+
 	flowCtx      *FlowCtx
 	input        RowSource
+	types        []sqlbase.ColumnType
 	lastGroupKey sqlbase.EncDatumRow
 	seen         map[string]struct{}
 	orderedCols  map[uint32]struct{}
 	distinctCols map[uint32]struct{}
 	memAcc       mon.BoundAccount
 	datumAlloc   sqlbase.DatumAlloc
-	out          procOutputHelper
 }
 
-var _ processor = &distinct{}
+var _ Processor = &distinct{}
 
 func newDistinct(
 	flowCtx *FlowCtx, spec *DistinctSpec, input RowSource, post *PostProcessSpec, output RowReceiver,
@@ -48,7 +48,7 @@ func newDistinct(
 		input:        input,
 		orderedCols:  make(map[uint32]struct{}),
 		distinctCols: make(map[uint32]struct{}),
-		memAcc:       flowCtx.evalCtx.Mon.MakeBoundAccount(),
+		memAcc:       flowCtx.EvalCtx.Mon.MakeBoundAccount(),
 	}
 	for _, col := range spec.OrderedColumns {
 		d.orderedCols[col] = struct{}{}
@@ -57,7 +57,8 @@ func newDistinct(
 		d.distinctCols[col] = struct{}{}
 	}
 
-	if err := d.out.init(post, input.Types(), &flowCtx.evalCtx, output); err != nil {
+	d.types = input.Types()
+	if err := d.out.Init(post, d.types, &flowCtx.EvalCtx, output); err != nil {
 		return nil, err
 	}
 
@@ -86,7 +87,7 @@ func (d *distinct) Run(ctx context.Context, wg *sync.WaitGroup) {
 	} else if !earlyExit {
 		sendTraceData(ctx, d.out.output)
 		d.input.ConsumerClosed()
-		d.out.close()
+		d.out.Close()
 	}
 }
 
@@ -152,7 +153,9 @@ func (d *distinct) matchLastGroupKey(row sqlbase.EncDatumRow) (bool, error) {
 		return false, nil
 	}
 	for colIdx := range d.orderedCols {
-		res, err := d.lastGroupKey[colIdx].Compare(&d.datumAlloc, &d.flowCtx.evalCtx, &row[colIdx])
+		res, err := d.lastGroupKey[colIdx].Compare(
+			&d.types[colIdx], &d.datumAlloc, &d.flowCtx.EvalCtx, &row[colIdx],
+		)
 		if res != 0 || err != nil {
 			return false, err
 		}
@@ -176,10 +179,10 @@ func (d *distinct) encode(appendTo []byte, row sqlbase.EncDatumRow) ([]byte, err
 		// TODO(irfansharif): Different rows may come with different encodings,
 		// e.g. if they come from different streams that were merged, in which
 		// case the encodings don't match (despite having the same underlying
-		// datums). We instead opt to always choose sqlbase.DatumEncoding_VALUE
+		// datums). We instead opt to always choose sqlbase.DatumEncoding_ASCENDING_KEY
 		// but we may want to check the first row for what encodings are already
 		// available.
-		appendTo, err = datum.Encode(&d.datumAlloc, sqlbase.DatumEncoding_VALUE, appendTo)
+		appendTo, err = datum.Encode(&d.types[i], &d.datumAlloc, sqlbase.DatumEncoding_ASCENDING_KEY, appendTo)
 		if err != nil {
 			return nil, err
 		}

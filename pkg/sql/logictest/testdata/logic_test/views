@@ -24,7 +24,7 @@ CREATE VIEW v3 (x) AS select a, b from t
 statement error pgcode 42601 CREATE VIEW specifies 3 column names, but data source has 2 columns
 CREATE VIEW v4 (x, y, z) AS select a, b from t
 
-statement error pgcode 42P01 table "dne" does not exist
+statement error pgcode 42P01 relation "dne" does not exist
 CREATE VIEW v5 AS select a, b from dne
 
 statement ok
@@ -127,7 +127,7 @@ x y
 query TT
 SHOW CREATE VIEW v1
 ----
-v1 CREATE VIEW v1 AS SELECT a, b FROM test.t
+v1 CREATE VIEW v1 (a, b) AS SELECT a, b FROM test.t
 
 query TT
 SHOW CREATE VIEW v2
@@ -142,7 +142,7 @@ v6 CREATE VIEW v6 (x, y) AS SELECT a, b FROM test.v1
 query TT
 SHOW CREATE VIEW test2.v1
 ----
-test2.v1 CREATE VIEW v1 AS SELECT x, y FROM test.v2
+test2.v1 CREATE VIEW v1 (x, y) AS SELECT x, y FROM test.v2
 
 statement ok
 GRANT SELECT ON t TO testuser
@@ -156,13 +156,13 @@ SELECT * FROM t
 2 98
 3 97
 
-query error user testuser does not have SELECT privilege on view v1
+query error user testuser does not have SELECT privilege on relation v1
 SELECT * FROM v1
 
-query error user testuser does not have SELECT privilege on view v6
+query error user testuser does not have SELECT privilege on relation v6
 SELECT * FROM v6
 
-query error user testuser has no privileges on view v1
+query error user testuser has no privileges on relation v1
 SHOW CREATE VIEW v1
 
 user root
@@ -175,7 +175,7 @@ GRANT SELECT ON v1 TO testuser
 
 user testuser
 
-query error user testuser does not have SELECT privilege on table t
+query error user testuser does not have SELECT privilege on relation t
 SELECT * FROM t
 
 query II rowsort
@@ -185,13 +185,13 @@ SELECT * FROM v1
 2 98
 3 97
 
-query error user testuser does not have SELECT privilege on view v6
+query error user testuser does not have SELECT privilege on relation v6
 SELECT * FROM v6
 
 query TT
 SHOW CREATE VIEW v1
 ----
-v1 CREATE VIEW v1 AS SELECT a, b FROM test.t
+v1 CREATE VIEW v1 (a, b) AS SELECT a, b FROM test.t
 
 user root
 
@@ -203,10 +203,10 @@ GRANT SELECT ON v6 TO testuser
 
 user testuser
 
-query error user testuser does not have SELECT privilege on table t
+query error user testuser does not have SELECT privilege on relation t
 SELECT * FROM t
 
-query error user testuser does not have SELECT privilege on view v1
+query error user testuser does not have SELECT privilege on relation v1
 SELECT * FROM v1
 
 query II rowsort
@@ -224,10 +224,10 @@ DROP TABLE v1
 statement error pgcode 42809 "t" is not a view
 DROP VIEW t
 
-statement error cannot drop view "v1" because view "v6" depends on it
+statement error cannot drop relation "v1" because view "v6" depends on it
 DROP VIEW v1
 
-statement error cannot drop view "v2" because view "test2.v1" depends on it
+statement error cannot drop relation "v2" because view "test2.v1" depends on it
 DROP VIEW v2
 
 statement ok
@@ -242,7 +242,7 @@ DROP VIEW v2
 statement ok
 DROP VIEW v1
 
-statement error pgcode 42P01 view "v1" does not exist
+statement error pgcode 42P01 relation "v1" does not exist
 DROP VIEW v1
 
 # Verify correct rejection of star expressions
@@ -357,11 +357,22 @@ CREATE TABLE t2 AS SELECT d, t FROM t AS OF SYSTEM TIME '2017-02-13 21:30:00'
 statement ok
 DROP TABLE t CASCADE
 
-statement error cannot make array for column type BOOL
-CREATE VIEW fail AS SELECT ARRAY[true]
+statement ok
+CREATE TABLE t (a INT[])
 
-statement error arrays of type STRING are unsupported
-CREATE VIEW fail AS SELECT ARRAY['foo']
+statement ok
+INSERT INTO t VALUES (array[1,2,3])
+
+statement ok
+CREATE VIEW b AS SELECT a[1] FROM t
+
+query I
+SELECT * FROM b
+----
+1
+
+statement ok
+DROP TABLE t CASCADE
 
 statement ok
 CREATE VIEW arr(a) AS SELECT ARRAY[3]
@@ -390,7 +401,7 @@ SELECT sum (Caps15951. a) FROM Caps15951 GROUP BY b ORDER BY b
 6
 
 query R
-SELECT sum ("Caps15951". a) FROM "Caps15951" GROUP BY b ORDER BY b
+SELECT sum ("caps15951". a) FROM "caps15951" GROUP BY b ORDER BY b
 ----
 1
 3

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer@cockroachlabs.com)
 
 package storage
 
@@ -134,7 +132,7 @@ func TestIsPushed(t *testing.T) {
 }
 
 func writeTxnRecord(ctx context.Context, tc *testContext, txn *roachpb.Transaction) error {
-	key := keys.TransactionKey(txn.Key, *txn.ID)
+	key := keys.TransactionKey(txn.Key, txn.ID)
 	return engine.MVCCPutProto(ctx, tc.store.Engine(), nil, key, hlc.Timestamp{}, nil, txn)
 }
 
@@ -170,7 +168,7 @@ func TestPushTxnQueueEnableDisable(t *testing.T) {
 
 	ptq.Enqueue(txn)
 	ptq.mu.Lock()
-	if pt := ptq.mu.txns[*txn.ID]; pt == nil {
+	if pt := ptq.mu.txns[txn.ID]; pt == nil {
 		t.Errorf("expected pendingTxn to be in txns map after enqueue")
 	}
 	ptq.mu.Unlock()
@@ -189,8 +187,8 @@ func TestPushTxnQueueEnableDisable(t *testing.T) {
 	}()
 
 	testutils.SucceedsSoon(t, func() error {
-		expDeps := []uuid.UUID{*pusher.ID}
-		if deps := ptq.GetDependents(*txn.ID); !reflect.DeepEqual(deps, expDeps) {
+		expDeps := []uuid.UUID{pusher.ID}
+		if deps := ptq.GetDependents(txn.ID); !reflect.DeepEqual(deps, expDeps) {
 			return errors.Errorf("expected GetDependents %+v; got %+v", expDeps, deps)
 		}
 		return nil
@@ -210,7 +208,7 @@ func TestPushTxnQueueEnableDisable(t *testing.T) {
 		t.Errorf("expected nil err; got %+v", respWithErr.pErr)
 	}
 
-	if deps := ptq.GetDependents(*txn.ID); deps != nil {
+	if deps := ptq.GetDependents(txn.ID); deps != nil {
 		t.Errorf("expected GetDependents to return nil as queue is disabled; got %+v", deps)
 	}
 
@@ -261,8 +259,13 @@ func TestPushTxnQueueCancel(t *testing.T) {
 	}()
 
 	testutils.SucceedsSoon(t, func() error {
-		expDeps := []uuid.UUID{*pusher.ID}
-		if deps := ptq.GetDependents(*txn.ID); !reflect.DeepEqual(deps, expDeps) {
+		select {
+		case rwe := <-retCh:
+			t.Fatalf("MaybeWaitForPush terminated prematurely: %+v", rwe)
+		default:
+		}
+		expDeps := []uuid.UUID{pusher.ID}
+		if deps := ptq.GetDependents(txn.ID); !reflect.DeepEqual(deps, expDeps) {
 			return errors.Errorf("expected GetDependents %+v; got %+v", expDeps, deps)
 		}
 		return nil
@@ -311,8 +314,8 @@ func TestPushTxnQueueUpdateTxn(t *testing.T) {
 		retCh <- RespWithErr{resp, pErr}
 	}()
 	testutils.SucceedsSoon(t, func() error {
-		expDeps := []uuid.UUID{*pusher1.ID}
-		if deps := ptq.GetDependents(*txn.ID); !reflect.DeepEqual(deps, expDeps) {
+		expDeps := []uuid.UUID{pusher1.ID}
+		if deps := ptq.GetDependents(txn.ID); !reflect.DeepEqual(deps, expDeps) {
 			return errors.Errorf("expected GetDependents %+v; got %+v", expDeps, deps)
 		}
 		return nil
@@ -323,8 +326,8 @@ func TestPushTxnQueueUpdateTxn(t *testing.T) {
 		retCh <- RespWithErr{resp, pErr}
 	}()
 	testutils.SucceedsSoon(t, func() error {
-		expDeps := []uuid.UUID{*pusher1.ID, *pusher2.ID}
-		if deps := ptq.GetDependents(*txn.ID); !reflect.DeepEqual(deps, expDeps) {
+		expDeps := []uuid.UUID{pusher1.ID, pusher2.ID}
+		if deps := ptq.GetDependents(txn.ID); !reflect.DeepEqual(deps, expDeps) {
 			return errors.Errorf("expected GetDependents %+v; got %+v", expDeps, deps)
 		}
 		return nil
@@ -374,8 +377,8 @@ func TestPushTxnQueueUpdateNotPushedTxn(t *testing.T) {
 	}()
 
 	testutils.SucceedsSoon(t, func() error {
-		expDeps := []uuid.UUID{*pusher.ID}
-		if deps := ptq.GetDependents(*txn.ID); !reflect.DeepEqual(deps, expDeps) {
+		expDeps := []uuid.UUID{pusher.ID}
+		if deps := ptq.GetDependents(txn.ID); !reflect.DeepEqual(deps, expDeps) {
 			return errors.Errorf("expected GetDependents %+v; got %+v", expDeps, deps)
 		}
 		return nil
@@ -445,8 +448,8 @@ func TestPushTxnQueuePusheeExpires(t *testing.T) {
 		retCh <- RespWithErr{resp, pErr}
 	}()
 	testutils.SucceedsSoon(t, func() error {
-		expDeps := []uuid.UUID{*pusher1.ID}
-		if deps := ptq.GetDependents(*txn.ID); !reflect.DeepEqual(deps, expDeps) {
+		expDeps := []uuid.UUID{pusher1.ID}
+		if deps := ptq.GetDependents(txn.ID); !reflect.DeepEqual(deps, expDeps) {
 			return errors.Errorf("expected GetDependents %+v; got %+v", expDeps, deps)
 		}
 		return nil
@@ -457,8 +460,8 @@ func TestPushTxnQueuePusheeExpires(t *testing.T) {
 		retCh <- RespWithErr{resp, pErr}
 	}()
 	testutils.SucceedsSoon(t, func() error {
-		expDeps := []uuid.UUID{*pusher1.ID, *pusher2.ID}
-		if deps := ptq.GetDependents(*txn.ID); !reflect.DeepEqual(deps, expDeps) {
+		expDeps := []uuid.UUID{pusher1.ID, pusher2.ID}
+		if deps := ptq.GetDependents(txn.ID); !reflect.DeepEqual(deps, expDeps) {
 			return errors.Errorf("expected GetDependents %+v; got %+v", expDeps, deps)
 		}
 		return nil
@@ -522,8 +525,8 @@ func TestPushTxnQueuePusherUpdate(t *testing.T) {
 			}()
 
 			testutils.SucceedsSoon(t, func() error {
-				expDeps := []uuid.UUID{*pusher.ID}
-				if deps := ptq.GetDependents(*txn.ID); !reflect.DeepEqual(deps, expDeps) {
+				expDeps := []uuid.UUID{pusher.ID}
+				if deps := ptq.GetDependents(txn.ID); !reflect.DeepEqual(deps, expDeps) {
 					return errors.Errorf("expected GetDependents %+v; got %+v", expDeps, deps)
 				}
 				return nil

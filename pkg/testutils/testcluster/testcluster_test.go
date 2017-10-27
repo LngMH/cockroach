@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: David Taylor (david@cockroachlabs.com)
-// Author: Andrei Matei (andrei@cockroachlabs.com)
 
 package testcluster
 
@@ -38,7 +35,6 @@ import (
 
 func TestManualReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("#13502")
 
 	tc := StartTestCluster(t, 3,
 		base.TestClusterArgs{
@@ -69,7 +65,7 @@ func TestManualReplication(t *testing.T) {
 	kvDB := tc.Servers[0].DB()
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
 
-	tableStartKey := keys.MakeRowSentinelKey(keys.MakeTablePrefix(uint32(tableDesc.ID)))
+	tableStartKey := keys.MakeTablePrefix(uint32(tableDesc.ID))
 	leftRangeDesc, tableRangeDesc, err := tc.SplitRange(tableStartKey)
 	if err != nil {
 		t.Fatal(err)
@@ -212,7 +208,7 @@ func TestStopServer(t *testing.T) {
 	}
 
 	rpcContext := rpc.NewContext(
-		log.AmbientContext{}, tc.Server(1).RPCContext().Config, tc.Server(1).Clock(), tc.Stopper(),
+		log.AmbientContext{Tracer: tc.Server(0).ClusterSettings().Tracer}, tc.Server(1).RPCContext().Config, tc.Server(1).Clock(), tc.Stopper(),
 	)
 	conn, err := rpcContext.GRPCDial(server1.ServingAddr())
 	if err != nil {

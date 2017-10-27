@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias@cockroachlabs.com)
 
 package acceptance
 
@@ -338,7 +336,9 @@ func TestClusterRecovery(t *testing.T) {
 	s := log.Scope(t)
 	defer s.Close(t)
 
-	runTestOnConfigs(t, testClusterRecoveryInner)
+	RunLocal(t, func(t *testing.T) {
+		runTestWithCluster(t, testClusterRecoveryInner)
+	})
 }
 
 func testClusterRecoveryInner(
@@ -388,7 +388,7 @@ func testClusterRecoveryInner(
 	for _, c := range counts {
 		count += c
 	}
-	log.Infof(ctx, "%d %.1f/sec", count, float64(count)/elapsed.Seconds())
+	log.Infof(ctx, "%d %.1f/sec over %s", count, float64(count)/elapsed.Seconds(), elapsed)
 }
 
 // TestNodeRestart starts up a cluster with an "accounts" table.
@@ -400,7 +400,9 @@ func TestNodeRestart(t *testing.T) {
 	s := log.Scope(t)
 	defer s.Close(t)
 
-	runTestOnConfigs(t, testNodeRestartInner)
+	RunLocal(t, func(t *testing.T) {
+		runTestWithCluster(t, testNodeRestartInner)
+	})
 }
 
 func testNodeRestartInner(

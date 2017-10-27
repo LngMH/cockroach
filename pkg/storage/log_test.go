@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package storage_test
 
@@ -46,7 +44,7 @@ func TestLogSplits(t *testing.T) {
 	countSplits := func() int {
 		var count int
 		err := db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM system.rangelog WHERE eventType = $1`,
+			`SELECT COUNT(*) FROM system.rangelog WHERE "eventType" = $1`,
 			storage.RangeLogEventType_split.String()).Scan(&count)
 		if err != nil {
 			t.Fatal(err)
@@ -77,7 +75,7 @@ func TestLogSplits(t *testing.T) {
 	// verify that RangeID always increases (a good way to see that the splits
 	// are logged correctly)
 	rows, err := db.QueryContext(ctx,
-		`SELECT rangeID, otherRangeID, info FROM system.rangelog WHERE eventType = $1`,
+		`SELECT "rangeID", "otherRangeID", info FROM system.rangelog WHERE "eventType" = $1`,
 		storage.RangeLogEventType_split.String(),
 	)
 	if err != nil {
@@ -132,6 +130,21 @@ func TestLogSplits(t *testing.T) {
 	if a := store.Metrics().RangeSplits.Count(); a < minSplits {
 		t.Errorf("splits = %d < min %d", a, minSplits)
 	}
+
+	{
+		// Verify that the uniqueIDs have non-zero node IDs. The "& 0x7fff" is
+		// using internal knowledge of the structure of uniqueIDs that the node ID
+		// is embedded in the lower 15 bits. See #17560.
+		var count int
+		err := db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM system.rangelog WHERE ("uniqueID" & 0x7fff) = 0`).Scan(&count)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("found %d uniqueIDs with a zero node ID", count)
+		}
+	}
 }
 
 func TestLogRebalances(t *testing.T) {
@@ -157,9 +170,10 @@ func TestLogRebalances(t *testing.T) {
 	}
 
 	// Log several fake events using the store.
-	logEvent := func(changeType roachpb.ReplicaChangeType) {
+	const details = "test"
+	logEvent := func(changeType roachpb.ReplicaChangeType, reason storage.RangeLogEventReason) {
 		if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-			return store.LogReplicaChangeTest(ctx, txn, changeType, desc.Replicas[0], *desc)
+			return store.LogReplicaChangeTest(ctx, txn, changeType, desc.Replicas[0], *desc, reason, details)
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -172,11 +186,11 @@ func TestLogRebalances(t *testing.T) {
 			t.Errorf("range removes %d != expected %d", a, e)
 		}
 	}
-	logEvent(roachpb.ADD_REPLICA)
+	logEvent(roachpb.ADD_REPLICA, storage.ReasonRangeUnderReplicated)
 	checkMetrics(1 /*add*/, 0 /*remove*/)
-	logEvent(roachpb.ADD_REPLICA)
+	logEvent(roachpb.ADD_REPLICA, storage.ReasonRangeUnderReplicated)
 	checkMetrics(2 /*adds*/, 0 /*remove*/)
-	logEvent(roachpb.REMOVE_REPLICA)
+	logEvent(roachpb.REMOVE_REPLICA, storage.ReasonRangeOverReplicated)
 	checkMetrics(2 /*adds*/, 1 /*remove*/)
 
 	// Open a SQL connection to verify that the events have been logged.
@@ -191,7 +205,7 @@ func TestLogRebalances(t *testing.T) {
 
 	// verify that two add replica events have been logged.
 	rows, err := sqlDB.QueryContext(ctx,
-		`SELECT rangeID, info FROM system.rangelog WHERE eventType = $1`,
+		`SELECT "rangeID", info FROM system.rangelog WHERE "eventType" = $1`,
 		storage.RangeLogEventType_add.String(),
 	)
 	if err != nil {
@@ -225,6 +239,14 @@ func TestLogRebalances(t *testing.T) {
 			t.Errorf("recorded wrong updated replica %s for add replica of range %d, expected %s",
 				a, rangeID, e)
 		}
+		if a, e := info.Reason, storage.ReasonRangeUnderReplicated; a != e {
+			t.Errorf("recorded wrong reason %s for add replica of range %d, expected %s",
+				a, rangeID, e)
+		}
+		if a, e := info.Details, details; a != e {
+			t.Errorf("recorded wrong details %s for add replica of range %d, expected %s",
+				a, rangeID, e)
+		}
 	}
 	if rows.Err() != nil {
 		t.Fatal(rows.Err())
@@ -235,7 +257,7 @@ func TestLogRebalances(t *testing.T) {
 
 	// verify that one remove replica event was logged.
 	rows, err = sqlDB.QueryContext(ctx,
-		`SELECT rangeID, info FROM system.rangelog WHERE eventType = $1`,
+		`SELECT "rangeID", info FROM system.rangelog WHERE "eventType" = $1`,
 		storage.RangeLogEventType_remove.String(),
 	)
 	if err != nil {
@@ -267,6 +289,14 @@ func TestLogRebalances(t *testing.T) {
 		}
 		if a, e := *info.RemovedReplica, desc.Replicas[0]; a != e {
 			t.Errorf("recorded wrong updated replica %s for remove replica of range %d, expected %s",
+				a, rangeID, e)
+		}
+		if a, e := info.Reason, storage.ReasonRangeOverReplicated; a != e {
+			t.Errorf("recorded wrong reason %s for add replica of range %d, expected %s",
+				a, rangeID, e)
+		}
+		if a, e := info.Details, details; a != e {
+			t.Errorf("recorded wrong details %s for add replica of range %d, expected %s",
 				a, rangeID, e)
 		}
 	}

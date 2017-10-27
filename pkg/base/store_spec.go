@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package base
 
@@ -45,7 +43,10 @@ const MinimumStoreSize = 10 * 64 << 20
 // StoreSpec contains the details that can be specified in the cli pertaining
 // to the --store flag.
 type StoreSpec struct {
-	Path        string
+	Path string
+	// SizeInBytes is used for calculating free space and making rebalancing
+	// decisions. Zero indicates that there is no maximum size. This value is not
+	// actually used by the engine and thus not enforced.
 	SizeInBytes int64
 	SizePercent float64
 	InMemory    bool

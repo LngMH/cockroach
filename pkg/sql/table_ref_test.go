@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql_test
 
@@ -79,33 +77,33 @@ ALTER TABLE test.t DROP COLUMN xx;
 		expectedColumns string
 		expectedError   string
 	}{
-		{fmt.Sprintf("[%d] as t", tID), `(p, d, c)`, ``},
-		{fmt.Sprintf("[%d(%d)] as t", tID, aID), `(p)`, ``},
-		{fmt.Sprintf("[%d(%d)] as t", tID, bID), `(d)`, ``},
-		{fmt.Sprintf("[%d(%d)] as t", tID, cID), `(c)`, ``},
-		{fmt.Sprintf("[%d]@bc as t", tID), `(p, d, c)`, ``},
-		{fmt.Sprintf("[%d(%d)]@bc as t", tID, aID), `(p)`, ``},
-		{fmt.Sprintf("[%d(%d)]@bc as t", tID, bID), `(d)`, ``},
-		{fmt.Sprintf("[%d(%d)]@bc as t", tID, cID), `(c)`, ``},
-		{fmt.Sprintf("[%d(%d, %d, %d)] as t", tID, cID, bID, aID), `(c, d, p)`, ``},
-		{fmt.Sprintf("[%d(%d, %d, %d)] as t(c, b, a)", tID, cID, bID, aID), `(c, b, a)`, ``},
-		{fmt.Sprintf("[%d()] as t", tID), `()`, ``},
-		{`[666()] as t`, ``, `pq: table "<id=666>" does not exist`},
-		{fmt.Sprintf("[%d(666)] as t", tID), ``, `pq: column 666 does not exist`},
+		{fmt.Sprintf("[%d as t]", tID), `(p, d, c)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]", tID, aID), `(p)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]", tID, bID), `(d)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]", tID, cID), `(c)`, ``},
+		{fmt.Sprintf("[%d as t]@bc", tID), `(p, d, c)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]@bc", tID, aID), `(p)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]@bc", tID, bID), `(d)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]@bc", tID, cID), `(c)`, ``},
+		{fmt.Sprintf("[%d(%d, %d, %d) as t]", tID, cID, bID, aID), `(c, d, p)`, ``},
+		{fmt.Sprintf("[%d(%d, %d, %d) as t(c, b, a)]", tID, cID, bID, aID), `(c, b, a)`, ``},
+		{fmt.Sprintf("[%d() as t]", tID), `()`, ``},
+		{`[666() as t]`, ``, `pq: [666() AS t]: relation "[666]" does not exist`},
+		{fmt.Sprintf("[%d(666) as t]", tID), ``, `pq: column [666] does not exist`},
 		{fmt.Sprintf("test.t@[%d]", pkID), `(p, d, c)`, ``},
 		{fmt.Sprintf("test.t@[%d]", secID), `(p, d, c)`, ``},
-		{`test.t@[666]`, ``, `pq: index 666 not found`},
-		{fmt.Sprintf("[%d]@[%d] as t", tID, pkID), `(p, d, c)`, ``},
-		{fmt.Sprintf("[%d(%d)]@[%d] as t", tID, aID, pkID), `(p)`, ``},
-		{fmt.Sprintf("[%d(%d)]@[%d] as t", tID, bID, pkID), `(d)`, ``},
-		{fmt.Sprintf("[%d(%d)]@[%d] as t", tID, cID, pkID), `(c)`, ``},
-		{fmt.Sprintf("[%d(%d)]@[%d] as t", tID, aID, secID), `(p)`, ``},
-		{fmt.Sprintf("[%d(%d)]@[%d] as t", tID, bID, secID), `(d)`, ``},
-		{fmt.Sprintf("[%d(%d)]@[%d] as t", tID, cID, secID), `(c)`, ``},
+		{`test.t@[666]`, ``, `pq: index [666] not found`},
+		{fmt.Sprintf("[%d as t]@[%d]", tID, pkID), `(p, d, c)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]@[%d]", tID, aID, pkID), `(p)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]@[%d]", tID, bID, pkID), `(d)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]@[%d]", tID, cID, pkID), `(c)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]@[%d]", tID, aID, secID), `(p)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]@[%d]", tID, bID, secID), `(d)`, ``},
+		{fmt.Sprintf("[%d(%d) as t]@[%d]", tID, cID, secID), `(c)`, ``},
 	}
 
 	for i, d := range testData {
-		sql := "SELECT Columns FROM [EXPLAIN(METADATA) SELECT * FROM " + d.tableExpr + "]"
+		sql := `SELECT "Columns" FROM [EXPLAIN(METADATA) SELECT * FROM ` + d.tableExpr + "]"
 		var columns string
 		if err := db.QueryRow(sql).Scan(&columns); err != nil {
 			if d.expectedError != "" {

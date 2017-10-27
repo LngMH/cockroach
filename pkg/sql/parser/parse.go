@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // This code was derived from https://github.com/youtube/vitess.
 //
@@ -29,7 +27,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/pkg/errors"
 )
 
 //go:generate make
@@ -61,10 +58,15 @@ type Parser struct {
 func (p *Parser) Parse(sql string) (stmts StatementList, err error) {
 	p.scanner.init(sql)
 	if p.parserImpl.Parse(&p.scanner) != 0 {
+		var err *pgerror.Error
 		if feat := p.scanner.lastError.unimplementedFeature; feat != "" {
-			return nil, pgerror.Unimplemented(feat, p.scanner.lastError.msg)
+			err = pgerror.Unimplemented(feat, p.scanner.lastError.msg)
+		} else {
+			err = pgerror.NewError(pgerror.CodeSyntaxError, p.scanner.lastError.msg)
 		}
-		return nil, pgerror.NewError(pgerror.CodeSyntaxError, p.scanner.lastError.msg)
+		err.Hint = p.scanner.lastError.hint
+		err.Detail = p.scanner.lastError.detail
+		return nil, err
 	}
 	return p.scanner.stmts, nil
 }
@@ -84,9 +86,12 @@ func TypeCheck(expr Expr, ctx *SemaContext, desired Type) (TypedExpr, error) {
 		panic("the desired type for parser.TypeCheck cannot be nil, use TypeAny instead")
 	}
 
-	expr = replacePlaceholders(expr, ctx)
+	expr, err := replacePlaceholders(expr, ctx)
+	if err != nil {
+		return nil, err
+	}
 
-	expr, err := foldConstantLiterals(expr)
+	expr, err = foldConstantLiterals(expr)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +108,8 @@ func TypeCheckAndRequire(expr Expr, ctx *SemaContext, required Type, op string) 
 		return nil, err
 	}
 	if typ := typedExpr.ResolvedType(); !(typ.Equivalent(required) || typ == TypeNull) {
-		return typedExpr, fmt.Errorf("argument of %s must be type %s, not type %s", op, required, typ)
+		return typedExpr, pgerror.NewErrorf(
+			pgerror.CodeDatatypeMismatchError, "argument of %s must be type %s, not type %s", op, required, typ)
 	}
 	return typedExpr, nil
 }
@@ -136,7 +142,8 @@ func ParseOne(sql string) (Statement, error) {
 		return nil, err
 	}
 	if len(stmts) != 1 {
-		return nil, errors.Errorf("expected 1 statement, but found %d", len(stmts))
+		return nil, pgerror.NewErrorf(
+			pgerror.CodeInternalError, "expected 1 statement, but found %d", len(stmts))
 	}
 	return stmts[0], nil
 }
@@ -149,7 +156,7 @@ func ParseTableName(sql string) (*TableName, error) {
 	}
 	rename, ok := stmt.(*RenameTable)
 	if !ok {
-		return nil, errors.Errorf("expected an ALTER TABLE statement, but found %T", stmt)
+		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "expected an ALTER TABLE statement, but found %T", stmt)
 	}
 	return rename.Name.Normalize()
 }
@@ -160,9 +167,9 @@ func parseExprs(exprs []string) (Exprs, error) {
 	if err != nil {
 		return nil, err
 	}
-	set, ok := stmt.(*Set)
+	set, ok := stmt.(*SetVar)
 	if !ok {
-		return nil, errors.Errorf("expected a SET statement, but found %T", stmt)
+		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "expected a SET statement, but found %T", stmt)
 	}
 	return set.Values, nil
 }
@@ -182,7 +189,7 @@ func ParseExpr(sql string) (Expr, error) {
 		return nil, err
 	}
 	if len(exprs) != 1 {
-		return nil, errors.Errorf("expected 1 expression, found %d", len(exprs))
+		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "expected 1 expression, found %d", len(exprs))
 	}
 	return exprs[0], nil
 }
@@ -196,14 +203,14 @@ func ParseType(sql string) (CastTargetType, error) {
 
 	cast, ok := expr.(*CastExpr)
 	if !ok {
-		return nil, errors.Errorf("expected a CastExpr, but found %T", expr)
+		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "expected a CastExpr, but found %T", expr)
 	}
 
 	return cast.Type, nil
 }
 
 // ParseStringAs parses s as type t.
-func ParseStringAs(t Type, s string, location *time.Location) (Datum, error) {
+func ParseStringAs(t Type, s string, evalCtx *EvalContext) (Datum, error) {
 	var d Datum
 	var err error
 	switch t {
@@ -212,7 +219,7 @@ func ParseStringAs(t Type, s string, location *time.Location) (Datum, error) {
 	case TypeBytes:
 		d = NewDBytes(DBytes(s))
 	case TypeDate:
-		d, err = ParseDDate(s, location)
+		d, err = ParseDDate(s, evalCtx.GetLocation())
 	case TypeDecimal:
 		d, err = ParseDDecimal(s)
 	case TypeFloat:
@@ -226,11 +233,24 @@ func ParseStringAs(t Type, s string, location *time.Location) (Datum, error) {
 	case TypeTimestamp:
 		d, err = ParseDTimestamp(s, time.Microsecond)
 	case TypeTimestampTZ:
-		d, err = ParseDTimestampTZ(s, location, time.Microsecond)
+		d, err = ParseDTimestampTZ(s, evalCtx.GetLocation(), time.Microsecond)
 	case TypeUUID:
 		d, err = ParseDUuidFromString(s)
+	case TypeINet:
+		d, err = ParseDIPAddrFromINetString(s)
 	default:
-		return nil, errors.Errorf("unknown type %s", t)
+		if a, ok := t.(TArray); ok {
+			typ, err := DatumTypeToColumnType(a.Typ)
+			if err != nil {
+				return nil, err
+			}
+			d, err = ParseDArrayFromString(evalCtx, s, typ)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unknown type %s", t)
+		}
 	}
 	return d, err
 }

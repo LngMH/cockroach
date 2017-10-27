@@ -11,15 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf
 
 package terrafarm
 
 import (
 	"bufio"
 	"bytes"
-	"fmt"
 	"io"
 	"os/exec"
 	"strings"
@@ -55,32 +52,6 @@ func (f *Farmer) run(cmd string, args ...string) (string, string, error) {
 	return outBuf.String(), errBuf.String(), err
 }
 
-func (f *Farmer) runErr(cmd string, args ...string) error {
-	o, e, err := f.run(cmd, args...)
-	if err != nil {
-		return fmt.Errorf("failed: %s\nstdout: %s\nstderr: %s", o, e, err)
-	}
-	return nil
-}
-
-func (f *Farmer) appendDefaults(args []string) []string {
-	return append(
-		args,
-		"-no-color",
-		"-var=key_name="+f.KeyName,
-		"-state="+f.StateFile,
-		`-var=prefix="`+f.Prefix+`"`)
-}
-
-func (f *Farmer) apply(args ...string) error {
-	args = f.appendDefaults(append([]string{"apply"}, args...))
-	if err := f.runErr("terraform", args...); err != nil {
-		return err
-	}
-	f.refresh()
-	return nil
-}
-
 func (f *Farmer) output(key string) []string {
 	o, _, err := f.run("terraform", "output", "-state="+f.StateFile, "-no-color", key)
 	if _, ok := err.(*exec.ExitError); err != nil && !ok {
@@ -92,9 +63,4 @@ func (f *Farmer) output(key string) []string {
 		return nil
 	}
 	return strings.Split(o, ",")
-}
-
-func (f *Farmer) execSupervisor(host string, action string) (string, string, error) {
-	cmd := "supervisorctl -c supervisor.conf " + action
-	return f.ssh(host, f.defaultKeyFile(), cmd)
 }

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc berhault (marc@cockroachlabs.com)
 
 package cli
 
@@ -35,7 +33,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 type sqlConnI interface {
@@ -246,7 +246,7 @@ func (c *sqlConn) ExecTxn(fn func(*sqlConn) error) (err error) {
 		// for either the standard PG errcode SerializationFailureError:40001 or the Cockroach extension
 		// errcode RetriableError:CR000. The Cockroach extension has been removed server-side, but support
 		// for it has been left here for now to maintain backwards compatibility.
-		pqErr, ok := err.(*pq.Error)
+		pqErr, ok := pgerror.GetPGCause(err)
 		if retryable := ok && (pqErr.Code == "CR000" || pqErr.Code == "40001"); !retryable {
 			return err
 		}
@@ -260,6 +260,9 @@ func (c *sqlConn) Exec(query string, args []driver.Value) error {
 	if err := c.ensureConn(); err != nil {
 		return err
 	}
+	if sqlCtx.echo {
+		fmt.Fprintln(stderr, ">", query)
+	}
 	_, err := c.conn.Exec(query, args)
 	if err == driver.ErrBadConn {
 		c.reconnecting = true
@@ -271,6 +274,9 @@ func (c *sqlConn) Exec(query string, args []driver.Value) error {
 func (c *sqlConn) Query(query string, args []driver.Value) (*sqlRows, error) {
 	if err := c.ensureConn(); err != nil {
 		return nil, err
+	}
+	if sqlCtx.echo {
+		fmt.Fprintln(stderr, ">", query)
 	}
 	rows, err := c.conn.Query(query, args)
 	if err == driver.ErrBadConn {
@@ -434,66 +440,121 @@ func makeQuery(query string, parameters ...driver.Value) queryFunc {
 
 // runQuery takes a 'query' with optional 'parameters'.
 // It runs the sql query and returns a list of columns names and a list of rows.
-func runQuery(
-	conn *sqlConn, fn queryFunc, showMoreChars bool,
-) ([]string, [][]string, string, error) {
+func runQuery(conn *sqlConn, fn queryFunc, showMoreChars bool) ([]string, [][]string, error) {
 	rows, err := fn(conn)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, err
 	}
 
 	defer func() { _ = rows.Close() }()
 	return sqlRowsToStrings(rows, showMoreChars)
 }
 
+// handleCopyError ensures the user is properly informed when they issue
+// a COPY statement somewhere in their input.
+func handleCopyError(conn *sqlConn, err error) error {
+	if !strings.HasPrefix(err.Error(), "pq: unknown response for simple query: 'G'") {
+		return err
+	}
+
+	// The COPY statement has hosed the connection by putting the
+	// protocol in a state that lib/pq cannot understand any more. Reset
+	// it.
+	conn.Close()
+	conn.reconnecting = true
+	return errors.New("woops! COPY has confused this client! Suggestion: use 'psql' for COPY")
+}
+
+// All tags where the RowsAffected value should be reported to
+// the user.
+var tagsWithRowsAffected = map[string]struct{}{
+	"INSERT":    {},
+	"UPDATE":    {},
+	"DELETE":    {},
+	"DROP USER": {},
+}
+
 // runQueryAndFormatResults takes a 'query' with optional 'parameters'.
 // It runs the sql query and writes output to 'w'.
-func runQueryAndFormatResults(
-	conn *sqlConn, w io.Writer, fn queryFunc, displayFormat tableDisplayFormat,
-) error {
+func runQueryAndFormatResults(conn *sqlConn, w io.Writer, fn queryFunc) error {
+	startTime := timeutil.Now()
 	rows, err := fn(conn)
 	if err != nil {
-		return err
+		return handleCopyError(conn, err)
 	}
 	defer func() {
 		_ = rows.Close()
 	}()
 	for {
-		cols := getColumnStrings(rows)
-		if len(cols) == 0 {
-			// When no columns are returned, we want to render a summary of the
-			// number of rows that were returned or affected. To do this this, the
-			// driver needs to "consume" all the rows so that the RowsAffected()
-			// method returns the correct number of rows (it only reports the number
-			// of rows that the driver consumes).
-			if err := consumeAllRows(rows); err != nil {
-				return err
+		// lib/pq is not able to tell us before the first call to Next()
+		// whether a statement returns either
+		// - a rows result set with zero rows (e.g. SELECT on an empty table), or
+		// - no rows result set, but a valid value for RowsAffected (e.g. INSERT), or
+		// - doesn't return any rows whatsoever (e.g. SET).
+		//
+		// To distinguish them we must go through Next() somehow, which is what the
+		// render() function does. So we ask render() to call this noRowsHook
+		// when Next() has completed its work and no rows where observed, to decide
+		// what to do.
+		noRowsHook := func() (bool, error) {
+			res := rows.Result()
+			if ra, ok := res.(driver.RowsAffected); ok {
+				// This may be either something like INSERT with a valid
+				// RowsAffected value, or a statement like SET. The pq driver
+				// uses both driver.RowsAffected for both.  So we need to be a
+				// little more manual.
+				tag := rows.Tag()
+				if tag == "SELECT" {
+					// The driver unhelpfully "optimizes" a SELECT returning no rows
+					// into a driver.RowsAffected instance with value 0. In that
+					// case, we still want the reporter to do its job properly.
+					return false, nil
+				} else if _, ok := tagsWithRowsAffected[tag]; ok {
+					// INSERT, DELETE, etc.: print the row count.
+					nRows, err := ra.RowsAffected()
+					if err != nil {
+						return false, err
+					}
+					fmt.Fprintf(w, "%s %d\n", tag, nRows)
+				} else {
+					// SET, etc.: just print the tag, or OK if there's no tag.
+					if tag == "" {
+						tag = "OK"
+					}
+					fmt.Fprintln(w, tag)
+				}
+				return true, nil
 			}
+			// Other cases: this is a statement with a rows result set, but
+			// zero rows (e.g. SELECT on empty table). Let the reporter
+			// handle it.
+			return false, nil
 		}
-		formattedTag := getFormattedTag(rows.Tag(), rows.Result())
-		if err := printQueryOutput(w, cols, newRowIter(rows, true), formattedTag, displayFormat); err != nil {
+
+		cols := getColumnStrings(rows)
+		reporter, err := makeReporter()
+		if err != nil {
+			return nil
+		}
+		if err := render(reporter, w, cols, newRowIter(rows, true), noRowsHook); err != nil {
 			return err
+		}
+
+		if cliCtx.showTimes {
+			// Present the time since the last result, or since the
+			// beginning of execution. Currently the execution engine makes
+			// all the work upfront so most of the time is accounted for by
+			// the 1st result; this is subject to change once CockroachDB
+			// evolves to stream results as statements are executed.
+			newNow := timeutil.Now()
+			fmt.Fprintf(w, "\nTime: %s\n\n", newNow.Sub(startTime))
+			startTime = newNow
 		}
 
 		if more, err := rows.NextResultSet(); err != nil {
 			return err
 		} else if !more {
 			return nil
-		}
-	}
-}
-
-// consumeAllRows consumes all of the rows from the network. Used this method
-// when the driver needs to consume all the rows, but you don't care about the
-// rows themselves.
-func consumeAllRows(rows *sqlRows) error {
-	for {
-		err := rows.Next(nil)
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
 		}
 	}
 }
@@ -505,15 +566,13 @@ func consumeAllRows(rows *sqlRows) error {
 // If both the header row and list of rows are empty, it means no row
 // information was returned (eg: statement was not a query).
 // If showMoreChars is true, then more characters are not escaped.
-func sqlRowsToStrings(rows *sqlRows, showMoreChars bool) ([]string, [][]string, string, error) {
+func sqlRowsToStrings(rows *sqlRows, showMoreChars bool) ([]string, [][]string, error) {
 	cols := getColumnStrings(rows)
 	allRows, err := getAllRowStrings(rows, showMoreChars)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, err
 	}
-	tag := getFormattedTag(rows.Tag(), rows.Result())
-
-	return cols, allRows, tag, nil
+	return cols, allRows, nil
 }
 
 func getColumnStrings(rows *sqlRows) []string {
@@ -562,18 +621,6 @@ func getNextRowStrings(rows *sqlRows, showMoreChars bool) ([]string, error) {
 		rowStrings[i] = formatVal(v, showMoreChars, showMoreChars)
 	}
 	return rowStrings, nil
-}
-
-func getFormattedTag(tag string, result driver.Result) string {
-	switch tag {
-	case "":
-		tag = "OK"
-	case "SELECT", "DELETE", "INSERT", "UPDATE":
-		if n, err := result.RowsAffected(); err == nil {
-			tag = fmt.Sprintf("%s %d", tag, n)
-		}
-	}
-	return tag
 }
 
 // expandTabsAndNewLines ensures that multi-line row strings that may

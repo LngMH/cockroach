@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package client
 
@@ -20,7 +18,6 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
@@ -28,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
@@ -109,7 +107,7 @@ func (kv *KeyValue) ValueInt() int64 {
 }
 
 // ValueProto parses the byte slice value into msg.
-func (kv *KeyValue) ValueProto(msg proto.Message) error {
+func (kv *KeyValue) ValueProto(msg protoutil.Message) error {
 	if kv.Value == nil {
 		msg.Reset()
 		return nil
@@ -127,7 +125,7 @@ type Result struct {
 	// returned varies by operation. For Get, Put, CPut, Inc and Del the number
 	// of rows returned is the number of keys operated on. For Scan the number of
 	// rows returned is the number or rows matching the scan capped by the
-	// maxRows parameter. For DelRange Rows is nil.
+	// maxRows parameter and other options. For DelRange Rows is nil.
 	Rows []KeyValue
 
 	// Keys is set by some operations instead of returning the rows themselves.
@@ -140,6 +138,9 @@ type Result struct {
 	// a new shorter span of keys. An empty span is returned when the
 	// operation has successfully completed running through the span.
 	ResumeSpan roachpb.Span
+	// When ResumeSpan is populated, this specifies the reason why the operation
+	// wasn't completed and needs to be resumed.
+	ResumeReason roachpb.ResponseHeader_ResumeReason
 
 	// RangeInfos contains information about the replicas that produced this
 	// result.
@@ -222,7 +223,7 @@ func (db *DB) Get(ctx context.Context, key interface{}) (KeyValue, error) {
 // message. If the key doesn't exist, the proto will simply be reset.
 //
 // key can be either a byte slice or a string.
-func (db *DB) GetProto(ctx context.Context, key interface{}, msg proto.Message) error {
+func (db *DB) GetProto(ctx context.Context, key interface{}, msg protoutil.Message) error {
 	r, err := db.Get(ctx, key)
 	if err != nil {
 		return err
@@ -233,7 +234,7 @@ func (db *DB) GetProto(ctx context.Context, key interface{}, msg proto.Message) 
 // Put sets the value for a key.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc).
+// protoutil.Message or any Go primitive type (bool, int, etc).
 func (db *DB) Put(ctx context.Context, key, value interface{}) error {
 	b := &Batch{}
 	b.Put(key, value)
@@ -246,7 +247,7 @@ func (db *DB) Put(ctx context.Context, key, value interface{}) error {
 // with caution.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc).
+// protoutil.Message or any Go primitive type (bool, int, etc).
 func (db *DB) PutInline(ctx context.Context, key, value interface{}) error {
 	b := &Batch{}
 	b.PutInline(key, value)
@@ -261,22 +262,24 @@ func (db *DB) PutInline(ctx context.Context, key, value interface{}) error {
 // Returns an error if the existing value is not equal to expValue.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc).
+// protoutil.Message or any Go primitive type (bool, int, etc).
 func (db *DB) CPut(ctx context.Context, key, value, expValue interface{}) error {
 	b := &Batch{}
 	b.CPut(key, value, expValue)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
-// InitPut sets the first value for a key to value. An error is reported if a
-// value already exists for the key and it's not equal to the value passed in.
+// InitPut sets the first value for a key to value. A ConditionFailedError is
+// reported if a value already exists for the key and it's not equal to the
+// value passed in. If failOnTombstones is set to true, tombstones count as
+// mismatched values and will cause a ConditionFailedError.
 //
 // key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc). It is illegal to
+// protoutil.Message or any Go primitive type (bool, int, etc). It is illegal to
 // set value to nil.
-func (db *DB) InitPut(ctx context.Context, key, value interface{}) error {
+func (db *DB) InitPut(ctx context.Context, key, value interface{}, failOnTombstones bool) error {
 	b := &Batch{}
-	b.InitPut(key, value)
+	b.InitPut(key, value, failOnTombstones)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
@@ -376,7 +379,7 @@ func (db *DB) AdminMerge(ctx context.Context, key interface{}) error {
 // #16008 for details, and #16344 for the tracking issue to clean this mess up
 // properly.
 //
-// keys can be either a byte slice or a string.
+// The keys can be either byte slices or a strings.
 func (db *DB) AdminSplit(ctx context.Context, spanKey, splitKey interface{}) error {
 	b := &Batch{}
 	b.adminSplit(spanKey, splitKey)
@@ -431,18 +434,9 @@ func (db *DB) WriteBatch(ctx context.Context, begin, end interface{}, data []byt
 	return getOneErr(db.Run(ctx, b), b)
 }
 
-// ExperimentalAddSSTable links a file into the RocksDB log-structured
-// merge-tree. Existing data in the range is cleared.
-//
-// TODO(dan): DANGER DANGER DANGER. This command is in development. It should
-// NOT be used on any non-testing cluster as it may write data that is
-// incompatible with future versions of CockroachDB. It also has known
-// limitations involving corruption if a node crashes at the wrong time (see
-// addSSTablePostApply) and currently requires that RocksDB's DeleteRange
-// operation not be used.
-func (db *DB) ExperimentalAddSSTable(
-	ctx context.Context, begin, end interface{}, data []byte,
-) error {
+// AddSSTable links a file into the RocksDB log-structured merge-tree. Existing
+// data in the range is cleared.
+func (db *DB) AddSSTable(ctx context.Context, begin, end interface{}, data []byte) error {
 	b := &Batch{}
 	b.addSSTable(begin, end, data)
 	return getOneErr(db.Run(ctx, b), b)
@@ -463,10 +457,10 @@ func sendAndFill(ctx context.Context, send SenderFunc, b *Batch) error {
 	b.response, b.pErr = send(ctx, ba)
 	if b.pErr != nil {
 		// Discard errors from fillResults.
-		_ = b.fillResults()
+		_ = b.fillResults(ctx)
 		return b.pErr.GoError()
 	}
-	if err := b.fillResults(); err != nil {
+	if err := b.fillResults(ctx); err != nil {
 		b.pErr = roachpb.NewError(err)
 		return err
 	}
@@ -506,12 +500,14 @@ func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) err
 	// (https://github.com/cockroachdb/cockroach/issues/10511).
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	txn := NewTxn(db)
+	// TODO(andrei): Plumb a gatewayNodeID here. If we pass 0, then the gateway
+	// field will be filled in by the DistSender which will assume that the
+	// current node is the gateway.
+	txn := NewTxn(db, 0 /* gatewayNodeID */)
 	txn.SetDebugName("unnamed")
 	opts := TxnExecOptions{
-		AutoCommit:                 true,
-		AutoRetry:                  true,
-		AssignTimestampImmediately: true,
+		AutoCommit: true,
+		AutoRetry:  true,
 	}
 	err := txn.Exec(ctx, opts, func(ctx context.Context, txn *Txn, _ *TxnExecOptions) error {
 		return retryable(ctx, txn)

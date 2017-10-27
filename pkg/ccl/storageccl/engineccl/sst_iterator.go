@@ -17,6 +17,7 @@ import (
 	"github.com/golang/leveldb/table"
 	"github.com/pkg/errors"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 )
 
@@ -39,6 +40,9 @@ type sstIterator struct {
 	// don't think there's a concrete reason that we need to hold a pointer to
 	// it, but may as well.
 	fs db.FileSystem
+
+	// roachpb.Verify k/v pairs on each call to Next()
+	verify bool
 }
 
 var _ engine.SimpleIterator = &sstIterator{}
@@ -59,7 +63,7 @@ func NewSSTIterator(path string) (engine.SimpleIterator, error) {
 // memory. It's compatible with sstables output by engine.RocksDBSstFileWriter,
 // which means the keys are CockroachDB mvcc keys and they each have the RocksDB
 // trailer (of seqno & value type).
-func NewMemSSTIterator(data []byte) (engine.SimpleIterator, error) {
+func NewMemSSTIterator(data []byte, verify bool) (engine.SimpleIterator, error) {
 	fs := memfs.New()
 	const filename = "data.sst"
 	f, err := fs.Create(filename)
@@ -77,7 +81,7 @@ func NewMemSSTIterator(data []byte) (engine.SimpleIterator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &sstIterator{fs: fs, sst: table.NewReader(file, readerOpts)}, nil
+	return &sstIterator{fs: fs, sst: table.NewReader(file, readerOpts), verify: verify}, nil
 }
 
 // Close implements the engine.SimpleIterator interface.
@@ -93,7 +97,7 @@ func (r *sstIterator) Close() {
 // Seek implements the engine.SimpleIterator interface.
 func (r *sstIterator) Seek(key engine.MVCCKey) {
 	if r.iter != nil {
-		if r.err = errors.Wrap(r.sst.Close(), "resetting sstable iterator"); r.err != nil {
+		if r.err = errors.Wrap(r.iter.Close(), "resetting sstable iterator"); r.err != nil {
 			return
 		}
 	}
@@ -129,6 +133,11 @@ func (r *sstIterator) Next() {
 	key := rocksdbInternalKey[:len(rocksdbInternalKey)-8]
 	if r.mvccKey, r.err = engine.DecodeKey(key); r.err != nil {
 		r.err = errors.Wrapf(r.err, "decoding key: %s", key)
+		return
+	}
+
+	if r.verify {
+		r.err = roachpb.Value{RawBytes: r.iter.Value()}.Verify(r.mvccKey.Key)
 	}
 }
 
@@ -138,7 +147,7 @@ func (r *sstIterator) NextKey() {
 		return
 	}
 	r.nextKeyStart = append(r.nextKeyStart[:0], r.mvccKey.Key...)
-	for r.Next(); r.valid && r.err != nil && bytes.Equal(r.nextKeyStart, r.mvccKey.Key); r.Next() {
+	for r.Next(); r.valid && r.err == nil && bytes.Equal(r.nextKeyStart, r.mvccKey.Key); r.Next() {
 	}
 }
 

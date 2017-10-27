@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package storage_test
 
@@ -37,9 +35,9 @@ func TestComputeStatsForKeySpan(t *testing.T) {
 	// Create a number of ranges using splits.
 	splitKeys := []string{"a", "c", "e", "g", "i"}
 	for _, k := range splitKeys {
-		key := []byte(k)
-		repl := mtc.stores[0].LookupReplica(key, roachpb.RKeyMin)
-		args := adminSplitArgs(key, key)
+		key := roachpb.Key(k)
+		repl := mtc.stores[0].LookupReplica(roachpb.RKey(key), roachpb.RKeyMin)
+		args := adminSplitArgs(key)
 		header := roachpb.Header{
 			RangeID: repl.RangeID,
 		}

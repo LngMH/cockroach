@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrew Bonventre (andybons@gmail.com)
 
 package server
 
@@ -26,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -181,7 +180,7 @@ func TestAcceptEncoding(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
-	client, err := s.GetHTTPClient()
+	client, err := s.GetAuthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +273,7 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	del := &roachpb.DeleteRangeRequest{
 		Span: roachpb.Span{
 			Key:    writes[0],
-			EndKey: roachpb.Key(writes[len(writes)-1]).Next(),
+			EndKey: writes[len(writes)-1].Next(),
 		},
 		ReturnKeys: true,
 	}
@@ -291,8 +290,8 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	}
 
 	scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next())
-	txn := roachpb.NewTransaction("MyTxn", nil, 0, 0, s.Clock().Now(), 0)
-	reply, err = client.SendWrappedWith(context.Background(), tds, roachpb.Header{Txn: txn}, scan)
+	txn := roachpb.MakeTransaction("MyTxn", nil, 0, 0, s.Clock().Now(), 0)
+	reply, err = client.SendWrappedWith(context.Background(), tds, roachpb.Header{Txn: &txn}, scan)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,8 +451,8 @@ func TestOfficializeAddr(t *testing.T) {
 				cfgAddr, lnAddr, expAddr string
 			}{
 				{"localhost:0", "127.0.0.1:1234", "localhost:1234"},
-				{"localhost:1234", "127.0.0.1:2345", "localhost:2345"},
-				{":1234", net.JoinHostPort(addrs[0], "2345"), net.JoinHostPort(host, "2345")},
+				{"localhost:1234", "127.0.0.1:2345", "localhost:1234"},
+				{":1234", net.JoinHostPort(addrs[0], "2345"), net.JoinHostPort(host, "1234")},
 				{":0", net.JoinHostPort(addrs[0], "2345"), net.JoinHostPort(host, "2345")},
 			} {
 				t.Run(tc.cfgAddr, func(t *testing.T) {
@@ -535,6 +534,57 @@ func TestListenURLFileCreation(t *testing.T) {
 		t.Fatalf("expected URL %s to match host %s", u, s.ServingAddr())
 	}
 }
+func TestListenerFileCreation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	dir, cleanupFn := testutils.TempDir(t)
+	defer cleanupFn()
+
+	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+		StoreSpecs: []base.StoreSpec{{
+			Path: dir,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stopper().Stop(context.TODO())
+
+	files, err := filepath.Glob(filepath.Join(dir, "cockroach.*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	li := listenerInfo{
+		advertise: s.ServingAddr(),
+		http:      s.HTTPAddr(),
+		listen:    s.Addr(),
+	}
+	expectedFiles := li.Iter()
+
+	for _, file := range files {
+		base := filepath.Base(file)
+		expVal, ok := expectedFiles[base]
+		if !ok {
+			t.Fatalf("unexpected file %s", file)
+		}
+		delete(expectedFiles, base)
+
+		data, err := ioutil.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := string(data)
+
+		if addr != expVal {
+			t.Fatalf("expected %s %s to match host %s", base, addr, expVal)
+		}
+	}
+
+	for f := range expectedFiles {
+		t.Errorf("never saw expected file %s", f)
+	}
+}
 
 func TestHeartbeatCallbackForDecommissioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -563,7 +613,9 @@ func TestHeartbeatCallbackForDecommissioning(t *testing.T) {
 		}
 		break
 	}
-	nodeLiveness.SetDecommissioning(context.Background(), ts.nodeIDContainer.Get(), true)
+	if _, err := nodeLiveness.SetDecommissioning(context.Background(), ts.nodeIDContainer.Get(), true); err != nil {
+		t.Fatal(err)
+	}
 
 	// Node should realize it is decommissioning after next heartbeat update.
 	testutils.SucceedsSoon(t, func() error {

@@ -11,17 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Vivek Menezes (vivek@cockroachlabs.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package parser
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 )
 
 // IsolationLevel holds the isolation level for a transaction.
@@ -118,22 +116,28 @@ func (node *TransactionModes) Format(buf *bytes.Buffer, f FmtFlags) {
 	}
 }
 
+var (
+	errIsolationLevelSpecifiedMultipleTimes = pgerror.NewError(pgerror.CodeSyntaxError, "isolation level specified multiple times")
+	errUserPrioritySpecifiedMultipleTimes   = pgerror.NewError(pgerror.CodeSyntaxError, "user priority specified multiple times")
+	errReadModeSpecifiedMultipleTimes       = pgerror.NewError(pgerror.CodeSyntaxError, "read mode specified multiple times")
+)
+
 func (node *TransactionModes) merge(other TransactionModes) error {
 	if other.Isolation != UnspecifiedIsolation {
 		if node.Isolation != UnspecifiedIsolation {
-			return errors.New("isolation level specified multiple times")
+			return errIsolationLevelSpecifiedMultipleTimes
 		}
 		node.Isolation = other.Isolation
 	}
 	if other.UserPriority != UnspecifiedUserPriority {
 		if node.UserPriority != UnspecifiedUserPriority {
-			return errors.New("user priority specified multiple times")
+			return errUserPrioritySpecifiedMultipleTimes
 		}
 		node.UserPriority = other.UserPriority
 	}
 	if other.ReadWriteMode != UnspecifiedReadWriteMode {
 		if node.ReadWriteMode != UnspecifiedReadWriteMode {
-			return errors.New("read mode specified multiple times")
+			return errReadModeSpecifiedMultipleTimes
 		}
 		node.ReadWriteMode = other.ReadWriteMode
 	}
@@ -177,7 +181,7 @@ const RestartSavepointName string = "COCKROACH_RESTART"
 // appends sequence numbers to the savepoint name specified by the user.
 func ValidateRestartCheckpoint(savepoint string) error {
 	if !strings.HasPrefix(strings.ToUpper(savepoint), RestartSavepointName) {
-		return fmt.Errorf("SAVEPOINT not supported except for %s", RestartSavepointName)
+		return pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "SAVEPOINT not supported except for %s", RestartSavepointName)
 	}
 	return nil
 }

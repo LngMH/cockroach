@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@cockroachlabs.com)
 
 package cli
 
@@ -22,8 +20,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/net/context"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/pkg/errors"
@@ -63,9 +65,35 @@ func runDump(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// TODO(knz/mjibson): dump foreign key constraints and dump in
-	// topological order to ensure key relationships can be verified
-	// during load.
+	byID := make(map[int64]tableMetadata)
+	for _, md := range mds {
+		byID[md.ID] = md
+	}
+
+	// First sort by name to guarantee stable output.
+	sort.Slice(mds, func(i, j int) bool {
+		return mds[i].name.String() < mds[j].name.String()
+	})
+
+	// Collect transitive dependencies in topological order into collected.
+	var collected []int64
+	seen := make(map[int64]bool)
+	for _, md := range mds {
+		collect(md.ID, byID, seen, &collected)
+	}
+	// collectOrder maps a table ID to its collection index. This is needed
+	// instead of just using range over collected because collected may contain
+	// table IDs not present in the dump spec. It is simpler to sort mds correctly
+	// to skip over these referenced-but-not-dumped tables.
+	collectOrder := make(map[int64]int)
+	for i, id := range collected {
+		collectOrder[id] = i
+	}
+
+	// Second sort dumped tables by dependency order.
+	sort.SliceStable(mds, func(i, j int) bool {
+		return collectOrder[mds[i].ID] < collectOrder[mds[j].ID]
+	})
 
 	w := os.Stdout
 
@@ -81,6 +109,9 @@ func runDump(cmd *cobra.Command, args []string) error {
 	}
 	if dumpCtx.dumpMode != dumpSchemaOnly {
 		for _, md := range mds {
+			if md.isView {
+				continue
+			}
 			if err := dumpTableData(w, conn, ts, md); err != nil {
 				return err
 			}
@@ -89,15 +120,29 @@ func runDump(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func collect(tid int64, byID map[int64]tableMetadata, seen map[int64]bool, collected *[]int64) {
+	// has this table already been collected previously?
+	if seen[tid] {
+		return
+	}
+	// no: add it
+	for _, dep := range byID[tid].dependsOn {
+		// depth-first collection of dependencies
+		collect(dep, byID, seen, collected)
+	}
+	*collected = append(*collected, tid)
+	seen[tid] = true
+}
+
 // tableMetadata describes one table to dump.
 type tableMetadata struct {
-	name         *parser.TableName
-	primaryIndex string
-	numIndexCols int
-	idxColNames  string
-	columnNames  string
-	columnTypes  map[string]string
-	createStmt   string
+	ID          int64
+	name        *parser.TableName
+	columnNames string
+	columnTypes map[string]string
+	createStmt  string
+	dependsOn   []int64
+	isView      bool
 }
 
 // getDumpMetadata retrieves the table information for the specified table(s).
@@ -176,6 +221,24 @@ func getTableNames(conn *sqlConn, dbName string, ts string) (tableNames []string
 func getMetadataForTable(
 	conn *sqlConn, dbName, tableName string, ts string,
 ) (tableMetadata, error) {
+	name := &parser.TableName{DatabaseName: parser.Name(dbName), TableName: parser.Name(tableName)}
+
+	// Fetch table ID.
+	vals, err := conn.QueryRow(fmt.Sprintf(`
+		SELECT table_id
+		FROM %s.crdb_internal.tables
+		AS OF SYSTEM TIME '%s'
+		WHERE DATABASE_NAME = $1
+			AND NAME = $2
+		`, parser.Name(dbName).String(), ts), []driver.Value{dbName, tableName})
+	if err != nil {
+		if err == io.EOF {
+			return tableMetadata{}, errors.Errorf("relation %s does not exist", name)
+		}
+		return tableMetadata{}, err
+	}
+	tableID := vals[0].(int64)
+
 	// Fetch column types.
 	rows, err := conn.Query(fmt.Sprintf(`
 		SELECT COLUMN_NAME, DATA_TYPE
@@ -187,7 +250,7 @@ func getMetadataForTable(
 	if err != nil {
 		return tableMetadata{}, err
 	}
-	vals := make([]driver.Value, 2)
+	vals = make([]driver.Value, 2)
 	coltypes := make(map[string]string)
 	var colnames bytes.Buffer
 	for {
@@ -215,87 +278,52 @@ func getMetadataForTable(
 		return tableMetadata{}, err
 	}
 
-	// Fetch the primary index name.
 	vals, err = conn.QueryRow(fmt.Sprintf(`
-		SELECT CONSTRAINT_NAME
-		FROM "".information_schema.table_constraints
+		SELECT create_statement, descriptor_type = 'view'
+		FROM %s.crdb_internal.create_statements
 		AS OF SYSTEM TIME '%s'
-		WHERE TABLE_SCHEMA = $1
-			AND TABLE_NAME = $2
-			AND CONSTRAINT_TYPE='PRIMARY KEY'
-		`, ts), []driver.Value{dbName, tableName})
-
-	var primaryIndex string
-
+		WHERE descriptor_name = $1
+			AND database_name = $2
+		`, parser.Name(dbName).String(), ts), []driver.Value{tableName, dbName})
 	if err != nil {
-		// If the above query returns no rows, err will be set to io.EOF.
-		// This indicates that there is no visible primary index in the table.
-		if err != io.EOF {
-			return tableMetadata{}, err
-		}
-	} else {
-		primaryIndex = vals[0].(string)
+		return tableMetadata{}, err
 	}
+	create := vals[0].(string)
+	descType := vals[1].(bool)
 
 	rows, err = conn.Query(fmt.Sprintf(`
-		SELECT COLUMN_NAME
-		FROM "".information_schema.key_column_usage
+		SELECT dependson_id
+		FROM %s.crdb_internal.backward_dependencies
 		AS OF SYSTEM TIME '%s'
-		WHERE TABLE_SCHEMA = $1
-			AND TABLE_NAME = $2
-			AND CONSTRAINT_NAME = $3
-		ORDER BY ORDINAL_POSITION
-		`, ts), []driver.Value{dbName, tableName, primaryIndex})
+		WHERE descriptor_id = $1
+		`, parser.Name(dbName).String(), ts), []driver.Value{tableID})
 	if err != nil {
 		return tableMetadata{}, err
 	}
 	vals = make([]driver.Value, 1)
 
-	var numIndexCols int
-	var idxColNames bytes.Buffer
-	// Find the primary index columns.
+	var refs []int64
 	for {
 		if err := rows.Next(vals); err == io.EOF {
 			break
 		} else if err != nil {
 			return tableMetadata{}, err
 		}
-		name := vals[0].(string)
-		if idxColNames.Len() > 0 {
-			idxColNames.WriteString(", ")
-		}
-		parser.FormatNode(&idxColNames, parser.FmtSimple, parser.Name(name))
-		numIndexCols++
+		id := vals[0].(int64)
+		refs = append(refs, id)
 	}
 	if err := rows.Close(); err != nil {
 		return tableMetadata{}, err
 	}
 
-	name := &parser.TableName{DatabaseName: parser.Name(dbName), TableName: parser.Name(tableName)}
-
-	vals, err = conn.QueryRow(fmt.Sprintf(`
-		SELECT CREATE_TABLE
-		FROM "".crdb_internal.tables
-		AS OF SYSTEM TIME '%s'
-		WHERE NAME = $1
-			AND DATABASE_NAME = $2
-		`, ts), []driver.Value{tableName, dbName})
-	if err != nil {
-		if err == io.EOF {
-			return tableMetadata{}, errors.Errorf("table %s.%s does not exist", dbName, tableName)
-		}
-		return tableMetadata{}, err
-	}
-	create := vals[0].(string)
-
 	return tableMetadata{
-		name:         name,
-		primaryIndex: primaryIndex,
-		numIndexCols: numIndexCols,
-		idxColNames:  idxColNames.String(),
-		columnNames:  colnames.String(),
-		columnTypes:  coltypes,
-		createStmt:   create,
+		ID:          tableID,
+		name:        name,
+		columnNames: colnames.String(),
+		columnTypes: coltypes,
+		createStmt:  create,
+		dependsOn:   refs,
+		isView:      descType,
 	}, nil
 }
 
@@ -311,99 +339,123 @@ func dumpCreateTable(w io.Writer, md tableMetadata) error {
 }
 
 const (
-	// limit is the number of rows to dump at a time (in each SELECT statement).
-	limit = 10000
 	// insertRows is the number of rows per INSERT statement.
 	insertRows = 100
 )
 
 // dumpTableData dumps the data of the specified table to w.
 func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, md tableMetadata) error {
-	// Build the SELECT query.
-	var sbuf bytes.Buffer
-	if md.idxColNames == "" {
-		// TODO(mjibson): remove hard coded rowid. Maybe create a crdb_internal
-		// table with the information we need instead.
-		md.idxColNames = "rowid"
-		md.numIndexCols = 1
+	bs := fmt.Sprintf("SELECT * FROM %s AS OF SYSTEM TIME '%s' ORDER BY PRIMARY KEY %[1]s",
+		md.name,
+		clusterTS,
+	)
+	inserts := make([]string, 0, insertRows)
+	rows, err := conn.Query(bs, nil)
+	if err != nil {
+		return err
 	}
-	fmt.Fprintf(&sbuf, "SELECT %s, %s FROM %s", md.idxColNames, md.columnNames, md.name)
-	if md.primaryIndex != "" {
-		fmt.Fprintf(&sbuf, "@%s", parser.Name(md.primaryIndex))
+	cols := rows.Columns()
+	// Make 2 []driver.Values and alternate sending them on the chan. This is
+	// needed so val encoding can proceed at the same time as fetching a new
+	// row. There's no benefit to having more than 2 because that's all we can
+	// encode at once if we want to preserve the select order.
+	var valArray [2][]driver.Value
+	for i := range valArray {
+		valArray[i] = make([]driver.Value, len(cols))
 	}
-	fmt.Fprintf(&sbuf, " AS OF SYSTEM TIME '%s'", clusterTS)
+	g, ctx := errgroup.WithContext(context.Background())
+	done := ctx.Done()
+	valsCh := make(chan []driver.Value)
+	// stringsCh receives VALUES lines and batches them before writing to the
+	// output. Buffering this chan allows the val encoding to proceed during
+	// writes.
+	stringsCh := make(chan string, insertRows)
 
-	var wbuf bytes.Buffer
-	fmt.Fprintf(&wbuf, " WHERE ROW (%s) > ROW (", md.idxColNames)
-	for i := 0; i < md.numIndexCols; i++ {
-		if i > 0 {
-			wbuf.WriteString(", ")
-		}
-		fmt.Fprintf(&wbuf, "$%d", i+1)
-	}
-	wbuf.WriteString(")")
-	// No WHERE clause first time, so add a place to inject it.
-	fmt.Fprintf(&sbuf, "%%s ORDER BY %s LIMIT %d", md.idxColNames, limit)
-	bs := sbuf.String()
-
-	// pk holds the last values of the fetched primary keys
-	var pk []driver.Value
-	q := fmt.Sprintf(bs, "")
-	inserts := make([][]string, 0, insertRows)
-	for {
-		rows, err := conn.Query(q, pk)
-		if err != nil {
-			return err
-		}
-		cols := rows.Columns()
-		pkcols := cols[:md.numIndexCols]
-		cols = cols[md.numIndexCols:]
-		i := 0
-		for {
-			vals := make([]driver.Value, len(cols)+len(pkcols))
+	g.Go(func() error {
+		// Fetch SQL rows and put them onto valsCh.
+		defer close(valsCh)
+		for i := 0; ; i++ {
+			vals := valArray[i%len(valArray)]
 			if err := rows.Next(vals); err == io.EOF {
-				break
+				return rows.Close()
 			} else if err != nil {
 				return err
 			}
-			if pk == nil {
-				q = fmt.Sprintf(bs, wbuf.String())
+			select {
+			case <-done:
+				return ctx.Err()
+			case valsCh <- vals:
 			}
-			pk = vals[:md.numIndexCols]
-			vals = vals[md.numIndexCols:]
-			ivals := make([]string, len(vals))
+		}
+	})
+	g.Go(func() error {
+		// Convert SQL rows into VALUE strings.
+		defer close(stringsCh)
+		var ivals bytes.Buffer
+		for vals := range valsCh {
+			ivals.Reset()
 			// Values need to be correctly encoded for INSERT statements in a text file.
 			for si, sv := range vals {
+				if si > 0 {
+					ivals.WriteString(", ")
+				}
+				var d parser.Datum
 				switch t := sv.(type) {
 				case nil:
-					ivals[si] = "NULL"
+					d = parser.DNull
 				case bool:
-					ivals[si] = parser.MakeDBool(parser.DBool(t)).String()
+					d = parser.MakeDBool(parser.DBool(t))
 				case int64:
-					ivals[si] = parser.NewDInt(parser.DInt(t)).String()
+					d = parser.NewDInt(parser.DInt(t))
 				case float64:
-					ivals[si] = parser.NewDFloat(parser.DFloat(t)).String()
+					d = parser.NewDFloat(parser.DFloat(t))
 				case string:
-					ivals[si] = parser.NewDString(t).String()
+					d = parser.NewDString(t)
 				case []byte:
 					switch ct := md.columnTypes[cols[si]]; ct {
 					case "INTERVAL":
-						ivals[si] = fmt.Sprintf("'%s'", t)
+						d, err = parser.ParseDInterval(string(t))
+						if err != nil {
+							return err
+						}
 					case "BYTES":
-						ivals[si] = parser.NewDBytes(parser.DBytes(t)).String()
+						d = parser.NewDBytes(parser.DBytes(t))
+					case "UUID":
+						d, err = parser.ParseDUuidFromString(string(t))
+						if err != nil {
+							return err
+						}
+					case "INET":
+						d, err = parser.ParseDIPAddrFromINetString(string(t))
+						if err != nil {
+							return err
+						}
 					default:
 						// STRING and DECIMAL types can have optional length
 						// suffixes, so only examine the prefix of the type.
-						if strings.HasPrefix(md.columnTypes[cols[si]], "STRING") {
-							ivals[si] = parser.NewDString(string(t)).String()
+						// In addition, we can only observe ARRAY types by their [] suffix.
+						if strings.HasSuffix(md.columnTypes[cols[si]], "[]") {
+							typ := strings.TrimRight(md.columnTypes[cols[si]], "[]")
+							elemType, err := parser.StringToColType(typ)
+							if err != nil {
+								return err
+							}
+							d, err = parser.ParseDArrayFromString(parser.NewTestingEvalContext(), string(t), elemType)
+							if err != nil {
+								return err
+							}
+						} else if strings.HasPrefix(md.columnTypes[cols[si]], "STRING") {
+							d = parser.NewDString(string(t))
 						} else if strings.HasPrefix(md.columnTypes[cols[si]], "DECIMAL") {
-							ivals[si] = string(t)
+							d, err = parser.ParseDDecimal(string(t))
+							if err != nil {
+								return err
+							}
 						} else {
-							panic(errors.Errorf("unknown []byte type: %s, %v: %s", t, cols[si], md.columnTypes[cols[si]]))
+							return errors.Errorf("unknown []byte type: %s, %v: %s", t, cols[si], md.columnTypes[cols[si]])
 						}
 					}
 				case time.Time:
-					var d parser.Datum
 					ct := md.columnTypes[cols[si]]
 					switch ct {
 					case "DATE":
@@ -413,56 +465,46 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, md tableMetadat
 					case "TIMESTAMP WITH TIME ZONE":
 						d = parser.MakeDTimestampTZ(t, time.Nanosecond)
 					default:
-						panic(errors.Errorf("unknown timestamp type: %s, %v: %s", t, cols[si], md.columnTypes[cols[si]]))
+						return errors.Errorf("unknown timestamp type: %s, %v: %s", t, cols[si], md.columnTypes[cols[si]])
 					}
-					ivals[si] = d.String()
 				default:
-					panic(errors.Errorf("unknown field type: %T (%s)", t, cols[si]))
+					return errors.Errorf("unknown field type: %T (%s)", t, cols[si])
 				}
+				d.Format(&ivals, parser.FmtParsable)
 			}
-			inserts = append(inserts, ivals)
-			i++
+			select {
+			case <-done:
+				return ctx.Err()
+			case stringsCh <- ivals.String():
+			}
+		}
+		return nil
+	})
+	g.Go(func() error {
+		// Batch SQL strings into groups and write to output.
+		for s := range stringsCh {
+			inserts = append(inserts, s)
 			if len(inserts) == cap(inserts) {
 				writeInserts(w, md, inserts)
 				inserts = inserts[:0]
 			}
 		}
-		for si, sv := range pk {
-			b, ok := sv.([]byte)
-			if ok && strings.HasPrefix(md.columnTypes[pkcols[si]], "STRING") {
-				// Primary key strings need to be converted to a go string, but not SQL
-				// encoded since they aren't being written to a text file.
-				pk[si] = string(b)
-			}
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
 		if len(inserts) != 0 {
 			writeInserts(w, md, inserts)
 			inserts = inserts[:0]
 		}
-		if i < limit {
-			break
-		}
-	}
-	return nil
+		return nil
+	})
+	return g.Wait()
 }
 
-func writeInserts(w io.Writer, md tableMetadata, inserts [][]string) {
+func writeInserts(w io.Writer, md tableMetadata, inserts []string) {
 	fmt.Fprintf(w, "\nINSERT INTO %s (%s) VALUES", md.name.TableName, md.columnNames)
 	for idx, values := range inserts {
 		if idx > 0 {
 			fmt.Fprint(w, ",")
 		}
-		fmt.Fprint(w, "\n\t(")
-		for vi, v := range values {
-			if vi > 0 {
-				fmt.Fprint(w, ", ")
-			}
-			fmt.Fprint(w, v)
-		}
-		fmt.Fprint(w, ")")
+		fmt.Fprintf(w, "\n\t(%s)", values)
 	}
 	fmt.Fprintln(w, ";")
 }

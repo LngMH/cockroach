@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
@@ -158,7 +156,7 @@ type explainDistSQLNode struct {
 	optColumnsSlot
 
 	plan           planNode
-	distSQLPlanner *distSQLPlanner
+	distSQLPlanner *DistSQLPlanner
 
 	// txn is the current transaction (used for the fake span resolver).
 	txn *client.Txn
@@ -170,15 +168,17 @@ type explainDistSQLNode struct {
 	done bool
 }
 
-func (*explainDistSQLNode) Close(context.Context) {}
+func (n *explainDistSQLNode) Close(ctx context.Context) {
+	n.plan.Close(ctx)
+}
 
 var explainDistSQLColumns = sqlbase.ResultColumns{
 	{Name: "Automatic", Typ: parser.TypeBool},
 	{Name: "URL", Typ: parser.TypeString},
-	{Name: "JSON", Typ: parser.TypeString},
+	{Name: "JSON", Typ: parser.TypeString, Hidden: true},
 }
 
-func (n *explainDistSQLNode) Start(ctx context.Context) error {
+func (n *explainDistSQLNode) Start(params runParams) error {
 	// Trigger limit propagation.
 	setUnlimited(n.plan)
 
@@ -187,13 +187,13 @@ func (n *explainDistSQLNode) Start(ctx context.Context) error {
 		return err
 	}
 
-	planCtx := n.distSQLPlanner.NewPlanningCtx(ctx, n.txn)
+	planCtx := n.distSQLPlanner.newPlanningCtx(params.ctx, n.txn)
 	plan, err := n.distSQLPlanner.createPlanForNode(&planCtx, n.plan)
 	if err != nil {
 		return err
 	}
 	n.distSQLPlanner.FinalizePlan(&planCtx, &plan)
-	flows := plan.GenerateFlowSpecs()
+	flows := plan.GenerateFlowSpecs(params.p.evalCtx.NodeID)
 	planJSON, planURL, err := distsqlrun.GeneratePlanDiagramWithURL(flows)
 	if err != nil {
 		return err
@@ -207,7 +207,7 @@ func (n *explainDistSQLNode) Start(ctx context.Context) error {
 	return nil
 }
 
-func (n *explainDistSQLNode) Next(context.Context) (bool, error) {
+func (n *explainDistSQLNode) Next(runParams) (bool, error) {
 	if n.done {
 		return false, nil
 	}

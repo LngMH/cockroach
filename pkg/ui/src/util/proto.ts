@@ -48,6 +48,7 @@ export namespace MetricConstants {
   export const liveBytes: string = "livebytes";
   export const keyBytes: string = "keybytes";
   export const valBytes: string = "valbytes";
+  export const totalBytes: string = "totalbytes";
   export const intentBytes: string = "intentbytes";
   export const liveCount: string = "livecount";
   export const keyCount: string = "keycount";
@@ -58,6 +59,7 @@ export namespace MetricConstants {
   export const lastUpdateNano: string = "lastupdatenanos";
   export const capacity: string = "capacity";
   export const availableCapacity: string = "capacity.available";
+  export const usedCapacity: string = "capacity.used";
   export const sysBytes: string = "sysbytes";
   export const sysCount: string = "syscount";
 
@@ -87,6 +89,10 @@ const aggregateByteKeys = [
 ];
 
 export function BytesUsed(s: NodeStatus$Properties): number {
+  const usedCapacity = s.metrics[MetricConstants.usedCapacity];
+  if (usedCapacity !== 0) {
+    return usedCapacity;
+  }
   return _.sumBy(aggregateByteKeys, (key: string) => {
     return s.metrics[key];
   });

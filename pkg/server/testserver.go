@@ -11,14 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package server
 
 import (
 	"fmt"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -30,18 +31,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/migrations"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
+	migrations "github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
@@ -58,14 +62,15 @@ const (
 // makeTestConfig returns a config for testing. It overrides the
 // Certs with the test certs directory.
 // We need to override the certs loader.
-func makeTestConfig() Config {
-	cfg := MakeConfig()
+func makeTestConfig(st *cluster.Settings) Config {
+	cfg := MakeConfig(context.TODO(), st)
 
 	// Test servers start in secure mode by default.
 	cfg.Insecure = false
 
-	// Override the DistSQL local store with an in-memory store.
-	cfg.TempStore = base.DefaultTestStoreSpec
+	// Configure the default in-memory temp storage for all tests unless
+	// otherwise configured.
+	cfg.TempStorageConfig = base.DefaultTestTempStorageConfig()
 
 	// Load test certs. In addition, the tests requiring certs
 	// need to call security.SetAssetLoader(securitytest.EmbeddedAssets)
@@ -85,13 +90,27 @@ func makeTestConfig() Config {
 	cfg.User = security.NodeUser
 	cfg.MetricsSampleInterval = metric.TestSampleInterval
 
+	// Enable web session authentication.
+	cfg.EnableWebSessionAuthentication = true
+
 	return cfg
 }
 
 // makeTestConfigFromParams creates a Config from a TestServerParams.
 func makeTestConfigFromParams(params base.TestServerArgs) Config {
-	cfg := makeTestConfig()
+	st := params.Settings
+	if params.Settings == nil {
+		st = cluster.MakeClusterSettings(cluster.BinaryMinimumSupportedVersion, cluster.BinaryServerVersion)
+	}
+	cfg := makeTestConfig(st)
 	cfg.TestingKnobs = params.Knobs
+	cfg.RaftConfig = params.RaftConfig
+	cfg.RaftConfig.SetDefaults()
+	if params.LeaseManagerConfig != nil {
+		cfg.LeaseManagerConfig = params.LeaseManagerConfig
+	} else {
+		cfg.LeaseManagerConfig = base.NewLeaseManagerConfig()
+	}
 	if params.JoinAddr != "" {
 		cfg.JoinList = []string{params.JoinAddr}
 	}
@@ -100,12 +119,6 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	cfg.RetryOptions = params.RetryOptions
 	if params.MetricsSampleInterval != 0 {
 		cfg.MetricsSampleInterval = params.MetricsSampleInterval
-	}
-	if params.RaftTickInterval != 0 {
-		cfg.RaftTickInterval = params.RaftTickInterval
-	}
-	if params.RaftElectionTimeoutTicks != 0 {
-		cfg.RaftElectionTimeoutTicks = params.RaftElectionTimeoutTicks
 	}
 	if knobs := params.Knobs.Store; knobs != nil {
 		if mo := knobs.(*storage.StoreTestingKnobs).MaxOffset; mo != 0 {
@@ -129,12 +142,6 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	}
 	if params.SQLMemoryPoolSize != 0 {
 		cfg.SQLMemoryPoolSize = params.SQLMemoryPoolSize
-	}
-	if params.SendNextTimeout != 0 {
-		cfg.SendNextTimeout = params.SendNextTimeout
-	}
-	if params.PendingRPCTimeout != 0 {
-		cfg.PendingRPCTimeout = params.PendingRPCTimeout
 	}
 	cfg.JoinList = []string{params.JoinAddr}
 	if cfg.Insecure {
@@ -160,6 +167,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.ListeningURLFile != "" {
 		cfg.ListeningURLFile = params.ListeningURLFile
 	}
+	if params.DisableWebSessionAuthentication {
+		cfg.EnableWebSessionAuthentication = false
+	}
 
 	// Ensure we have the correct number of engines. Add in-memory ones where
 	// needed. There must be at least one store/engine.
@@ -179,8 +189,11 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		// the dir (and the test is then responsible for cleaning it up, not
 		// TestServer).
 	}
-	// Copy over the store specs.
 	cfg.Stores = base.StoreSpecList{Specs: params.StoreSpecs}
+	if params.TempStorageConfig != (base.TempStorageConfig{}) {
+		cfg.TempStorageConfig = params.TempStorageConfig
+	}
+
 	if cfg.TestingKnobs.Store == nil {
 		cfg.TestingKnobs.Store = &storage.StoreTestingKnobs{}
 	}
@@ -206,6 +219,13 @@ type TestServer struct {
 	Cfg *Config
 	// server is the embedded Cockroach server struct.
 	*Server
+	// authClient is an http.Client that has been authenticated to access the
+	// Admin UI.
+	authClient struct {
+		httpClient http.Client
+		once       sync.Once
+		err        error
+	}
 }
 
 // Stopper returns the embedded server's Stopper.
@@ -225,6 +245,14 @@ func (ts *TestServer) Gossip() *gossip.Gossip {
 func (ts *TestServer) Clock() *hlc.Clock {
 	if ts != nil {
 		return ts.clock
+	}
+	return nil
+}
+
+// JobRegistry returns the *jobs.Registry as an interface{}.
+func (ts *TestServer) JobRegistry() interface{} {
+	if ts != nil {
+		return ts.jobRegistry
 	}
 	return nil
 }
@@ -357,7 +385,7 @@ func WaitForInitialSplits(db *client.DB) error {
 	if err != nil {
 		return err
 	}
-	return util.RetryForDuration(initialSplitsTimeout, func() error {
+	return retry.ForDuration(initialSplitsTimeout, func() error {
 		// Scan all keys in the Meta2Prefix; we only need a count.
 		rows, err := db.Scan(context.TODO(), keys.Meta2Prefix, keys.MetaMax, 0)
 		if err != nil {
@@ -380,6 +408,11 @@ func (ts *TestServer) GetStores() interface{} {
 	return ts.node.stores
 }
 
+// ClusterSettings returns the ClusterSettings.
+func (ts *TestServer) ClusterSettings() *cluster.Settings {
+	return ts.Cfg.Settings
+}
+
 // Engines returns the TestServer's engines.
 func (ts *TestServer) Engines() []engine.Engine {
 	return ts.engines
@@ -390,6 +423,16 @@ func (ts *TestServer) ServingAddr() string {
 	return ts.cfg.AdvertiseAddr
 }
 
+// HTTPAddr returns the server's HTTP address. Should be used by clients.
+func (ts *TestServer) HTTPAddr() string {
+	return ts.cfg.HTTPAddr
+}
+
+// Addr returns the server's listening address.
+func (ts *TestServer) Addr() string {
+	return ts.cfg.Addr
+}
+
 // WriteSummaries implements TestServerInterface.
 func (ts *TestServer) WriteSummaries() error {
 	return ts.node.writeSummaries(context.TODO())
@@ -397,12 +440,53 @@ func (ts *TestServer) WriteSummaries() error {
 
 // AdminURL implements TestServerInterface.
 func (ts *TestServer) AdminURL() string {
-	return ts.Cfg.AdminURL()
+	return ts.Cfg.AdminURL().String()
 }
 
 // GetHTTPClient implements TestServerInterface.
 func (ts *TestServer) GetHTTPClient() (http.Client, error) {
 	return ts.Cfg.GetHTTPClient()
+}
+
+// GetAuthenticatedHTTPClient implements TestServerInterface.
+func (ts *TestServer) GetAuthenticatedHTTPClient() (http.Client, error) {
+	ts.authClient.once.Do(func() {
+		// Create an authentication session for an arbitrary user. We do not
+		// currently have an authorization mechanism, so a specific user is not
+		// necessary.
+		ts.authClient.err = func() error {
+			id, secret, err := ts.authentication.newAuthSession(context.TODO(), "authentic_user")
+			if err != nil {
+				return err
+			}
+			// Encode a session cookie and store it in a cookie jar.
+			cookie, err := encodeSessionCookie(&serverpb.SessionCookie{
+				ID:     id,
+				Secret: secret,
+			})
+			if err != nil {
+				return err
+			}
+			cookieJar, err := cookiejar.New(nil)
+			if err != nil {
+				return err
+			}
+			url, err := url.Parse(ts.AdminURL())
+			if err != nil {
+				return err
+			}
+			cookieJar.SetCookies(url, []*http.Cookie{cookie})
+			// Create an httpClient and attach the cookie jar to the client.
+			ts.authClient.httpClient, err = ts.Cfg.GetHTTPClient()
+			if err != nil {
+				return err
+			}
+			ts.authClient.httpClient.Jar = cookieJar
+			return nil
+		}()
+	})
+
+	return ts.authClient.httpClient, ts.authClient.err
 }
 
 // MustGetSQLCounter implements TestServerInterface.
@@ -452,6 +536,11 @@ func (ts *TestServer) LeaseManager() interface{} {
 	return ts.leaseMgr
 }
 
+// Executor is part of TestServerInterface.
+func (ts *TestServer) Executor() interface{} {
+	return ts.sqlExecutor
+}
+
 // GetNode exposes the Server's Node.
 func (ts *TestServer) GetNode() *Node {
 	return ts.node
@@ -489,18 +578,13 @@ func (ts *TestServer) GetFirstStoreID() roachpb.StoreID {
 
 // LookupRange returns the descriptor of the range containing key.
 func (ts *TestServer) LookupRange(key roachpb.Key) (roachpb.RangeDescriptor, error) {
-	rangeLookupReq := roachpb.RangeLookupRequest{
-		Span: roachpb.Span{
-			Key: keys.RangeMetaKey(keys.MustAddr(key)),
-		},
-		MaxRanges: 1,
-	}
-	resp, pErr := client.SendWrapped(context.Background(), ts.DistSender(), &rangeLookupReq)
-	if pErr != nil {
+	rs, _, err := client.RangeLookupForVersion(context.Background(), ts.ClusterSettings(),
+		ts.DistSender(), key, roachpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
+	if err != nil {
 		return roachpb.RangeDescriptor{}, errors.Errorf(
-			"%q: lookup range unexpected error: %s", key, pErr)
+			"%q: lookup range unexpected error: %s", key, err)
 	}
-	return resp.(*roachpb.RangeLookupResponse).Ranges[0], nil
+	return rs[0], nil
 }
 
 // SplitRange splits the range containing splitKey.
@@ -568,7 +652,7 @@ func (ts *TestServer) SplitRange(
 			return desc, err
 		}
 
-		rightRangeDesc, err = scanMeta(splitRKey, false /* !reverse */)
+		rightRangeDesc, err = scanMeta(splitRKey, false /* reverse */)
 		if err != nil {
 			wrappedMsg = "could not look up right-hand side descriptor"
 			return err

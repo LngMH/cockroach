@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
 
 package sql
 
@@ -26,7 +25,7 @@ var noColumns = make(sqlbase.ResultColumns, 0)
 //
 // The length of the returned slice is guaranteed to be equal to the
 // length of the tuple returned by the planNode's Values() method
-// during local exeecution.
+// during local execution.
 //
 // The returned slice is *not* mutable. To modify the result column
 // set, implement a separate recursion (e.g. needed_columns.go) or use
@@ -80,12 +79,16 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 		return n.columns
 
 		// Nodes with a fixed schema.
+	case *scrubNode:
+		return n.getColumns(mut, scrubColumns)
 	case *explainDistSQLNode:
 		return n.getColumns(mut, explainDistSQLColumns)
 	case *testingRelocateNode:
 		return n.getColumns(mut, relocateNodeColumns)
 	case *scatterNode:
 		return n.getColumns(mut, scatterNodeColumns)
+	case *showZoneConfigNode:
+		return n.getColumns(mut, showZoneConfigNodeColumns)
 	case *showRangesNode:
 		return n.getColumns(mut, showRangesColumns)
 	case *showFingerprintsNode:
@@ -112,8 +115,10 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 	case *limitNode:
 		return getPlanColumns(n.plan, mut)
 	case *unionNode:
+		if n.inverted {
+			return getPlanColumns(n.right, mut)
+		}
 		return getPlanColumns(n.left, mut)
-
 	}
 
 	// Every other node has no columns in their results.

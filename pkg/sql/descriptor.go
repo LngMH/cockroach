@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package sql
 
@@ -152,6 +150,10 @@ func (p *planner) createDescriptorWithID(
 		return expectDescriptor(systemConfig, descKey, descDesc)
 	})
 
+	if desc, ok := descriptor.(*sqlbase.TableDescriptor); ok {
+		p.session.tables.addUncommittedTable(*desc)
+	}
+
 	return p.txn.Run(ctx, b)
 }
 
@@ -175,7 +177,18 @@ func getDescriptor(
 		return false, nil
 	}
 
-	descKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(gr.ValueInt()))
+	return getDescriptorByID(ctx, txn, sqlbase.ID(gr.ValueInt()), descriptor)
+}
+
+// getDescriptorByID looks up the descriptor for `id`, validates it,
+// and unmarshals it into `descriptor`.
+//
+// In most cases you'll want to use wrappers: `getDatabaseDescByID` or
+// `getTableDescByID`.
+func getDescriptorByID(
+	ctx context.Context, txn *client.Txn, id sqlbase.ID, descriptor sqlbase.DescriptorProto,
+) (bool, error) {
+	descKey := sqlbase.MakeDescMetadataKey(id)
 	desc := &sqlbase.Descriptor{}
 	if err := txn.GetProto(ctx, descKey, desc); err != nil {
 		return false, err
@@ -185,7 +198,7 @@ func getDescriptor(
 	case *sqlbase.TableDescriptor:
 		table := desc.GetTable()
 		if table == nil {
-			return false, errors.Errorf("%q is not a table", plainKey.Name())
+			return false, errors.Errorf("%q is not a table", desc.String())
 		}
 		table.MaybeUpgradeFormatVersion()
 		// TODO(dan): Write the upgraded TableDescriptor back to kv. This will break
@@ -200,7 +213,7 @@ func getDescriptor(
 	case *sqlbase.DatabaseDescriptor:
 		database := desc.GetDatabase()
 		if database == nil {
-			return false, errors.Errorf("%q is not a database", plainKey.Name())
+			return false, errors.Errorf("%q is not a database", desc.String())
 		}
 		if err := database.Validate(); err != nil {
 			return false, err
@@ -269,7 +282,7 @@ func getDescriptorsFromTargetList(
 			return nil, err
 		}
 		for i := range tables {
-			descriptor, err := mustGetTableOrViewDesc(
+			descriptor, err := MustGetTableOrViewDesc(
 				ctx, txn, vt, &tables[i], true /*allowAdding*/)
 			if err != nil {
 				return nil, err

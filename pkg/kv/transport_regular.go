@@ -12,8 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Tobias Schottdorf
 
 // +build !race
 
@@ -24,7 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 )
 
-func grpcTransportFactory(
+// GRPCTransportFactory is the default TransportFactory, using GRPC.
+func GRPCTransportFactory(
 	opts SendOptions, rpcContext *rpc.Context, replicas ReplicaSlice, args roachpb.BatchRequest,
 ) (Transport, error) {
 	return grpcTransportFactoryImpl(opts, rpcContext, replicas, args)

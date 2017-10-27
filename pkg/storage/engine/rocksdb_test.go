@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package engine
 
@@ -29,7 +27,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -80,7 +80,7 @@ func TestBatchIterReadOwnWrite(t *testing.T) {
 		t.Fatal("uncommitted write seen by non-batch iter")
 	}
 
-	if err := b.Commit(false /* !sync */); err != nil {
+	if err := b.Commit(false /* sync */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -260,7 +260,10 @@ func openRocksDBWithVersion(t *testing.T, hasVersionFile bool, ver Version) erro
 	}
 
 	rocksdb, err := NewRocksDB(
-		RocksDBConfig{Dir: dir},
+		RocksDBConfig{
+			Settings: cluster.MakeTestingClusterSettings(),
+			Dir:      dir,
+		},
 		RocksDBCache{},
 	)
 	if err == nil {
@@ -369,7 +372,7 @@ func TestReadAmplification(t *testing.T) {
 func TestConcurrentBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	if testutils.Stress() {
+	if testutils.NightlyStress() || util.RaceEnabled {
 		t.Skip()
 	}
 
@@ -384,7 +387,10 @@ func TestConcurrentBatch(t *testing.T) {
 	}()
 
 	db, err := NewRocksDB(
-		RocksDBConfig{Dir: dir},
+		RocksDBConfig{
+			Settings: cluster.MakeTestingClusterSettings(),
+			Dir:      dir,
+		},
 		RocksDBCache{},
 	)
 	if err != nil {
@@ -414,7 +420,7 @@ func TestConcurrentBatch(t *testing.T) {
 	// Concurrently write all the batches.
 	for _, batch := range batches {
 		go func(batch Batch) {
-			errChan <- batch.Commit(false /* !sync */)
+			errChan <- batch.Commit(false /* sync */)
 		}(batch)
 	}
 
@@ -570,7 +576,10 @@ func TestRocksDBTimeBound(t *testing.T) {
 	defer dirCleanup()
 
 	rocksdb, err := NewRocksDB(
-		RocksDBConfig{Dir: dir},
+		RocksDBConfig{
+			Settings: cluster.MakeTestingClusterSettings(),
+			Dir:      dir,
+		},
 		RocksDBCache{},
 	)
 	if err != nil {
@@ -612,4 +621,65 @@ func TestRocksDBTimeBound(t *testing.T) {
 	if sst.TsMax == nil || *sst.TsMax != maxTimestamp {
 		t.Fatalf("got max %v expected %v", sst.TsMax, maxTimestamp)
 	}
+}
+
+// Regression test for https://github.com/facebook/rocksdb/issues/2752. Range
+// deletion tombstones between different snapshot stripes are not stored in
+// order, so the first tombstone of each snapshot stripe should be checked as a
+// smallest candidate.
+func TestRocksDBDeleteRangeBug(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	dir, dirCleanup := testutils.TempDir(t)
+	defer dirCleanup()
+
+	db, err := NewRocksDB(
+		RocksDBConfig{
+			Settings: cluster.MakeTestingClusterSettings(),
+			Dir:      dir,
+		},
+		RocksDBCache{},
+	)
+	if err != nil {
+		t.Fatalf("could not create new rocksdb db instance at %s: %v", dir, err)
+	}
+	defer db.Close()
+
+	key := func(s string) MVCCKey {
+		return MakeMVCCMetadataKey([]byte(s))
+	}
+	if err := db.Put(key("a"), []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	func() {
+		if err := db.ClearRange(key("b"), key("c")); err != nil {
+			t.Fatal(err)
+		}
+		// Hold a snapshot to separate these two delete ranges.
+		snap := db.NewSnapshot()
+		defer snap.Close()
+		if err := db.ClearRange(key("a"), key("b")); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	if err := db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	iter := db.NewIterator(false)
+	iter.Seek(key("a"))
+	if ok, _ := iter.Valid(); ok {
+		t.Fatalf("unexpected key: %s", iter.Key())
+	}
+	iter.Close()
 }

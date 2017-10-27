@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package sql_test
 
@@ -27,10 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/migrations"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -96,7 +94,7 @@ func TestDatabaseDescriptor(t *testing.T) {
 	if kvs, err := kvDB.Scan(ctx, start, start.PrefixEnd(), 0); err != nil {
 		t.Fatal(err)
 	} else {
-		migrationDescriptors, _, err := migrations.AdditionalInitialDescriptors(ctx, kvDB)
+		migrationDescriptors, _, err := sqlmigrations.AdditionalInitialDescriptors(ctx, kvDB)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -373,4 +371,64 @@ func TestParallelCreateConflictingTables(t *testing.T) {
 		1, /* expectedNumOfTables */
 		descIDStart,
 	)
+}
+
+// Test that the modification time on a table descriptor is initialized.
+func TestTableReadErrorsBeforeTableCreation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := createTestServerParams()
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.timestamp (k CHAR PRIMARY KEY, v CHAR);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []struct {
+		schema string
+	}{
+		{"CREATE TABLE t.kv0 (k CHAR PRIMARY KEY, v CHAR)"},
+		{"CREATE TABLE t.kv1 AS SELECT * FROM t.kv0"},
+		{"CREATE VIEW t.kv2 AS SELECT k, v FROM t.kv0"},
+	}
+
+	for i, testCase := range testCases {
+		tx, err := sqlDB.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Insert an entry so that the transaction is guaranteed to be
+		// assigned a timestamp.
+		if _, err := tx.Exec(fmt.Sprintf(`
+INSERT INTO t.timestamp VALUES ('%d', 'b');
+`, i)); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create schema and read data so that a table lease is acquired.
+		if _, err := sqlDB.Exec(testCase.schema); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := sqlDB.Exec(fmt.Sprintf(`
+SELECT * FROM t.kv%d
+`, i)); err != nil {
+			t.Fatal(err)
+		}
+
+		// This select should not see any data.
+		if _, err := tx.Query(fmt.Sprintf(
+			`SELECT * FROM t.kv%d`, i,
+		)); !testutils.IsError(err, fmt.Sprintf("id %d is not a table", 52+i)) {
+			t.Fatalf("err = %v", err)
+		}
+
+		if err := tx.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

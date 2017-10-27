@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package acceptance
 
@@ -30,38 +28,16 @@ func TestDockerNodeJS(t *testing.T) {
 	defer s.Close(t)
 
 	ctx := context.Background()
-	testDockerSuccess(ctx, t, "node.js", []string{"node", "-e", strings.Replace(nodeJS, "%v", "3", 1)})
-	testDockerFail(ctx, t, "node.js", []string{"node", "-e", strings.Replace(nodeJS, "%v", `'a'`, 1)})
+	testDockerSuccess(ctx, t, "node.js", []string{"/bin/sh", "-c", strings.Replace(nodeJS, "%v", "", 1)})
+	testDockerFail(ctx, t, "node.js", []string{"/bin/sh", "-c", strings.Replace(nodeJS, "%v", "fail", 1)})
 }
 
 const nodeJS = `
-const fs     = require('fs');
-const pg     = require('pg');
-const assert = require('assert');
+set -e
+cd /testdata/node
 
-const config = {
-  user: 'root',
-  ssl: {
-    cert: fs.readFileSync(process.env.PGSSLCERT),
-    key:  fs.readFileSync(process.env.PGSSLKEY),
-  }
-};
-
-const client = new pg.Client(config);
-
-client.connect(function (err) {
-  if (err) throw err;
-
-  client.query("SELECT 1 as first, 2+$1 as second", [%v], function (err, results) {
-    if (err) throw err;
-
-    assert.deepEqual(results.rows, [{
-      first: 1,
-      second: 5
-    }]);
-    client.end(function (err) {
-      if (err) throw err;
-    });
-  });
-});
+export SHOULD_FAIL=%v
+# Get access to globally installed node modules.
+export NODE_PATH=$NODE_PATH:/usr/lib/node_modules/
+mocha .
 `

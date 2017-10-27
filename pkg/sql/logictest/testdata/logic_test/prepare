@@ -77,7 +77,7 @@ EXECUTE a(3, 1)
 ----
 4
 
-query error incompatible type for EXECUTE parameter expression: int vs string
+query error could not parse "foo" as type int
 EXECUTE a('foo', 1)
 
 query error incompatible type for EXECUTE parameter expression: int vs decimal
@@ -108,7 +108,7 @@ EXECUTE b(3)
 ----
 3
 
-query error incompatible type for EXECUTE parameter expression: int vs string
+query error could not parse "foo" as type int
 EXECUTE b('foo')
 
 statement
@@ -149,7 +149,7 @@ EXECUTE i(2)
 ----
 3
 
-query error incompatible type for EXECUTE parameter expression: int vs string
+query error could not parse "foo" as type int
 EXECUTE i('foo')
 
 query error incompatible type for EXECUTE parameter expression: int vs decimal
@@ -245,3 +245,113 @@ PREPARE groupbyhaving AS SELECT min(1) FROM foo WHERE a = $1 GROUP BY a HAVING c
 query I
 EXECUTE groupbyhaving(1)
 ----
+
+# Mismatch between expected and hinted types should prepare, but potentially
+# fail to execute if the cast is not possible.
+statement
+PREPARE wrongTypePossibleCast(float) AS INSERT INTO foo VALUES ($1)
+
+statement
+EXECUTE wrongTypePossibleCast(2.3)
+
+statement
+PREPARE wrongTypeImpossibleCast(string) AS INSERT INTO foo VALUES ($1)
+
+statement
+EXECUTE wrongTypeImpossibleCast('3')
+
+statement error could not parse "crabgas" as type int
+EXECUTE wrongTypeImpossibleCast('crabgas')
+
+# Check statement compatibility
+
+statement ok
+PREPARE s AS SELECT a FROM t; PREPARE p1 AS UPSERT INTO t(a) VALUES($1) RETURNING a
+
+query I
+EXECUTE s
+----
+1
+2
+3
+
+query I
+EXECUTE p1(123)
+----
+123
+
+statement ok
+PREPARE p2 AS UPDATE t SET a = a + $1 RETURNING a
+
+query I
+EXECUTE s
+----
+1
+2
+3
+123
+
+query I
+EXECUTE p2(123)
+----
+124
+125
+126
+246
+
+statement ok
+PREPARE p3 AS DELETE FROM t WHERE a = $1 RETURNING a
+
+query I
+EXECUTE s
+----
+124
+125
+126
+246
+
+query I
+EXECUTE p3(124)
+----
+124
+
+statement ok
+PREPARE p4 AS CANCEL JOB $1
+
+query error pq: job with ID 123 does not exist
+EXECUTE p4(123)
+
+statement ok
+PREPARE p5 AS PAUSE JOB $1
+
+query error pq: job with ID 123 does not exist
+EXECUTE p5(123)
+
+statement ok
+PREPARE p6 AS RESUME JOB $1
+
+query error pq: job with ID 123 does not exist
+EXECUTE p6(123)
+
+# Ensure that SET / SET CLUSTER SETTING know about placeholders
+statement
+PREPARE setp(string) AS SET application_name = $1
+
+query T
+SET application_name = 'foo'; SHOW application_name
+----
+foo
+
+query T
+EXECUTE setp('hello'); SHOW application_name
+----
+hello
+
+# Note: we can't check the result of SET CLUSTER SETTING synchronously
+# because it doesn't propagate immediately.
+
+statement
+PREPARE sets(string) AS SET CLUSTER SETTING cluster.organization = $1
+
+statement
+EXECUTE sets('hello')

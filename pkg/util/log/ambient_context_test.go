@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde
 
 package log
 
@@ -49,7 +47,7 @@ func TestAnnotateCtxSpan(t *testing.T) {
 	tracer := tracing.NewTracer()
 	tracer.SetForceRealSpans(true)
 
-	ac := AmbientContext{}
+	ac := AmbientContext{Tracer: tracer}
 	ac.AddLogTag("ambient", nil)
 
 	// Annotate a context that has an open span.

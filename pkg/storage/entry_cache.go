@@ -12,17 +12,16 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Spencer Kimball (spencer@cockroachlabs.com)
 
 package storage
 
 import (
 	"github.com/biogo/store/llrb"
+	"github.com/coreos/etcd/raft/raftpb"
+
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/coreos/etcd/raft/raftpb"
 )
 
 type entryCacheKey struct {
@@ -175,16 +174,16 @@ func (rec *raftEntryCache) delEntries(rangeID roachpb.RangeID, lo, hi uint64) {
 	if lo >= hi {
 		return
 	}
-	var keys []*entryCacheKey
+	var cacheEnts []*cache.Entry
 	rec.fromKey = entryCacheKey{RangeID: rangeID, Index: lo}
 	rec.toKey = entryCacheKey{RangeID: rangeID, Index: hi}
-	rec.cache.DoRange(func(k, v interface{}) bool {
-		keys = append(keys, k.(*entryCacheKey))
+	rec.cache.DoRangeEntry(func(e *cache.Entry) bool {
+		cacheEnts = append(cacheEnts, e)
 		return false
 	}, &rec.fromKey, &rec.toKey)
 
-	for _, k := range keys {
-		rec.cache.Del(k)
+	for _, e := range cacheEnts {
+		rec.cache.DelEntry(e)
 	}
 }
 

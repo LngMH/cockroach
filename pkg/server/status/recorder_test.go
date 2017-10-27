@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt.r.tracy@gmail.com)
 
 package status
 
@@ -35,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // byTimeAndName is a slice of tspb.TimeSeriesData.
@@ -121,6 +120,7 @@ func TestMetricsRecorder(t *testing.T) {
 		Capacity: roachpb.StoreCapacity{
 			Capacity:  100,
 			Available: 50,
+			Used:      50,
 		},
 	}
 	storeDesc2 := roachpb.StoreDescriptor{
@@ -128,6 +128,7 @@ func TestMetricsRecorder(t *testing.T) {
 		Capacity: roachpb.StoreCapacity{
 			Capacity:  200,
 			Available: 75,
+			Used:      125,
 		},
 	}
 
@@ -156,7 +157,7 @@ func TestMetricsRecorder(t *testing.T) {
 	// as the test expects time to not advance too far which would age the actual
 	// data (e.g. in histogram's) unexpectedly.
 	defer metric.TestingSetNow(func() time.Time {
-		return time.Unix(0, manual.UnixNano()).UTC()
+		return timeutil.Unix(0, manual.UnixNano())
 	})()
 
 	// ========================================

@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package roachpb
 
@@ -24,10 +21,12 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/pkg/errors"
 )
 
 // NodeID is a custom type for a cockroach node ID. (not a raft node ID)
+// 0 is not a valid NodeID.
 type NodeID int32
 
 // String implements the fmt.Stringer interface.
@@ -109,9 +108,10 @@ func (r RangeDescriptor) ContainsKey(key RKey) bool {
 	return r.RSpan().ContainsKey(key)
 }
 
-// ContainsExclusiveEndKey returns whether this RangeDescriptor contains the specified end key.
-func (r RangeDescriptor) ContainsExclusiveEndKey(key RKey) bool {
-	return r.RSpan().ContainsExclusiveEndKey(key)
+// ContainsKeyInverted returns whether this RangeDescriptor contains the
+// specified key using an inverted range. See RSpan.ContainsKeyInverted.
+func (r RangeDescriptor) ContainsKeyInverted(key RKey) bool {
+	return r.RSpan().ContainsKeyInverted(key)
 }
 
 // ContainsKeyRange returns whether this RangeDescriptor contains the specified
@@ -227,12 +227,68 @@ func (r ReplicaDescriptor) Validate() error {
 	return nil
 }
 
+// PercentilesFromData derives percentiles from a slice of data points.
+// Sorts the input data if it isn't already sorted.
+func PercentilesFromData(data []float64) Percentiles {
+	sort.Float64s(data)
+
+	return Percentiles{
+		P10: percentileFromSortedData(data, 10),
+		P25: percentileFromSortedData(data, 25),
+		P50: percentileFromSortedData(data, 50),
+		P75: percentileFromSortedData(data, 75),
+		P90: percentileFromSortedData(data, 90),
+	}
+}
+
+func percentileFromSortedData(data []float64, percent float64) float64 {
+	if len(data) == 0 {
+		return 0
+	}
+	if percent < 0 {
+		percent = 0
+	}
+	if percent >= 100 {
+		return data[len(data)-1]
+	}
+	// TODO(a-robinson): Use go's rounding function once we're using 1.10.
+	idx := int(float64(len(data)) * percent / 100.0)
+	return data[idx]
+}
+
+// String returns a string representation of the Percentiles.
+func (p Percentiles) String() string {
+	return fmt.Sprintf("p10=%.2f p25=%.2f p50=%.2f p75=%.2f p90=%.2f",
+		p.P10, p.P25, p.P50, p.P75, p.P90)
+}
+
+// String returns a string representation of the StoreCapacity.
+func (sc StoreCapacity) String() string {
+	return fmt.Sprintf("disk (capacity=%s, available=%s, used=%s, logicalBytes=%s), "+
+		"ranges=%d, leases=%d, writes=%.2f, "+
+		"bytesPerReplica={%s}, writesPerReplica={%s}",
+		humanizeutil.IBytes(sc.Capacity), humanizeutil.IBytes(sc.Available),
+		humanizeutil.IBytes(sc.Used), humanizeutil.IBytes(sc.LogicalBytes),
+		sc.RangeCount, sc.LeaseCount, sc.WritesPerSecond,
+		sc.BytesPerReplica, sc.WritesPerReplica)
+}
+
 // FractionUsed computes the fraction of storage capacity that is in use.
 func (sc StoreCapacity) FractionUsed() float64 {
 	if sc.Capacity == 0 {
 		return 0
 	}
-	return float64(sc.Capacity-sc.Available) / float64(sc.Capacity)
+	// Prefer computing the fraction of available disk space used by considering
+	// anything on the disk that isn't in the store's data directory just a sunk
+	// cost, not truly part of the disk's capacity. This means that the disk's
+	// capacity is really just the available space plus cockroach's usage.
+	//
+	// Fall back to a more pessimistic calcuation of disk usage if we don't know
+	// how much space the store's data is taking up.
+	if sc.Used == 0 {
+		return float64(sc.Capacity-sc.Available) / float64(sc.Capacity)
+	}
+	return float64(sc.Used) / float64(sc.Available+sc.Used)
 }
 
 // CombinedAttrs returns the full list of attributes for the store, including
@@ -276,6 +332,10 @@ func (Locality) Type() string {
 	return "Locality"
 }
 
+// MaxDiversityScore is the largest possible diversity score, indicating that
+// two localities are as different from each other as possible.
+const MaxDiversityScore = 1.0
+
 // DiversityScore returns a score comparing the two localities which ranges from
 // 1, meaning completely diverse, to 0 which means not diverse at all (that
 // their localities match). This function ignores the locality tier key names
@@ -308,7 +368,7 @@ func (l Locality) DiversityScore(other Locality) float64 {
 		}
 	}
 	if len(l.Tiers) != len(other.Tiers) {
-		return 1.0 / float64(length+1)
+		return MaxDiversityScore / float64(length+1)
 	}
 	return 0
 }

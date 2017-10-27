@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
@@ -25,6 +23,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 )
 
 const eof = -1
@@ -42,6 +42,8 @@ type Scanner struct {
 	nextTok   *sqlSymType
 	lastError struct {
 		msg                  string
+		hint                 string
+		detail               string
 		unimplementedFeature string
 	}
 	stmts       []Statement
@@ -135,18 +137,45 @@ func (s *Scanner) Unimplemented(feature string) {
 
 // UnimplementedWithIssue wraps Error, setting lastUnimplementedError.
 func (s *Scanner) UnimplementedWithIssue(issue int) {
-	s.Error(fmt.Sprintf(
-		"unimplemented (see issue https://github.com/cockroachdb/cockroach/issues/%d)", issue,
-	))
+	s.Error("unimplemented")
 	s.lastError.unimplementedFeature = fmt.Sprintf("#%d", issue)
+	s.lastError.hint = fmt.Sprintf("See: https://github.com/cockroachdb/cockroach/issues/%d", issue)
+}
+
+// SetHelp marks the "last error" field in the Scanner to become a
+// help text. This method is invoked in the error action of the
+// parser, so the help text is only produced if the last token
+// encountered was HELPTOKEN -- other cases are just syntax errors,
+// and in that case we do not want the help text to overwrite the
+// lastError field, which was set earlier to contain details about the
+// syntax error.
+func (s *Scanner) SetHelp(msg HelpMessage) {
+	if s.lastTok.id == HELPTOKEN {
+		s.populateHelpMsg(msg.String())
+	} else {
+		if msg.Command != "" {
+			s.lastError.hint = `try \h ` + msg.Command
+		} else {
+			s.lastError.hint = `try \hf ` + msg.Function
+		}
+	}
+}
+
+func (s *Scanner) populateHelpMsg(msg string) {
+	s.lastError.unimplementedFeature = ""
+	s.lastError.msg = "help token in input"
+	s.lastError.hint = msg
 }
 
 func (s *Scanner) Error(e string) {
-	var buf bytes.Buffer
 	if s.lastTok.id == ERROR {
-		fmt.Fprintf(&buf, "%s", s.lastTok.str)
+		// This is a tokenizer (lexical) error: just emit the invalid
+		// input as error.
+		s.lastError.msg = s.lastTok.str
 	} else {
-		fmt.Fprintf(&buf, "%s at or near \"%s\"", e, s.lastTok.str)
+		// This is a contextual error. Print the provided error message
+		// and the error context.
+		s.lastError.msg = fmt.Sprintf("%s at or near \"%s\"", e, s.lastTok.str)
 	}
 
 	// Find the end of the line containing the last token.
@@ -160,11 +189,12 @@ func (s *Scanner) Error(e string) {
 	// LastIndex returns -1 if "\n" could not be found.
 	j := strings.LastIndex(s.in[:s.lastTok.pos], "\n") + 1
 	// Output everything up to and including the line containing the last token.
-	fmt.Fprintf(&buf, "\n%s\n", s.in[:i])
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "source SQL:\n%s\n", s.in[:i])
 	// Output a caret indicating where the last token starts.
-	fmt.Fprintf(&buf, "%s^\n", strings.Repeat(" ", s.lastTok.pos-j))
+	fmt.Fprintf(&buf, "%s^", strings.Repeat(" ", s.lastTok.pos-j))
+	s.lastError.detail = buf.String()
 	s.lastError.unimplementedFeature = ""
-	s.lastError.msg = buf.String()
 }
 
 func (s *Scanner) scan(lval *sqlSymType) {
@@ -290,6 +320,23 @@ func (s *Scanner) scan(lval *sqlSymType) {
 		}
 		return
 
+	case '?':
+		switch s.peek() {
+		case '?': // ??
+			s.pos++
+			lval.id = HELPTOKEN
+			return
+		case '|': // ?|
+			s.pos++
+			lval.id = HAS_SOME_KEY
+			return
+		case '&': // ?|
+			s.pos++
+			lval.id = HAS_ALL_KEYS
+			return
+		}
+		return
+
 	case '<':
 		switch s.peek() {
 		case '<': // <<
@@ -303,6 +350,10 @@ func (s *Scanner) scan(lval *sqlSymType) {
 		case '=': // <=
 			s.pos++
 			lval.id = LESS_EQUALS
+			return
+		case '@': // <@
+			s.pos++
+			lval.id = CONTAINED_BY
 			return
 		}
 		return
@@ -358,6 +409,49 @@ func (s *Scanner) scan(lval *sqlSymType) {
 		case '*': // ~*
 			s.pos++
 			lval.id = REGIMATCH
+			return
+		}
+		return
+
+	case '@':
+		switch s.peek() {
+		case '>': // @>
+			s.pos++
+			lval.id = CONTAINS
+			return
+		}
+		return
+
+	case '-':
+		switch s.peek() {
+		case '>': // ->
+			if s.peekN(1) == '>' {
+				// ->>
+				s.pos += 2
+				lval.id = FETCHTEXT
+				return
+			}
+			s.pos++
+			lval.id = FETCHVAL
+			return
+		}
+		return
+
+	case '#':
+		switch s.peek() {
+		case '>': // #>
+			if s.peekN(1) == '>' {
+				// #>>
+				s.pos += 2
+				lval.id = FETCHTEXT_PATH
+				return
+			}
+			s.pos++
+			lval.id = FETCHVAL_PATH
+			return
+		case '-': // #-
+			s.pos++
+			lval.id = REMOVE_PATH
 			return
 		}
 		return
@@ -483,12 +577,55 @@ func (s *Scanner) scanComment(lval *sqlSymType) (present, ok bool) {
 }
 
 func (s *Scanner) scanIdent(lval *sqlSymType) {
-	start := s.pos - 1
-	for ; isIdentMiddle(s.peek()); s.pos++ {
+	s.pos--
+	start := s.pos
+	isASCII := true
+	isLower := true
+
+	// Consume the scanner character by character, stopping after the last legal
+	// identifier character. By the end of this function, we need to
+	// lowercase and unicode normalize this identifier, which is expensive if
+	// there are actual unicode characters in it. If not, it's quite cheap - and
+	// if it's lowercase already, there's no work to do. Therefore, we keep track
+	// of whether the string is only ASCII or only ASCII lowercase for later.
+	for {
+		ch := s.peek()
+		//fmt.Println(ch, ch >= utf8.RuneSelf, ch >= 'A' && ch <= 'Z')
+
+		if ch >= utf8.RuneSelf {
+			isASCII = false
+		} else if ch >= 'A' && ch <= 'Z' {
+			isLower = false
+		}
+
+		if !isIdentMiddle(ch) {
+			break
+		}
+
+		s.pos++
 	}
-	lval.str = ReNormalizeName(s.in[start:s.pos])
-	if id, ok := keywords[strings.ToUpper(lval.str)]; ok {
-		lval.id = id
+	//fmt.Println("parsed: ", s.in[start:s.pos], isASCII, isLower)
+
+	if isLower {
+		// Already lowercased - nothing to do.
+		lval.str = s.in[start:s.pos]
+	} else if isASCII {
+		// We know that the identifier we've seen so far is ASCII, so we don't need
+		// to unicode normalize. Instead, just lowercase as normal.
+		b := make([]byte, s.pos-start)
+		for i, c := range s.in[start:s.pos] {
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			b[i] = byte(c)
+		}
+		lval.str = string(b)
+	} else {
+		// The string has unicode in it. No choice but to run Normalize.
+		lval.str = Name(s.in[start:s.pos]).Normalize()
+	}
+	if id, ok := keywords[lval.str]; ok {
+		lval.id = id.tok
 	} else {
 		lval.id = IDENT
 	}
@@ -601,7 +738,7 @@ func (s *Scanner) scanPlaceholder(lval *sqlSymType) {
 
 	uval, err := strconv.ParseUint(lval.str, 10, 64)
 	if err == nil && uval > 1<<63 {
-		err = fmt.Errorf("integer value out of range: %d", uval)
+		err = pgerror.NewErrorf(pgerror.CodeNumericValueOutOfRangeError, "integer value out of range: %d", uval)
 	}
 	if err != nil {
 		lval.id = ERROR
@@ -742,33 +879,46 @@ func isHexDigit(ch int) bool {
 }
 
 var lookaheadKeywords = map[string]struct{}{
-	"BETWEEN":    {},
-	"ILIKE":      {},
-	"IN":         {},
-	"LIKE":       {},
-	"OF":         {},
-	"ORDINALITY": {},
-	"SIMILAR":    {},
-	"TIME":       {},
+	"between":    {},
+	"ilike":      {},
+	"in":         {},
+	"like":       {},
+	"of":         {},
+	"ordinality": {},
+	"similar":    {},
+	"time":       {},
 }
 
+// isNonKeywordBareIdentifier returns true if the input string is a permissible
+// bare SQL identifier and is not a SQL keyword.
 func isNonKeywordBareIdentifier(s string) bool {
-	if len(s) == 0 || !isIdentStart(int(s[0])) {
+	if len(s) == 0 || !isIdentStart(int(s[0])) || (s[0] >= 'A' && s[0] <= 'Z') {
 		return false
 	}
+	// Keep track of whether the input string is all ASCII. If it is, we don't
+	// have to bother running the full Normalize() function at the end, which is
+	// quite expensive.
+	isASCII := s[0] < utf8.RuneSelf
 	for i := 1; i < len(s); i++ {
 		if !isIdentMiddle(int(s[i])) {
 			return false
 		}
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			// Non-lowercase identifiers aren't permissible.
+			return false
+		}
+		if s[i] >= utf8.RuneSelf {
+			isASCII = false
+		}
 	}
-	upper := strings.ToUpper(s)
-	if _, ok := reservedKeywords[upper]; ok {
+
+	if _, ok := reservedKeywords[s]; ok {
 		return false
 	}
-	if _, ok := lookaheadKeywords[upper]; ok {
+	if _, ok := lookaheadKeywords[s]; ok {
 		return false
 	}
-	return Name(s).Normalize() == s
+	return isASCII || Name(s).Normalize() == s
 }
 
 func isIdentStart(ch int) bool {

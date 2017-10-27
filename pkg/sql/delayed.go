@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
@@ -42,6 +40,6 @@ func (d *delayedNode) Close(ctx context.Context) {
 	}
 }
 
-func (d *delayedNode) Start(ctx context.Context) error        { return d.plan.Start(ctx) }
-func (d *delayedNode) Next(ctx context.Context) (bool, error) { return d.plan.Next(ctx) }
-func (d *delayedNode) Values() parser.Datums                  { return d.plan.Values() }
+func (d *delayedNode) Start(params runParams) error        { return d.plan.Start(params) }
+func (d *delayedNode) Next(params runParams) (bool, error) { return d.plan.Next(params) }
+func (d *delayedNode) Values() parser.Datums               { return d.plan.Values() }

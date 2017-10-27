@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Jingguo Yao (yaojingguo@gmail.com)
 
 package interval
 
@@ -49,8 +47,7 @@ func perm(n uint32) (out items) {
 
 // rang returns an ordered list of intervals in the range [m, n].
 func rang(m, n uint32) (out items) {
-	for i := m; i <= n; i++ {
-		u := uint32(i)
+	for u := m; u <= n; u++ {
 		iv := makeMultiByteInterval(u, u+1, u)
 		out = append(out, iv)
 	}

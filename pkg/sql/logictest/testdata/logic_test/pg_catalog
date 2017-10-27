@@ -68,6 +68,7 @@ pg_range
 pg_roles
 pg_settings
 pg_tables
+pg_tablespace
 pg_type
 pg_views
 
@@ -79,7 +80,7 @@ pg_catalog.pg_namespace  CREATE TABLE pg_namespace (
                              oid OID NULL,
                              nspname NAME NOT NULL,
                              nspowner OID NULL,
-                             aclitem STRING NULL
+                             nspacl STRING NULL
 )
 
 query TTBTT colnames
@@ -89,7 +90,7 @@ Field     Type    Null   Default Indices
 oid       OID     true   NULL    {}
 nspname   NAME    false  NULL    {}
 nspowner  OID     true   NULL    {}
-aclitem   STRING  true   NULL    {}
+nspacl    STRING  true   NULL    {}
 
 query TTBITTBB colnames
 SHOW INDEXES FROM pg_catalog.pg_namespace
@@ -145,7 +146,7 @@ CREATE VIEW constraint_db.v1 AS SELECT p,a,b,c FROM constraint_db.t1
 query OTOT colnames
 SELECT * FROM pg_catalog.pg_namespace
 ----
-oid         nspname             nspowner  aclitem
+oid         nspname             nspowner  nspacl
 1708731312  constraint_db       NULL      NULL
 2699457641  crdb_internal       NULL      NULL
 719671438   information_schema  NULL      NULL
@@ -174,12 +175,12 @@ FROM pg_catalog.pg_database
 ORDER BY oid
 ----
 oid         datname             datconnlimit  datlastsysoid  datfrozenxid  datminmxid  dattablespace  datacl
-381876367   system              -1            NULL           NULL          NULL        NULL           NULL
-437457361   constraint_db       -1            NULL           NULL          NULL        NULL           NULL
-1965331359  test                -1            NULL           NULL          NULL        NULL           NULL
-2107984548  crdb_internal       -1            NULL           NULL          NULL        NULL           NULL
-2157629366  pg_catalog          -1            NULL           NULL          NULL        NULL           NULL
-3177026209  information_schema  -1            NULL           NULL          NULL        NULL           NULL
+381876367   system              -1            NULL           NULL          NULL        0              NULL
+437457361   constraint_db       -1            NULL           NULL          NULL        0              NULL
+1965331359  test                -1            NULL           NULL          NULL        0              NULL
+2107984548  crdb_internal       -1            NULL           NULL          NULL        0              NULL
+2157629366  pg_catalog          -1            NULL           NULL          NULL        0              NULL
+3177026209  information_schema  -1            NULL           NULL          NULL        0              NULL
 
 ## pg_catalog.pg_tables
 
@@ -201,6 +202,14 @@ tablename          hasindexes
 table_constraints  false
 table_privileges   false
 tables             false
+
+## pg_catalog.pg_tablespace
+
+query OTOTT colnames
+SELECT oid, spcname, spcowner, spcacl, spcoptions FROM pg_tablespace
+----
+oid  spcname     spcowner  spcacl  spcoptions
+0    pg_default  NULL      NULL    NULL
 
 ## pg_catalog.pg_views
 
@@ -231,24 +240,24 @@ oid         relname       relnamespace  reltype  relowner  relam  relfilenode  r
 624432001   t3_a_b_idx    1708731312    0        NULL      NULL   0            0
 2875635133  v1            1708731312    0        NULL      NULL   0            0
 
-query TIRIOBB colnames
-SELECT relname, relpages, reltuples, relallvisible, reltoastrelid, relhasindex, relisshared
+query TIRIOBBT colnames
+SELECT relname, relpages, reltuples, relallvisible, reltoastrelid, relhasindex, relisshared, relpersistence
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
 WHERE n.nspname = 'constraint_db'
 ----
-relname       relpages  reltuples  relallvisible  reltoastrelid  relhasindex  relisshared
-t1            NULL      NULL       0              0              true         false
-primary       NULL      NULL       0              0              false        false
-t1_a_key      NULL      NULL       0              0              false        false
-index_key     NULL      NULL       0              0              false        false
-t2            NULL      NULL       0              0              true         false
-primary       NULL      NULL       0              0              false        false
-t2_t1_id_idx  NULL      NULL       0              0              false        false
-t3            NULL      NULL       0              0              true         false
-primary       NULL      NULL       0              0              false        false
-t3_a_b_idx    NULL      NULL       0              0              false        false
-v1            NULL      NULL       0              0              false        false
+relname       relpages  reltuples  relallvisible  reltoastrelid  relhasindex  relisshared  relpersistence
+t1            NULL      NULL       0              0              true         false        p
+primary       NULL      NULL       0              0              false        false        p
+t1_a_key      NULL      NULL       0              0              false        false        p
+index_key     NULL      NULL       0              0              false        false        p
+t2            NULL      NULL       0              0              true         false        p
+primary       NULL      NULL       0              0              false        false        p
+t2_t1_id_idx  NULL      NULL       0              0              false        false        p
+t3            NULL      NULL       0              0              true         false        p
+primary       NULL      NULL       0              0              false        false        p
+t3_a_b_idx    NULL      NULL       0              0              false        false        p
+v1            NULL      NULL       0              0              false        false        p
 
 query TBTIIBB colnames
 SELECT relname, relistemp, relkind, relnatts, relchecks, relhasoids, relhaspkey
@@ -665,15 +674,29 @@ oid   typname       typnamespace  typowner  typlen  typbyval  typtype
 26    oid           1782195457    NULL      8       true      b
 700   float4        1782195457    NULL      8       true      b
 701   float8        1782195457    NULL      8       true      b
+869   inet          1782195457    NULL      24      true      b
+1000  _bool         1782195457    NULL      -1      false     b
+1001  _bytea        1782195457    NULL      -1      false     b
+1003  _name         1782195457    NULL      -1      false     b
 1005  _int2         1782195457    NULL      -1      false     b
 1007  _int4         1782195457    NULL      -1      false     b
 1009  _text         1782195457    NULL      -1      false     b
+1015  _varchar      1782195457    NULL      -1      false     b
 1016  _int8         1782195457    NULL      -1      false     b
+1021  _float4       1782195457    NULL      -1      false     b
+1022  _float8       1782195457    NULL      -1      false     b
+1028  _oid          1782195457    NULL      -1      false     b
+1041  _inet         1782195457    NULL      -1      false     b
 1043  varchar       1782195457    NULL      -1      false     b
 1082  date          1782195457    NULL      8       true      b
 1114  timestamp     1782195457    NULL      24      true      b
+1115  _timestamp    1782195457    NULL      -1      false     b
+1182  _date         1782195457    NULL      -1      false     b
 1184  timestamptz   1782195457    NULL      24      true      b
+1185  _timestamptz  1782195457    NULL      -1      false     b
 1186  interval      1782195457    NULL      24      true      b
+1187  _interval     1782195457    NULL      -1      false     b
+1231  _numeric      1782195457    NULL      -1      false     b
 1700  numeric       1782195457    NULL      -1      false     b
 2202  regprocedure  1782195457    NULL      8       true      b
 2205  regclass      1782195457    NULL      8       true      b
@@ -681,6 +704,8 @@ oid   typname       typnamespace  typowner  typlen  typbyval  typtype
 2249  record        1782195457    NULL      0       true      b
 2283  anyelement    1782195457    NULL      -1      false     b
 2950  uuid          1782195457    NULL      16      true      b
+2951  _uuid         1782195457    NULL      -1      false     b
+3802  jsonb         1782195457    NULL      -1      false     b
 4089  regnamespace  1782195457    NULL      8       true      b
 
 query OTTBBTOOO colnames
@@ -689,34 +714,50 @@ FROM pg_catalog.pg_type
 ORDER BY oid
 ----
 oid   typname       typcategory  typispreferred  typisdefined  typdelim  typrelid  typelem  typarray
-16    bool          B            false           true          ,         0         0        0
-17    bytea         U            false           true          ,         0         0        0
-19    name          S            false           true          ,         0         0        0
-20    int8          N            false           true          ,         0         0        0
-21    int2          N            false           true          ,         0         0        0
+16    bool          B            false           true          ,         0         0        1000
+17    bytea         U            false           true          ,         0         0        1001
+19    name          S            false           true          ,         0         0        1003
+20    int8          N            false           true          ,         0         0        1016
+21    int2          N            false           true          ,         0         0        1005
 22    int2vector    A            false           true          ,         0         21       0
-23    int4          N            false           true          ,         0         0        0
+23    int4          N            false           true          ,         0         0        1007
 24    regproc       N            false           true          ,         0         0        0
-25    text          S            false           true          ,         0         0        0
-26    oid           N            false           true          ,         0         0        0
-700   float4        N            false           true          ,         0         0        0
-701   float8        N            false           true          ,         0         0        0
+25    text          S            false           true          ,         0         0        1009
+26    oid           N            false           true          ,         0         0        1028
+700   float4        N            false           true          ,         0         0        1021
+701   float8        N            false           true          ,         0         0        1022
+869   inet          I            false           true          ,         0         0        1041
+1000  _bool         A            false           true          ,         0         16       0
+1001  _bytea        A            false           true          ,         0         17       0
+1003  _name         A            false           true          ,         0         19       0
 1005  _int2         A            false           true          ,         0         21       0
 1007  _int4         A            false           true          ,         0         23       0
 1009  _text         A            false           true          ,         0         25       0
+1015  _varchar      A            false           true          ,         0         1043     0
 1016  _int8         A            false           true          ,         0         20       0
-1043  varchar       S            false           true          ,         0         0        0
-1082  date          D            false           true          ,         0         0        0
-1114  timestamp     D            false           true          ,         0         0        0
-1184  timestamptz   D            false           true          ,         0         0        0
-1186  interval      T            false           true          ,         0         0        0
-1700  numeric       N            false           true          ,         0         0        0
+1021  _float4       A            false           true          ,         0         700      0
+1022  _float8       A            false           true          ,         0         701      0
+1028  _oid          A            false           true          ,         0         26       0
+1041  _inet         A            false           true          ,         0         869      0
+1043  varchar       S            false           true          ,         0         0        1015
+1082  date          D            false           true          ,         0         0        1182
+1114  timestamp     D            false           true          ,         0         0        1115
+1115  _timestamp    A            false           true          ,         0         1114     0
+1182  _date         A            false           true          ,         0         1082     0
+1184  timestamptz   D            false           true          ,         0         0        1185
+1185  _timestamptz  A            false           true          ,         0         1184     0
+1186  interval      T            false           true          ,         0         0        1187
+1187  _interval     A            false           true          ,         0         1186     0
+1231  _numeric      A            false           true          ,         0         1700     0
+1700  numeric       N            false           true          ,         0         0        1231
 2202  regprocedure  N            false           true          ,         0         0        0
 2205  regclass      N            false           true          ,         0         0        0
 2206  regtype       N            false           true          ,         0         0        0
 2249  record        P            false           true          ,         0         0        0
 2283  anyelement    P            false           true          ,         0         0        0
-2950  uuid          U            false           true          ,         0         0        0
+2950  uuid          U            false           true          ,         0         0        2951
+2951  _uuid         A            false           true          ,         0         2950     0
+3802  jsonb         U            false           true          ,         0         0        0
 4089  regnamespace  N            false           true          ,         0         0        0
 
 query OTOOOOOOO colnames
@@ -737,15 +778,29 @@ oid   typname       typinput        typoutput        typreceive        typsend  
 26    oid           oidin           oidout           oidrecv           oidsend           0         0          0
 700   float4        float4in        float4out        float4recv        float4send        0         0          0
 701   float8        float8in        float8out        float8recv        float8send        0         0          0
+869   inet          inetin          inetout          inetrecv          inetsend          0         0          0
+1000  _bool         array_in        array_out        array_recv        array_send        0         0          0
+1001  _bytea        array_in        array_out        array_recv        array_send        0         0          0
+1003  _name         array_in        array_out        array_recv        array_send        0         0          0
 1005  _int2         array_in        array_out        array_recv        array_send        0         0          0
 1007  _int4         array_in        array_out        array_recv        array_send        0         0          0
 1009  _text         array_in        array_out        array_recv        array_send        0         0          0
+1015  _varchar      array_in        array_out        array_recv        array_send        0         0          0
 1016  _int8         array_in        array_out        array_recv        array_send        0         0          0
+1021  _float4       array_in        array_out        array_recv        array_send        0         0          0
+1022  _float8       array_in        array_out        array_recv        array_send        0         0          0
+1028  _oid          array_in        array_out        array_recv        array_send        0         0          0
+1041  _inet         array_in        array_out        array_recv        array_send        0         0          0
 1043  varchar       varcharin       varcharout       varcharrecv       varcharsend       0         0          0
 1082  date          date_in         date_out         date_recv         date_send         0         0          0
 1114  timestamp     timestamp_in    timestamp_out    timestamp_recv    timestamp_send    0         0          0
+1115  _timestamp    array_in        array_out        array_recv        array_send        0         0          0
+1182  _date         array_in        array_out        array_recv        array_send        0         0          0
 1184  timestamptz   timestamptz_in  timestamptz_out  timestamptz_recv  timestamptz_send  0         0          0
+1185  _timestamptz  array_in        array_out        array_recv        array_send        0         0          0
 1186  interval      interval_in     interval_out     interval_recv     interval_send     0         0          0
+1187  _interval     array_in        array_out        array_recv        array_send        0         0          0
+1231  _numeric      array_in        array_out        array_recv        array_send        0         0          0
 1700  numeric       numeric_in      numeric_out      numeric_recv      numeric_send      0         0          0
 2202  regprocedure  regprocedurein  regprocedureout  regprocedurerecv  regproceduresend  0         0          0
 2205  regclass      regclassin      regclassout      regclassrecv      regclasssend      0         0          0
@@ -753,6 +808,8 @@ oid   typname       typinput        typoutput        typreceive        typsend  
 2249  record        record_in       record_out       record_recv       record_send       0         0          0
 2283  anyelement    anyelement_in   anyelement_out   anyelement_recv   anyelement_send   0         0          0
 2950  uuid          uuid_in         uuid_out         uuid_recv         uuid_send         0         0          0
+2951  _uuid         array_in        array_out        array_recv        array_send        0         0          0
+3802  jsonb         jsonb_in        jsonb_out        jsonb_recv        jsonb_send        0         0          0
 4089  regnamespace  regnamespacein  regnamespaceout  regnamespacerecv  regnamespacesend  0         0          0
 
 query OTTTBOI colnames
@@ -773,15 +830,29 @@ oid   typname       typalign  typstorage  typnotnull  typbasetype  typtypmod
 26    oid           NULL      NULL        false       0            -1
 700   float4        NULL      NULL        false       0            -1
 701   float8        NULL      NULL        false       0            -1
+869   inet          NULL      NULL        false       0            -1
+1000  _bool         NULL      NULL        false       0            -1
+1001  _bytea        NULL      NULL        false       0            -1
+1003  _name         NULL      NULL        false       0            -1
 1005  _int2         NULL      NULL        false       0            -1
 1007  _int4         NULL      NULL        false       0            -1
 1009  _text         NULL      NULL        false       0            -1
+1015  _varchar      NULL      NULL        false       0            -1
 1016  _int8         NULL      NULL        false       0            -1
+1021  _float4       NULL      NULL        false       0            -1
+1022  _float8       NULL      NULL        false       0            -1
+1028  _oid          NULL      NULL        false       0            -1
+1041  _inet         NULL      NULL        false       0            -1
 1043  varchar       NULL      NULL        false       0            -1
 1082  date          NULL      NULL        false       0            -1
 1114  timestamp     NULL      NULL        false       0            -1
+1115  _timestamp    NULL      NULL        false       0            -1
+1182  _date         NULL      NULL        false       0            -1
 1184  timestamptz   NULL      NULL        false       0            -1
+1185  _timestamptz  NULL      NULL        false       0            -1
 1186  interval      NULL      NULL        false       0            -1
+1187  _interval     NULL      NULL        false       0            -1
+1231  _numeric      NULL      NULL        false       0            -1
 1700  numeric       NULL      NULL        false       0            -1
 2202  regprocedure  NULL      NULL        false       0            -1
 2205  regclass      NULL      NULL        false       0            -1
@@ -789,6 +860,8 @@ oid   typname       typalign  typstorage  typnotnull  typbasetype  typtypmod
 2249  record        NULL      NULL        false       0            -1
 2283  anyelement    NULL      NULL        false       0            -1
 2950  uuid          NULL      NULL        false       0            -1
+2951  _uuid         NULL      NULL        false       0            -1
+3802  jsonb         NULL      NULL        false       0            -1
 4089  regnamespace  NULL      NULL        false       0            -1
 
 query OTIOTTT colnames
@@ -809,15 +882,29 @@ oid   typname       typndims  typcollation  typdefaultbin  typdefault  typacl
 26    oid           0         0             NULL           NULL        NULL
 700   float4        0         0             NULL           NULL        NULL
 701   float8        0         0             NULL           NULL        NULL
+869   inet          0         0             NULL           NULL        NULL
+1000  _bool         0         0             NULL           NULL        NULL
+1001  _bytea        0         0             NULL           NULL        NULL
+1003  _name         0         1661428263    NULL           NULL        NULL
 1005  _int2         0         0             NULL           NULL        NULL
 1007  _int4         0         0             NULL           NULL        NULL
 1009  _text         0         1661428263    NULL           NULL        NULL
+1015  _varchar      0         1661428263    NULL           NULL        NULL
 1016  _int8         0         0             NULL           NULL        NULL
+1021  _float4       0         0             NULL           NULL        NULL
+1022  _float8       0         0             NULL           NULL        NULL
+1028  _oid          0         0             NULL           NULL        NULL
+1041  _inet         0         0             NULL           NULL        NULL
 1043  varchar       0         1661428263    NULL           NULL        NULL
 1082  date          0         0             NULL           NULL        NULL
 1114  timestamp     0         0             NULL           NULL        NULL
+1115  _timestamp    0         0             NULL           NULL        NULL
+1182  _date         0         0             NULL           NULL        NULL
 1184  timestamptz   0         0             NULL           NULL        NULL
+1185  _timestamptz  0         0             NULL           NULL        NULL
 1186  interval      0         0             NULL           NULL        NULL
+1187  _interval     0         0             NULL           NULL        NULL
+1231  _numeric      0         0             NULL           NULL        NULL
 1700  numeric       0         0             NULL           NULL        NULL
 2202  regprocedure  0         0             NULL           NULL        NULL
 2205  regclass      0         0             NULL           NULL        NULL
@@ -825,6 +912,8 @@ oid   typname       typndims  typcollation  typdefaultbin  typdefault  typacl
 2249  record        0         0             NULL           NULL        NULL
 2283  anyelement    0         0             NULL           NULL        NULL
 2950  uuid          0         0             NULL           NULL        NULL
+2951  _uuid         0         0             NULL           NULL        NULL
+3802  jsonb         0         0             NULL           NULL        NULL
 4089  regnamespace  0         0             NULL           NULL        NULL
 
 ## pg_catalog.pg_proc
@@ -947,22 +1036,24 @@ query TTTTTT colnames
 SELECT name, setting, category, short_desc, extra_desc, vartype FROM pg_catalog.pg_settings
 ----
 name                           setting       category  short_desc  extra_desc  vartype
-application_name                             NULL      NULL        NULL        string
+application_name               ·             NULL      NULL        NULL        string
 client_encoding                UTF8          NULL      NULL        NULL        string
-client_min_messages                          NULL      NULL        NULL        string
+client_min_messages            ·             NULL      NULL        NULL        string
 database                       test          NULL      NULL        NULL        string
 datestyle                      ISO           NULL      NULL        NULL        string
 default_transaction_isolation  SERIALIZABLE  NULL      NULL        NULL        string
 distsql                        off           NULL      NULL        NULL        string
-extra_float_digits                           NULL      NULL        NULL        string
+extra_float_digits             ·             NULL      NULL        NULL        string
 max_index_keys                 32            NULL      NULL        NULL        string
 node_id                        1             NULL      NULL        NULL        string
-search_path                    pg_catalog    NULL      NULL        NULL        string
+search_path                    ·             NULL      NULL        NULL        string
 server_version                 9.5.0         NULL      NULL        NULL        string
+server_version_num             90500         NULL      NULL        NULL        string
 session_user                   root          NULL      NULL        NULL        string
+sql_safe_updates               false         NULL      NULL        NULL        string
 standard_conforming_strings    on            NULL      NULL        NULL        string
 time zone                      UTC           NULL      NULL        NULL        string
-trace                          off           NULL      NULL        NULL        string
+tracing                        off           NULL      NULL        NULL        string
 transaction isolation level    SERIALIZABLE  NULL      NULL        NULL        string
 transaction priority           NORMAL        NULL      NULL        NULL        string
 transaction status             NoTxn         NULL      NULL        NULL        string
@@ -971,22 +1062,24 @@ query TTTTTTT colnames
 SELECT name, setting, unit, context, enumvals, boot_val, reset_val FROM pg_catalog.pg_settings
 ----
 name                           setting       unit  context  enumvals  boot_val      reset_val
-application_name                             NULL  user     NULL
+application_name               ·             NULL  user     NULL      ·             ·
 client_encoding                UTF8          NULL  user     NULL      UTF8          UTF8
-client_min_messages                          NULL  user     NULL
+client_min_messages            ·             NULL  user     NULL      ·             ·
 database                       test          NULL  user     NULL      test          test
 datestyle                      ISO           NULL  user     NULL      ISO           ISO
 default_transaction_isolation  SERIALIZABLE  NULL  user     NULL      SERIALIZABLE  SERIALIZABLE
 distsql                        off           NULL  user     NULL      off           off
-extra_float_digits                           NULL  user     NULL
+extra_float_digits             ·             NULL  user     NULL      ·             ·
 max_index_keys                 32            NULL  user     NULL      32            32
 node_id                        1             NULL  user     NULL      1             1
-search_path                    pg_catalog    NULL  user     NULL      pg_catalog    pg_catalog
+search_path                    ·             NULL  user     NULL      ·             ·
 server_version                 9.5.0         NULL  user     NULL      9.5.0         9.5.0
+server_version_num             90500         NULL  user     NULL      90500         90500
 session_user                   root          NULL  user     NULL      root          root
+sql_safe_updates               false         NULL  user     NULL      false         false
 standard_conforming_strings    on            NULL  user     NULL      on            on
 time zone                      UTC           NULL  user     NULL      UTC           UTC
-trace                          off           NULL  user     NULL      off           off
+tracing                        off           NULL  user     NULL      off           off
 transaction isolation level    SERIALIZABLE  NULL  user     NULL      SERIALIZABLE  SERIALIZABLE
 transaction priority           NORMAL        NULL  user     NULL      NORMAL        NORMAL
 transaction status             NoTxn         NULL  user     NULL      NoTxn         NoTxn
@@ -1007,10 +1100,12 @@ max_index_keys                 NULL    NULL     NULL     NULL        NULL
 node_id                        NULL    NULL     NULL     NULL        NULL
 search_path                    NULL    NULL     NULL     NULL        NULL
 server_version                 NULL    NULL     NULL     NULL        NULL
+server_version_num             NULL    NULL     NULL     NULL        NULL
 session_user                   NULL    NULL     NULL     NULL        NULL
+sql_safe_updates               NULL    NULL     NULL     NULL        NULL
 standard_conforming_strings    NULL    NULL     NULL     NULL        NULL
 time zone                      NULL    NULL     NULL     NULL        NULL
-trace                          NULL    NULL     NULL     NULL        NULL
+tracing                        NULL    NULL     NULL     NULL        NULL
 transaction isolation level    NULL    NULL     NULL     NULL        NULL
 transaction priority           NULL    NULL     NULL     NULL        NULL
 transaction status             NULL    NULL     NULL     NULL        NULL

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlplan_test
 
@@ -56,7 +54,7 @@ func TestFakeSpanResolver(t *testing.T) {
 
 	db := tc.Server(0).KVClient().(*client.DB)
 
-	txn := client.NewTxn(db)
+	txn := client.NewTxn(db, tc.Server(0).NodeID())
 	it := resolver.NewSpanResolverIterator(txn)
 
 	desc := sqlbase.GetTableDescriptor(db, "test", "t")

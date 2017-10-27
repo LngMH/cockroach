@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package engine
 
@@ -49,7 +46,7 @@ func gibberishString(n int) string {
 	return string(b)
 }
 
-func mustMarshal(m proto.Message) []byte {
+func mustMarshal(m protoutil.Message) []byte {
 	b, err := protoutil.Marshal(m)
 	if err != nil {
 		panic(err)
@@ -166,10 +163,10 @@ func TestGoMerge(t *testing.T) {
 			continue
 		}
 		var resultV, expectedV enginepb.MVCCMetadata
-		if err := proto.Unmarshal(result, &resultV); err != nil {
+		if err := protoutil.Unmarshal(result, &resultV); err != nil {
 			t.Fatal(err)
 		}
-		if err := proto.Unmarshal(c.expected, &expectedV); err != nil {
+		if err := protoutil.Unmarshal(c.expected, &expectedV); err != nil {
 			t.Fatal(err)
 		}
 		if !reflect.DeepEqual(resultV, expectedV) {
@@ -297,7 +294,7 @@ func TestGoMerge(t *testing.T) {
 // a MVCCMetadata with an inline value.
 func unmarshalTimeSeries(t testing.TB, b []byte) roachpb.InternalTimeSeriesData {
 	var meta enginepb.MVCCMetadata
-	if err := proto.Unmarshal(b, &meta); err != nil {
+	if err := protoutil.Unmarshal(b, &meta); err != nil {
 		t.Fatalf("error unmarshalling time series in text: %s", err.Error())
 	}
 	valueTS, err := MakeValue(meta).GetTimeseries()

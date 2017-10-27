@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package acceptance
 
@@ -38,7 +36,9 @@ func TestEventLog(t *testing.T) {
 	s := log.Scope(t)
 	defer s.Close(t)
 
-	runTestOnConfigs(t, testEventLogInner)
+	RunLocal(t, func(t *testing.T) {
+		runTestWithCluster(t, testEventLogInner)
+	})
 }
 
 func testEventLogInner(
@@ -65,7 +65,7 @@ func testEventLogInner(
 		// Query all node join events. There should be one for each node in the
 		// cluster.
 		rows, err := db.Query(
-			"SELECT targetID, info FROM system.eventlog WHERE eventType = $1",
+			`SELECT "targetID", info FROM system.eventlog WHERE "eventType" = $1`,
 			string(csql.EventLogNodeJoin))
 		if err != nil {
 			return err
@@ -135,7 +135,7 @@ func testEventLogInner(
 
 		// Query all node restart events. There should only be one.
 		rows, err := db.Query(
-			"SELECT targetID, info FROM system.eventlog WHERE eventType = $1",
+			`SELECT "targetID", info FROM system.eventlog WHERE "eventType" = $1`,
 			string(csql.EventLogNodeRestart))
 		if err != nil {
 			return err

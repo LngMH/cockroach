@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package roachpb
 
@@ -31,7 +29,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
@@ -195,10 +192,12 @@ func (k Key) String() string {
 func (k Key) Format(f fmt.State, verb rune) {
 	// Note: this implementation doesn't handle the width and precision
 	// specifiers such as "%20.10s".
-	if PrettyPrintKey != nil {
+	if verb == 'x' {
+		fmt.Fprintf(f, "%x", []byte(k))
+	} else if PrettyPrintKey != nil {
 		fmt.Fprint(f, PrettyPrintKey(k))
 	} else {
-		fmt.Fprintf(f, strconv.Quote(string(k)))
+		fmt.Fprint(f, strconv.Quote(string(k)))
 	}
 }
 
@@ -271,6 +270,11 @@ func (v *Value) ShallowClone() *Value {
 	}
 	t := *v
 	return &t
+}
+
+// IsPresent returns true if the value is present (existent and not a tombstone).
+func (v *Value) IsPresent() bool {
+	return v != nil && len(v.RawBytes) != 0
 }
 
 // MakeValueFromString returns a value with bytes and tag set.
@@ -360,39 +364,22 @@ func (v *Value) SetInt(i int64) {
 // SetProto encodes the specified proto message into the bytes field of the
 // receiver and clears the checksum. If the proto message is an
 // InternalTimeSeriesData, the tag will be set to TIMESERIES rather than BYTES.
-func (v *Value) SetProto(msg proto.Message) error {
-	// Fast-path for when the proto implements MarshalTo and Size (i.e. all of
-	// our protos). The fast-path marshals directly into the Value.RawBytes field
-	// instead of allocating a separate []byte and copying.
-	type marshalTo interface {
-		MarshalTo(data []byte) (int, error)
-		Size() int
-	}
-	if m, ok := msg.(marshalTo); ok {
-		size := m.Size()
-		v.RawBytes = make([]byte, headerSize+size)
-		// NB: This call to protoutil.Interceptor would be more natural
-		// encapsulated in protoutil.MarshalTo, yet that approach imposes a
-		// significant (~30%) slowdown. It is unclear why. See
-		// BenchmarkValueSetProto.
-		protoutil.Interceptor(msg)
-		if _, err := m.MarshalTo(v.RawBytes[headerSize:]); err != nil {
-			return err
-		}
-		// Special handling for timeseries data.
-		if _, ok := msg.(*InternalTimeSeriesData); ok {
-			v.setTag(ValueType_TIMESERIES)
-		} else {
-			v.setTag(ValueType_BYTES)
-		}
-		return nil
-	}
-
-	data, err := protoutil.Marshal(msg)
-	if err != nil {
+func (v *Value) SetProto(msg protoutil.Message) error {
+	msg = protoutil.MaybeFuzz(msg)
+	// All of the Cockroach protos implement MarshalTo and Size. So we marshal
+	// directly into the Value.RawBytes field instead of allocating a separate
+	// []byte and copying.
+	size := msg.Size()
+	v.RawBytes = make([]byte, headerSize+size)
+	if _, err := protoutil.MarshalToWithoutFuzzing(msg, v.RawBytes[headerSize:]); err != nil {
 		return err
 	}
-	v.SetBytes(data)
+	// Special handling for timeseries data.
+	if _, ok := msg.(*InternalTimeSeriesData); ok {
+		v.setTag(ValueType_TIMESERIES)
+	} else {
+		v.setTag(ValueType_BYTES)
+	}
 	return nil
 }
 
@@ -498,7 +485,7 @@ func (v Value) GetInt() (int64, error) {
 // GetProto unmarshals the bytes field of the receiver into msg. If
 // unmarshalling fails or the tag is not BYTES, an error will be
 // returned.
-func (v Value) GetProto(msg proto.Message) error {
+func (v Value) GetProto(msg protoutil.Message) error {
 	expectedTag := ValueType_BYTES
 
 	// Special handling for ts data.
@@ -509,7 +496,7 @@ func (v Value) GetProto(msg proto.Message) error {
 	if tag := v.GetTag(); tag != expectedTag {
 		return fmt.Errorf("value type is not %s: %s", expectedTag, tag)
 	}
-	return proto.Unmarshal(v.dataBytes(), msg)
+	return protoutil.Unmarshal(v.dataBytes(), msg)
 }
 
 // GetTime decodes a time value from the bytes field of the receiver. If the
@@ -668,36 +655,39 @@ const (
 	MaxTxnPriority = math.MaxInt32
 )
 
-// NewTransaction creates a new transaction. The transaction key is
+// MakeTransaction creates a new transaction. The transaction key is
 // composed using the specified baseKey (for locality with data
 // affected by the transaction) and a random ID to guarantee
 // uniqueness. The specified user-level priority is combined with a
 // randomly chosen value to yield a final priority, used to settle
 // write conflicts in a way that avoids starvation of long-running
 // transactions (see Replica.PushTxn).
-func NewTransaction(
+//
+// baseKey can be nil, in which case it will be set when sending the first
+// write.
+func MakeTransaction(
 	name string,
 	baseKey Key,
 	userPriority UserPriority,
 	isolation enginepb.IsolationType,
 	now hlc.Timestamp,
-	maxOffset int64,
-) *Transaction {
+	maxOffsetNs int64,
+) Transaction {
 	u := uuid.MakeV4()
 	var maxTS hlc.Timestamp
-	if maxOffset == timeutil.ClocklessMaxOffset {
+	if maxOffsetNs == timeutil.ClocklessMaxOffset {
 		// For clockless reads, use the largest possible maxTS. This means we'll
 		// always restart if we see something in our future (but we do so at
 		// most once thanks to ObservedTimestamps).
 		maxTS.WallTime = math.MaxInt64
 	} else {
-		maxTS = now.Add(maxOffset, 0)
+		maxTS = now.Add(maxOffsetNs, 0)
 	}
 
-	return &Transaction{
+	return Transaction{
 		TxnMeta: enginepb.TxnMeta{
 			Key:       baseKey,
-			ID:        &u,
+			ID:        u,
 			Isolation: isolation,
 			Timestamp: now,
 			Priority:  MakePriority(userPriority),
@@ -735,21 +725,13 @@ func (t Transaction) Clone() Transaction {
 	return t
 }
 
-// Equal tests two transactions for equality. They are equal if they are
-// either simultaneously nil or their IDs match.
-func (t *Transaction) Equal(s *Transaction) bool {
-	if t == nil && s == nil {
-		return true
+// AssertInitialized crashes if the transaction is not initialized.
+func (t *Transaction) AssertInitialized(ctx context.Context) {
+	if t.ID == (uuid.UUID{}) ||
+		t.OrigTimestamp == (hlc.Timestamp{}) ||
+		t.Timestamp == (hlc.Timestamp{}) {
+		log.Fatalf(ctx, "uninitialized txn: %s", t)
 	}
-	if (t == nil && s != nil) || (t != nil && s == nil) {
-		return false
-	}
-	return TxnIDEqual(t.ID, s.ID)
-}
-
-// IsInitialized returns true if the transaction has been initialized.
-func (t *Transaction) IsInitialized() bool {
-	return t.ID != nil
 }
 
 // MakePriority generates a random priority value, biased by the specified
@@ -837,16 +819,6 @@ func MakePriority(userPriority UserPriority) int32 {
 	return int32(val)
 }
 
-// TxnIDEqual returns whether the transaction IDs are equal.
-func TxnIDEqual(a, b *uuid.UUID) bool {
-	if a == nil && b == nil {
-		return true
-	} else if a != nil && b != nil {
-		return *a == *b
-	}
-	return false
-}
-
 // Restart reconfigures a transaction for restart. The epoch is
 // incremented for an in-place restart. The timestamp of the
 // transaction on restart is set to the maximum of the transaction's
@@ -854,7 +826,7 @@ func TxnIDEqual(a, b *uuid.UUID) bool {
 func (t *Transaction) Restart(
 	userPriority UserPriority, upgradePriority int32, timestamp hlc.Timestamp,
 ) {
-	t.Epoch++
+	t.BumpEpoch()
 	if t.Timestamp.Less(timestamp) {
 		t.Timestamp = timestamp
 	}
@@ -871,6 +843,13 @@ func (t *Transaction) Restart(
 	t.Sequence = 0
 }
 
+// BumpEpoch increments the transaction's epoch, allowing for an in-place
+// restart. This invalidates all write intents previously written at lower
+// epochs.
+func (t *Transaction) BumpEpoch() {
+	t.Epoch++
+}
+
 // Update ratchets priority, timestamp and original timestamp values (among
 // others) for the transaction. If t.ID is empty, then the transaction is
 // copied from o.
@@ -878,7 +857,8 @@ func (t *Transaction) Update(o *Transaction) {
 	if o == nil {
 		return
 	}
-	if t.ID == nil {
+	o.AssertInitialized(context.TODO())
+	if t.ID == (uuid.UUID{}) {
 		*t = o.Clone()
 		return
 	}
@@ -958,6 +938,17 @@ func (t *Transaction) ResetObservedTimestamps() {
 // operations in the transaction. When multiple calls are made for a single
 // nodeID, the lowest timestamp prevails.
 func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, maxTS hlc.Timestamp) {
+	// Fast path optimization for either no observed timestamps or
+	// exactly one, for the same nodeID as we're updating.
+	if l := len(t.ObservedTimestamps); l == 0 {
+		t.ObservedTimestamps = []ObservedTimestamp{{NodeID: nodeID, Timestamp: maxTS}}
+		return
+	} else if l == 1 && t.ObservedTimestamps[0].NodeID == nodeID {
+		if maxTS.Less(t.ObservedTimestamps[0].Timestamp) {
+			t.ObservedTimestamps = []ObservedTimestamp{{NodeID: nodeID, Timestamp: maxTS}}
+		}
+		return
+	}
 	s := observedTimestampSlice(t.ObservedTimestamps)
 	t.ObservedTimestamps = s.update(nodeID, maxTS)
 }
@@ -985,35 +976,48 @@ func (t Transaction) GetObservedTimestamp(nodeID NodeID) (hlc.Timestamp, bool) {
 //
 // In case retryErr tells us that a new Transaction needs to be created,
 // isolation and name help initialize this new transaction.
-func PrepareTransactionForRetry(ctx context.Context, pErr *Error, pri UserPriority) Transaction {
+func PrepareTransactionForRetry(
+	ctx context.Context, pErr *Error, pri UserPriority, clock *hlc.Clock,
+) Transaction {
 	if pErr.TransactionRestart == TransactionRestart_NONE {
 		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
 	}
-	txn := pErr.GetTxn()
-	if txn == nil {
+
+	if pErr.GetTxn() == nil {
 		log.Fatalf(ctx, "missing txn for retryable error: %s", pErr)
 	}
 
+	txn := pErr.GetTxn().Clone()
 	aborted := false
-
-	// Figure out what updated Transaction the error should carry.
-	// TransactionAbortedError will not carry a Transaction, signaling to the
-	// recipient to start a brand new txn.
-	txnClone := txn.Clone()
-	txn = &txnClone
 	switch tErr := pErr.GetDetail().(type) {
 	case *TransactionAbortedError:
+		// The txn coming with a TransactionAbortedError is not supposed to be used
+		// for the restart. Instead, a brand new transaction is created.
 		aborted = true
 		// TODO(andrei): Should we preserve the ObservedTimestamps across the
 		// restart?
-		txn = &Transaction{
-			TxnMeta: enginepb.TxnMeta{
-				Priority:  txn.Priority,
-				Timestamp: txn.Timestamp,
-				Isolation: txn.Isolation,
-			},
-			Name: txn.Name,
+		errTxnPri := txn.Priority
+		// The OrigTimestamp of the new transaction is going to be the greater of
+		// two the current clock and the timestamp received in the error.
+		// TODO(andrei): Can we just use the clock since it has already been
+		// advanced to at least the error's timestamp?
+		now := clock.Now()
+		newTxnTimestamp := now
+		if newTxnTimestamp.Less(txn.Timestamp) {
+			newTxnTimestamp = txn.Timestamp
 		}
+		txn = MakeTransaction(
+			txn.Name,
+			nil, // baseKey
+			// We have errTxnPri, but this wants a UserPriority. So we're going to
+			// overwrite the priority below.
+			NormalUserPriority,
+			txn.Isolation,
+			newTxnTimestamp,
+			clock.MaxOffset().Nanoseconds(),
+		)
+		// Use the priority communicated back by the server.
+		txn.Priority = errTxnPri
 	case *ReadWithinUncertaintyIntervalError:
 		// If the reader encountered a newer write within the uncertainty
 		// interval, we advance the txn's timestamp just past the last observed
@@ -1044,7 +1048,13 @@ func PrepareTransactionForRetry(ctx context.Context, pErr *Error, pri UserPriori
 	if !aborted {
 		txn.Restart(pri, txn.Priority, txn.Timestamp)
 	}
-	return *txn
+	return txn
+}
+
+var _ fmt.Stringer = &ChangeReplicasTrigger{}
+
+func (crt ChangeReplicasTrigger) String() string {
+	return fmt.Sprintf("%s(%s): updated=%s next=%d", crt.ChangeType, crt.Replica, crt.UpdatedReplicas, crt.NextReplicaID)
 }
 
 var _ fmt.Stringer = &Lease{}
@@ -1057,7 +1067,18 @@ func (l Lease) String() string {
 	if l.Type() == LeaseExpiration {
 		return fmt.Sprintf("repl=%s start=%s exp=%s%s", l.Replica, l.Start, l.Expiration, proposedSuffix)
 	}
-	return fmt.Sprintf("repl=%s start=%s epo=%d%s", l.Replica, l.Start, *l.Epoch, proposedSuffix)
+	return fmt.Sprintf("repl=%s start=%s epo=%d%s", l.Replica, l.Start, l.Epoch, proposedSuffix)
+}
+
+// BootstrapLease returns the lease to persist for the range of a freshly bootstrapped store. The
+// returned lease is morally "empty" but has a few fields set to non-nil zero values because some
+// used to be non-nullable and we now fuzz their nullability in tests. As a consequence, it's better
+// to always use zero fields here so that the initial stats are constant.
+func BootstrapLease() Lease {
+	return Lease{
+		Expiration:            &hlc.Timestamp{},
+		DeprecatedStartStasis: &hlc.Timestamp{},
+	}
 }
 
 // OwnedBy returns whether the given store is the lease owner.
@@ -1081,7 +1102,7 @@ const (
 
 // Type returns the lease type.
 func (l Lease) Type() LeaseType {
-	if l.Epoch == nil {
+	if l.Epoch == 0 {
 		return LeaseExpiration
 	}
 	return LeaseEpoch
@@ -1096,18 +1117,39 @@ func (l Lease) Type() LeaseType {
 func (l Lease) Equivalent(ol Lease) bool {
 	// Ignore proposed timestamp & deprecated start stasis.
 	l.ProposedTS, ol.ProposedTS = nil, nil
-	l.DeprecatedStartStasis = ol.DeprecatedStartStasis
+	l.DeprecatedStartStasis, ol.DeprecatedStartStasis = nil, nil
 	// If both leases are epoch-based, we must dereference the epochs
 	// and then set to nil.
-	if l.Type() == LeaseEpoch && ol.Type() == LeaseEpoch && *l.Epoch == *ol.Epoch {
-		l.Epoch, ol.Epoch = nil, nil
-	}
-	// For expiration-based leases, extensions are considered equivalent.
-	if l.Type() == LeaseExpiration && ol.Type() == LeaseExpiration &&
-		l.Expiration.Less(ol.Expiration) {
-		l.Expiration = ol.Expiration
+	switch l.Type() {
+	case LeaseEpoch:
+		// Ignore expirations. This seems benign but since we changed the
+		// nullability of this field in the 1.2 cycle, it's crucial and
+		// tested in TestLeaseEquivalence.
+		l.Expiration, ol.Expiration = nil, nil
+
+		if l.Epoch == ol.Epoch {
+			l.Epoch, ol.Epoch = 0, 0
+		}
+	case LeaseExpiration:
+		// See the comment above, though this field's nullability wasn't
+		// changed. We nil it out for completeness only.
+		l.Epoch, ol.Epoch = 0, 0
+
+		// For expiration-based leases, extensions are considered equivalent.
+		if !ol.GetExpiration().Less(l.GetExpiration()) {
+			l.Expiration, ol.Expiration = nil, nil
+		}
 	}
 	return l == ol
+}
+
+// GetExpiration returns the lease expiration or the zero timestamp if the
+// receiver is not an expiration-based lease.
+func (l Lease) GetExpiration() hlc.Timestamp {
+	if l.Expiration == nil {
+		return hlc.Timestamp{}
+	}
+	return *l.Expiration
 }
 
 // AsIntents takes a slice of spans and returns it as a slice of intents for
@@ -1195,10 +1237,10 @@ func (rs RSpan) ContainsKey(key RKey) bool {
 	return bytes.Compare(key, rs.Key) >= 0 && bytes.Compare(key, rs.EndKey) < 0
 }
 
-// ContainsExclusiveEndKey returns whether this span contains the specified key.
-// A span is considered to include its EndKey (e.g., span ["a", b") contains
-// "b" according to this function, but does not contain "a").
-func (rs RSpan) ContainsExclusiveEndKey(key RKey) bool {
+// ContainsKeyInverted returns whether this span contains the specified key. The
+// receiver span is considered inverted, meaning that instead of containing the
+// range ["key","endKey"), it contains the range ("key","endKey"].
+func (rs RSpan) ContainsKeyInverted(key RKey) bool {
 	return bytes.Compare(key, rs.Key) > 0 && bytes.Compare(key, rs.EndKey) <= 0
 }
 
@@ -1241,10 +1283,10 @@ func (rs RSpan) Intersect(desc *RangeDescriptor) (RSpan, error) {
 	return RSpan{key, endKey}, nil
 }
 
-// asRawSpan returns the RSpan as a Span. This is to be used only in select
-// situations in which an RSpan is known to not contain a wrapped locally-
-// addressed Span. Do not export.
-func (rs RSpan) asRawSpan() Span {
+// AsRawSpanWithNoLocals returns the RSpan as a Span. This is to be used only
+// in select situations in which an RSpan is known to not contain a wrapped
+// locally-addressed Span.
+func (rs RSpan) AsRawSpanWithNoLocals() Span {
 	return Span{
 		Key:    Key(rs.Key),
 		EndKey: Key(rs.EndKey),
@@ -1253,7 +1295,7 @@ func (rs RSpan) asRawSpan() Span {
 
 // Overlaps returns whether the two spans overlap.
 func (rs RSpan) Overlaps(other RSpan) bool {
-	return rs.asRawSpan().Overlaps(other.asRawSpan())
+	return rs.AsRawSpanWithNoLocals().Overlaps(other.AsRawSpanWithNoLocals())
 }
 
 // KeyValueByKey implements sorting of a slice of KeyValues by key.

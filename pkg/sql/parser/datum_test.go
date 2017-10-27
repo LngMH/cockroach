@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: David Eisenstat (eisen@cockroachlabs.com)
 
 package parser
 
@@ -84,8 +82,8 @@ func TestDatumOrdering(t *testing.T) {
 		{`'':::string`, valIsMin, `e'\x00'`, `''`, noMax},
 		{`e'\x00'`, noPrev, `e'\x00\x00'`, `''`, noMax},
 		{`'abc':::string`, noPrev, `e'abc\x00'`, `''`, noMax},
-		{`'':::bytes`, valIsMin, `b'\x00'`, `b''`, noMax},
-		{`'abc':::bytes`, noPrev, `b'abc\x00'`, `b''`, noMax},
+		{`'':::bytes`, valIsMin, `'\x00'`, `'\x'`, noMax},
+		{`'abc':::bytes`, noPrev, `'\x61626300'`, `'\x'`, noMax},
 
 		// Dates
 		{`'2006-01-02':::date`, `'2006-01-01'`, `'2006-01-03'`, noMin, noMax},
@@ -122,6 +120,20 @@ func TestDatumOrdering(t *testing.T) {
 		{`'00000000-0000-0000-ffff-ffffffffffff'::uuid`, `'00000000-0000-0000-ffff-fffffffffffe'`,
 			`'00000000-0000-0001-0000-000000000000'`, `'00000000-0000-0000-0000-000000000000'`,
 			`'ffffffff-ffff-ffff-ffff-ffffffffffff'`},
+
+		// INETs
+		{`'0.0.0.0'::inet`, `'255.255.255.255/31'`, `'0.0.0.1'`, `'0.0.0.0/0'`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'`},
+		{`'0.0.0.0/0'::inet`, noPrev, `'0.0.0.1/0'`, `'0.0.0.0/0'`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'`},
+		{`'192.168.255.255'::inet`, `'192.168.255.254'`, `'192.169.0.0'`, `'0.0.0.0/0'`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'`},
+		{`'127.0.0.1'::inet`, `'127.0.0.0'`, `'127.0.0.2'`, `'0.0.0.0/0'`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'`},
+		{`'192.168.0.1/20'::inet`, `'192.168.0.0/20'`, `'192.168.0.2/20'`, `'0.0.0.0/0'`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'`},
+		{`'192.168.0.0/20'::inet`, `'192.167.255.255/20'`, `'192.168.0.1/20'`, `'0.0.0.0/0'`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'`},
+		{`'::ffff:1.2.3.4'::inet`, `'::ffff:1.2.3.3'`, `'::ffff:1.2.3.5'`, `'0.0.0.0/0'`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'`},
+		{`'::0'::inet`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/127'`, `'::1'`, `'0.0.0.0/0'`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'`},
+		{`'::0/0'::inet`, `'255.255.255.255'`, `'::1/0'`, `'0.0.0.0/0'`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'`},
+		{`'255.255.255.255/32'::inet`, `'255.255.255.254'`, `'::/0'`, `'0.0.0.0/0'`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'`},
+		{`'255.255.255.255/16'::inet`, `'255.255.255.254/16'`, `'0.0.0.0/17'`, `'0.0.0.0/0'`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'`},
+		{`'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128'::inet`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe'`, noNext, `'0.0.0.0/0'`, `'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'`},
 
 		// NULL
 		{`NULL`, valIsMin, valIsMax, `NULL`, `NULL`},

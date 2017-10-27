@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package tracing
 
@@ -119,6 +117,14 @@ func (s *span) isRecording() bool {
 	return atomic.LoadInt32(&s.recording) != 0
 }
 
+// IsRecording returns true if the span is recording its events.
+func IsRecording(s opentracing.Span) bool {
+	if _, noop := s.(*noopSpan); noop {
+		return false
+	}
+	return s.(*span).isRecording()
+}
+
 func (s *span) enableRecording(group *spanGroup, recType RecordingType) {
 	if group == nil {
 		panic("no spanGroup")
@@ -135,17 +141,6 @@ func (s *span) enableRecording(group *spanGroup, recType RecordingType) {
 	s.mu.Unlock()
 
 	group.addSpan(s)
-}
-
-// GetSpanTag returns the value of a tag in a span.
-func GetSpanTag(os opentracing.Span, key string) interface{} {
-	if _, noop := os.(*noopSpan); noop {
-		return nil
-	}
-	sp := os.(*span)
-	sp.mu.Lock()
-	defer sp.mu.Unlock()
-	return sp.mu.tags[key]
 }
 
 // StartRecording enables recording on the span. Events from this point forward
@@ -245,6 +240,13 @@ func IsBlackHoleSpan(s opentracing.Span) bool {
 	}
 	sp := s.(*span)
 	return !sp.isRecording() && sp.netTr == nil && sp.shadowTr == nil
+}
+
+// IsNoopContext returns true if the span context is from a "no-op" span. If
+// this is true, any span derived from this context will be a "black hole span".
+func IsNoopContext(spanCtx opentracing.SpanContext) bool {
+	_, noop := spanCtx.(noopSpanContext)
+	return noop
 }
 
 // Finish is part of the opentracing.Span interface.
@@ -386,6 +388,10 @@ func (s *span) SetBaggageItem(restrictedKey, value string) opentracing.Span {
 }
 
 func (s *span) setBaggageItemLocked(restrictedKey, value string) opentracing.Span {
+	if oldVal, ok := s.mu.Baggage[restrictedKey]; ok && oldVal == value {
+		// No-op.
+		return s
+	}
 	if s.mu.Baggage == nil {
 		s.mu.Baggage = make(map[string]string)
 	}

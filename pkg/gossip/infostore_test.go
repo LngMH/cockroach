@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package gossip
 
@@ -35,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/gogo/protobuf/proto"
 )
 
@@ -44,7 +43,7 @@ func newTestInfoStore() (*infoStore, *stop.Stopper) {
 	stopper := stop.NewStopper()
 	nc := &base.NodeIDContainer{}
 	nc.Set(context.TODO(), 1)
-	is := newInfoStore(log.AmbientContext{}, nc, emptyAddr, stopper)
+	is := newInfoStore(log.AmbientContext{Tracer: tracing.NewTracer()}, nc, emptyAddr, stopper)
 	return is, stopper
 }
 

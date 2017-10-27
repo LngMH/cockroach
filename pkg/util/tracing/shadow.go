@@ -12,8 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 //
-// Author: Radu Berinde (radu@cockroachlabs.com)
-//
 // A "shadow" tracer can be any opentracing.Tracer implementation that is used
 // in addition to the normal functionality of our tracer. It works by attaching
 // a shadow span to every span, and attaching a shadow context to every span
@@ -26,7 +24,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	lightstep "github.com/lightstep/lightstep-tracer-go"
 	opentracing "github.com/opentracing/opentracing-go"
 	zipkin "github.com/openzipkin/zipkin-go-opentracing"
@@ -109,12 +106,6 @@ func linkShadowSpan(
 	s.shadowSpan = shadowTr.StartSpan(s.operation, opts...)
 }
 
-var lightStepToken = settings.RegisterStringSetting(
-	"trace.lightstep.token",
-	"if set, traces go to Lightstep using this token",
-	"",
-)
-
 func createLightStepTracer(token string) (shadowTracerManager, opentracing.Tracer) {
 	return lightStepManager{}, lightstep.NewTracer(lightstep.Options{
 		AccessToken:      token,
@@ -123,12 +114,6 @@ func createLightStepTracer(token string) (shadowTracerManager, opentracing.Trace
 		UseGRPC:          true,
 	})
 }
-
-var zipkinCollector = settings.RegisterStringSetting(
-	"trace.zipkin.collector",
-	"if set, traces go to the given Zipkin instance (example: '127.0.0.1:9411'); ignored if trace.lightstep.token is set.",
-	"",
-)
 
 func createZipkinTracer(collectorAddr string) (shadowTracerManager, opentracing.Tracer) {
 	// Create our HTTP collector.
@@ -147,7 +132,7 @@ func createZipkinTracer(collectorAddr string) (shadowTracerManager, opentracing.
 	}
 
 	// Create our recorder.
-	recorder := zipkin.NewRecorder(collector, false /* !debug */, "0.0.0.0:0", "cockroach")
+	recorder := zipkin.NewRecorder(collector, false /* debug */, "0.0.0.0:0", "cockroach")
 
 	// Create our tracer.
 	zipkinTr, err := zipkin.NewTracer(recorder)
@@ -155,23 +140,4 @@ func createZipkinTracer(collectorAddr string) (shadowTracerManager, opentracing.
 		panic(err)
 	}
 	return &zipkinManager{collector: collector}, zipkinTr
-}
-
-// We don't call OnChange inline above because it causes an "initialization
-// loop" compile error.
-var _ = lightStepToken.OnChange(updateShadowTracers)
-var _ = zipkinCollector.OnChange(updateShadowTracers)
-
-func updateShadowTracer(t *Tracer) {
-	if lsToken := lightStepToken.Get(); lsToken != "" {
-		t.setShadowTracer(createLightStepTracer(lsToken))
-	} else if zipkinAddr := zipkinCollector.Get(); zipkinAddr != "" {
-		t.setShadowTracer(createZipkinTracer(zipkinAddr))
-	} else {
-		t.setShadowTracer(nil, nil)
-	}
-}
-
-func updateShadowTracers() {
-	tracerRegistry.ForEach(updateShadowTracer)
 }

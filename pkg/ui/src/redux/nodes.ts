@@ -20,6 +20,14 @@ import { nullOfReturnType } from "src/util/types";
 export const deadTimeout = moment.duration(5, "m");
 
 /**
+ * A grace period for which a liveness record can be expired before being
+ * its node is considered suspect. This helps to avoid situations where liveness
+ * records are being updated correctly on the server, but are judged to be dead
+ * on the client due to clock skew.
+ */
+export const suspectGracePeriod = moment.duration(5, "s");
+
+/**
  * LivenessStatus is a convenience enumeration used to bucket node liveness
  * records into basic states.
  */
@@ -38,12 +46,16 @@ export enum LivenessStatus {
    * considered dead.
    */
   DEAD,
+  /**
+   * DEAD, but the liveness record has the decommissioning flag set.
+   */
+  DECOMMISSIONED,
 }
 
 // Functions to select data directly from the redux state.
 export const nodeStatusesSelector = (state: AdminUIState) => state.cachedData.nodes.data;
 const livenessesSelector = (state: AdminUIState) => state.cachedData.liveness.data;
-const livenessCheckedAtSelector = (state: AdminUIState) => state.cachedData.liveness.setAt;
+const livenessCheckedAtSelector = (state: AdminUIState) => state.cachedData.liveness.requestedAt;
 
 /**
  * livenessByNodeIDSelector returns a map from NodeID to the Liveness record for
@@ -72,8 +84,8 @@ const livenessStatusByNodeIDSelector = createSelector(
       return _.mapValues(livenessByNodeID, (l) => {
         const expiration = moment(NanoToMilli(l.expiration.wall_time.toNumber()));
         if (expiration.isBefore(deadCutoff)) {
-          return LivenessStatus.DEAD;
-        } else if (expiration.isBefore(livenessCheckedAt)) {
+          return l.decommissioning ? LivenessStatus.DECOMMISSIONED : LivenessStatus.DEAD;
+        } else if (expiration.clone().add(suspectGracePeriod).isBefore(livenessCheckedAt)) {
           return LivenessStatus.SUSPECT;
         }
         return LivenessStatus.HEALTHY;
@@ -121,7 +133,9 @@ const nodeSumsSelector = createSelector(
         healthy: 0,
         suspect: 0,
         dead: 0,
+        decommissioned: 0,
       },
+      capacityUsed: 0,
       capacityAvailable: 0,
       capacityTotal: 0,
       usedBytes: 0,
@@ -131,8 +145,10 @@ const nodeSumsSelector = createSelector(
     };
     if (_.isArray(nodeStatuses) && _.isObject(livenessStatusByNodeID)) {
       nodeStatuses.forEach((n) => {
-        result.nodeCounts.total += 1;
         const status = livenessStatusByNodeID[n.desc.node_id];
+        if (status !== LivenessStatus.DECOMMISSIONED) {
+          result.nodeCounts.total += 1;
+        }
         switch (status) {
           case LivenessStatus.HEALTHY:
             result.nodeCounts.healthy++;
@@ -140,14 +156,16 @@ const nodeSumsSelector = createSelector(
           case LivenessStatus.SUSPECT:
             result.nodeCounts.suspect++;
             break;
-          case LivenessStatus.DEAD:
-            result.nodeCounts.dead++;
+          case LivenessStatus.DECOMMISSIONED:
+            result.nodeCounts.decommissioned++;
             break;
+          case LivenessStatus.DEAD:
           default:
             result.nodeCounts.dead++;
             break;
         }
         if (status !== LivenessStatus.DEAD) {
+          result.capacityUsed += n.metrics[MetricConstants.usedCapacity];
           result.capacityAvailable += n.metrics[MetricConstants.availableCapacity];
           result.capacityTotal += n.metrics[MetricConstants.capacity];
           result.usedBytes += BytesUsed(n);

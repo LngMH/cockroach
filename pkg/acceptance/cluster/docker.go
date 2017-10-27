@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package cluster
 
@@ -25,13 +23,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/jsonmessage"
@@ -42,8 +41,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
-
-const matchNone = "^$"
 
 // Retrieve the IP address of docker itself.
 func dockerIP() net.IP {
@@ -70,7 +67,7 @@ func dockerIP() net.IP {
 type Container struct {
 	id      string
 	name    string
-	cluster *LocalCluster
+	cluster *DockerCluster
 }
 
 // Name returns the container's name.
@@ -78,35 +75,57 @@ func (c Container) Name() string {
 	return c.name
 }
 
-func hasImage(ctx context.Context, l *LocalCluster, ref string) bool {
-	name := strings.Split(ref, ":")[0]
-	images, err := l.client.ImageList(ctx, types.ImageListOptions{MatchName: name})
+func hasImage(ctx context.Context, l *DockerCluster, ref string) error {
+	distributionRef, err := reference.ParseNamed(ref)
 	if err != nil {
-		log.Fatal(ctx, err)
+		return err
 	}
+	path := reference.Path(distributionRef)
+	// Correct for random docker stupidity:
+	//
+	// https://github.com/moby/moby/blob/7248742/registry/service.go#L207:L215
+	path = strings.TrimPrefix(path, "library/")
+
+	images, err := l.client.ImageList(ctx, types.ImageListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("reference", path),
+		),
+	})
+	if err != nil {
+		return err
+	}
+
+	tagged, ok := distributionRef.(reference.Tagged)
+	if !ok {
+		return errors.Errorf("untagged reference %s not permitted", ref)
+	}
+
+	wanted := fmt.Sprintf("%s:%s", path, tagged.Tag())
 	for _, image := range images {
 		for _, repoTag := range image.RepoTags {
-			// The Image.RepoTags field contains strings of the form <repo>:<tag>.
-			if ref == repoTag {
-				return true
+			// The Image.RepoTags field contains strings of the form <path>:<tag>.
+			if repoTag == wanted {
+				return nil
 			}
 		}
 	}
+	var imageList []string
 	for _, image := range images {
 		for _, tag := range image.RepoTags {
-			log.Infof(ctx, "ImageList %s %s", tag, image.ID)
+			imageList = append(imageList, "%s %s", tag, image.ID)
 		}
 	}
-	return false
+	return errors.Errorf("%s not found in:\n%s", wanted, strings.Join(imageList, "\n"))
 }
 
 func pullImage(
-	ctx context.Context, l *LocalCluster, ref string, options types.ImagePullOptions,
+	ctx context.Context, l *DockerCluster, ref string, options types.ImagePullOptions,
 ) error {
 	// HACK: on CircleCI, docker pulls the image on the first access from an
 	// acceptance test even though that image is already present. So we first
 	// check to see if our image is present in order to avoid this slowness.
-	if hasImage(ctx, l, ref) {
+	if hasImage(ctx, l, ref) == nil {
 		log.Infof(ctx, "ImagePull %s already exists", ref)
 		return nil
 	}
@@ -123,7 +142,13 @@ func pullImage(
 	outFd := out.Fd()
 	isTerminal := isatty.IsTerminal(outFd)
 
-	return jsonmessage.DisplayJSONMessagesStream(rc, out, outFd, isTerminal, nil)
+	if err := jsonmessage.DisplayJSONMessagesStream(rc, out, outFd, isTerminal, nil); err != nil {
+		return err
+	}
+	if err := hasImage(ctx, l, ref); err != nil {
+		return errors.Wrapf(err, "pulled image %s but still don't have it", ref)
+	}
+	return nil
 }
 
 // createContainer creates a new container using the specified
@@ -133,7 +158,7 @@ func pullImage(
 // defined by l.createNetwork().
 func createContainer(
 	ctx context.Context,
-	l *LocalCluster,
+	l *DockerCluster,
 	containerConfig container.Config,
 	hostConfig container.HostConfig,
 	containerName string,
@@ -231,32 +256,32 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 var _ = (*Container).Stop
 
 // Wait waits for a running container to exit.
-func (c *Container) Wait(ctx context.Context) error {
-	exitCode, err := c.cluster.client.ContainerWait(ctx, c.id)
-	if err != nil {
+func (c *Container) Wait(ctx context.Context, condition container.WaitCondition) error {
+	waitOKBodyCh, errCh := c.cluster.client.ContainerWait(ctx, c.id, condition)
+	select {
+	case err := <-errCh:
+		return err
+	case waitOKBody := <-waitOKBodyCh:
+		outputLog := filepath.Join(c.cluster.logDir, "console-output.log")
+		cmdLog, err := os.Create(outputLog)
+		if err != nil {
+			return err
+		}
+		defer cmdLog.Close()
+
+		out := io.MultiWriter(cmdLog, os.Stderr)
+		if err := c.Logs(ctx, out); err != nil {
+			log.Warning(ctx, err)
+		}
+
+		if exitCode := waitOKBody.StatusCode; exitCode != 0 {
+			err = errors.Errorf("non-zero exit code: %d", exitCode)
+			fmt.Fprintln(out, err.Error())
+			log.Shout(ctx, log.Severity_INFO, "command left-over files in ", c.cluster.logDir)
+		}
+
 		return err
 	}
-
-	outputLog := filepath.Join(c.cluster.logDir, "console-output.log")
-	cmdLog, err := os.Create(outputLog)
-	if err != nil {
-		return err
-	}
-	defer cmdLog.Close()
-
-	out := io.MultiWriter(cmdLog, os.Stderr)
-	if err := c.Logs(ctx, out); err != nil {
-		log.Warning(ctx, err)
-	}
-
-	var resultErr error
-	if exitCode != 0 {
-		resultErr = errors.Errorf("non-zero exit code: %d", exitCode)
-		fmt.Fprintln(out, resultErr.Error())
-		log.Shout(ctx, log.Severity_INFO, "command left-over files in ", c.cluster.logDir)
-	}
-
-	return resultErr
 }
 
 // Logs outputs the containers logs to the given io.Writer.
@@ -325,6 +350,27 @@ type resilientDockerClient struct {
 	client.APIClient
 }
 
+func (cli resilientDockerClient) ContainerStart(
+	clientCtx context.Context, id string, opts types.ContainerStartOptions,
+) error {
+	for {
+		err := func() error {
+			ctx, cancel := context.WithTimeout(clientCtx, 20*time.Second)
+			defer cancel()
+
+			return cli.APIClient.ContainerStart(ctx, id, opts)
+		}()
+
+		// Keep going if ContainerStart timed out, but client's context is not
+		// expired.
+		if err == context.DeadlineExceeded && clientCtx.Err() == nil {
+			log.Warningf(clientCtx, "ContainerStart timed out, retrying")
+			continue
+		}
+		return err
+	}
+}
+
 func (cli resilientDockerClient) ContainerCreate(
 	ctx context.Context,
 	config *container.Config,
@@ -372,145 +418,4 @@ func (cli resilientDockerClient) ContainerCreate(
 		return response, context.DeadlineExceeded
 	}
 	return response, err
-}
-
-func (cli resilientDockerClient) ContainerRemove(
-	ctx context.Context, container string, options types.ContainerRemoveOptions,
-) error {
-	return cli.APIClient.ContainerRemove(ctx, container, options)
-}
-
-// retryingDockerClient proxies the Docker client api and retries problematic
-// calls.
-//
-// Sometimes http requests to the Docker server, on circleci in particular, will
-// hang indefinitely and non-deterministically. This leads to flaky tests. To
-// avoid this, we wrap some of them in a timeout and retry loop.
-type retryingDockerClient struct {
-	// Implements client.APIClient, but we use that it's resilient.
-	resilientDockerClient
-	attempts int
-	timeout  time.Duration
-}
-
-// retry invokes the supplied function with time-limited contexts as long as
-// returned error is a context timeout. When needing more than one attempt to
-// get a (non-timeout) result, any errors matching retryErrorsRE are swallowed.
-//
-// For example, retrying a container removal could fail on the second attempt
-// if the first request timed out (but still executed).
-func retry(
-	ctx context.Context,
-	attempts int,
-	timeout time.Duration,
-	name string,
-	retryErrorsRE string,
-	f func(ctx context.Context) error,
-) error {
-	for i := 0; i < attempts; i++ {
-		timeoutCtx, _ := context.WithTimeout(ctx, timeout)
-		err := f(timeoutCtx)
-		if err != nil {
-			if err == context.DeadlineExceeded {
-				continue
-			} else if i > 0 && retryErrorsRE != matchNone {
-				if regexp.MustCompile(retryErrorsRE).MatchString(err.Error()) {
-					log.Infof(ctx, "%s: swallowing expected error after retry: %v",
-						name, err)
-					return nil
-				}
-			}
-		}
-		return err
-	}
-	return fmt.Errorf("%s: exceeded %d tries with a %s timeout", name, attempts, timeout)
-}
-
-func (cli retryingDockerClient) ContainerCreate(
-	ctx context.Context,
-	config *container.Config,
-	hostConfig *container.HostConfig,
-	networkingConfig *network.NetworkingConfig,
-	containerName string,
-) (container.ContainerCreateCreatedBody, error) {
-	var ret container.ContainerCreateCreatedBody
-	err := retry(ctx, cli.attempts, cli.timeout,
-		"ContainerCreate", matchNone,
-		func(timeoutCtx context.Context) error {
-			var err error
-			ret, err = cli.resilientDockerClient.ContainerCreate(timeoutCtx, config, hostConfig, networkingConfig, containerName)
-			_ = ret // silence incorrect unused warning
-			return err
-		})
-	return ret, err
-}
-
-func (cli retryingDockerClient) ContainerStart(
-	ctx context.Context, container string, options types.ContainerStartOptions,
-) error {
-	return retry(ctx, cli.attempts, cli.timeout, "ContainerStart", matchNone,
-		func(timeoutCtx context.Context) error {
-			return cli.resilientDockerClient.ContainerStart(timeoutCtx, container, options)
-		})
-}
-
-func (cli retryingDockerClient) ContainerRemove(
-	ctx context.Context, container string, options types.ContainerRemoveOptions,
-) error {
-	return retry(ctx, cli.attempts, cli.timeout, "ContainerRemove", "No such container",
-		func(timeoutCtx context.Context) error {
-			return cli.resilientDockerClient.ContainerRemove(timeoutCtx, container, options)
-		})
-}
-
-func (cli retryingDockerClient) ContainerKill(ctx context.Context, container, signal string) error {
-	return retry(ctx, cli.attempts, cli.timeout, "ContainerKill",
-		"Container .* is not running",
-		func(timeoutCtx context.Context) error {
-			return cli.resilientDockerClient.ContainerKill(timeoutCtx, container, signal)
-		})
-}
-
-func (cli retryingDockerClient) ContainerWait(
-	ctx context.Context, container string,
-) (int64, error) {
-	var ret int64
-	return ret, retry(ctx, cli.attempts, cli.timeout, "ContainerWait", matchNone,
-		func(timeoutCtx context.Context) error {
-			var err error
-			ret, err = cli.resilientDockerClient.ContainerWait(timeoutCtx, container)
-			_ = ret // silence incorrect unused warning
-			return err
-		})
-}
-
-func (cli retryingDockerClient) ImageList(
-	ctx context.Context, options types.ImageListOptions,
-) ([]types.ImageSummary, error) {
-	var ret []types.ImageSummary
-	return ret, retry(ctx, cli.attempts, cli.timeout, "ImageList", matchNone,
-		func(timeoutCtx context.Context) error {
-			var err error
-			ret, err = cli.resilientDockerClient.ImageList(timeoutCtx, options)
-			_ = ret // silence incorrect unused warning
-			return err
-		})
-}
-
-func (cli retryingDockerClient) ImagePull(
-	ctx context.Context, ref string, options types.ImagePullOptions,
-) (io.ReadCloser, error) {
-	// Image pulling is potentially slow. Make sure the timeout is sufficient.
-	timeout := cli.timeout
-	if minTimeout := 2 * time.Minute; timeout < minTimeout {
-		timeout = minTimeout
-	}
-	var ret io.ReadCloser
-	return ret, retry(ctx, cli.attempts, timeout, "ImagePull", matchNone,
-		func(timeoutCtx context.Context) error {
-			var err error
-			ret, err = cli.resilientDockerClient.ImagePull(timeoutCtx, ref, options)
-			_ = ret // silence incorrect unused warning
-			return err
-		})
 }

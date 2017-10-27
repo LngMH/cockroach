@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package sqlbase
 
@@ -22,9 +20,9 @@ import (
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
 
 func TestRowContainer(t *testing.T) {
@@ -37,7 +35,9 @@ func TestRowContainer(t *testing.T) {
 				for i := range resCol {
 					resCol[i] = ResultColumn{Typ: parser.TypeInt}
 				}
-				m := mon.MakeUnlimitedMonitor(context.Background(), "test", nil, nil, math.MaxInt64)
+				m := mon.MakeUnlimitedMonitor(
+					context.Background(), "test", mon.MemoryResource, nil, nil, math.MaxInt64,
+				)
 				rc := NewRowContainer(m.MakeBoundAccount(), ColTypeInfoFromResCols(resCol), 0)
 				row := make(parser.Datums, numCols)
 				for i := 0; i < numRows; i++ {
@@ -69,6 +69,8 @@ func TestRowContainer(t *testing.T) {
 						}
 					}
 				}
+				rc.Close(context.Background())
+				m.Stop(context.Background())
 			}
 		}
 	}

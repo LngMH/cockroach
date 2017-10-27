@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql_test
 
@@ -46,7 +44,7 @@ func TestSplitAtTableBoundary(t *testing.T) {
 
 	const tableIDQuery = `
 SELECT tables.id FROM system.namespace tables
-  JOIN system.namespace dbs ON dbs.id = tables.parentid
+  JOIN system.namespace dbs ON dbs.id = tables."parentID"
   WHERE dbs.name = $1 AND tables.name = $2
 `
 	var tableID uint32
@@ -55,7 +53,7 @@ SELECT tables.id FROM system.namespace tables
 
 	// Wait for new table to split.
 	testutils.SucceedsSoon(t, func() error {
-		desc, err := tc.LookupRange(keys.MakeRowSentinelKey(tableStartKey))
+		desc, err := tc.LookupRange(tableStartKey)
 		if err != nil {
 			t.Fatal(err)
 		}

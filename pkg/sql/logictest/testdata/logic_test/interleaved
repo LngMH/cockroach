@@ -177,16 +177,15 @@ DROP TABLE p2
 statement ok
 CREATE INDEX p1_s2 ON p1_1 (s2)
 
+# p1_0 is truncated when p2 is truncated.
 query ITTT rowsort
 SELECT * FROM p1_0
 ----
-2  2  2.01  2
-7  5  7.01  7.0
 
 statement ok
 DROP TABLE p2 CASCADE
 
-statement error table "p0" does not exist
+statement error relation "p0" does not exist
 SELECT * FROM p0
 
 # Validation and descriptor bookkeeping
@@ -222,7 +221,7 @@ all_interleaves   CREATE TABLE all_interleaves (
                     FAMILY "primary" (b, c, d)
                   ) INTERLEAVE IN PARENT p1_1 (b)
 
-statement error table "missing" does not exist
+statement error relation "missing" does not exist
 CREATE TABLE err (f FLOAT PRIMARY KEY) INTERLEAVE IN PARENT missing (f)
 
 statement error interleaved columns must match parent
@@ -288,6 +287,34 @@ SELECT * FROM orders WHERE customer = 1 AND id = 1000
 query ITTT
 EXPLAIN SELECT * FROM orders WHERE customer = 1 AND id = 1000
 ----
-0  scan
-0        table  orders@primary
-0        spans  /1/#/64/1/1000-/1/#/64/1/1001
+0  scan  ·      ·
+0  ·     table  orders@primary
+0  ·     spans  /1/#/65/1/1000-/1/#/65/1/1001
+
+# Check that interleaving can occur across databases
+statement ok
+CREATE DATABASE other; CREATE TABLE other.foo(x INT PRIMARY KEY);
+  CREATE TABLE interdb (x INT PRIMARY KEY) INTERLEAVE IN PARENT other.foo (x)
+
+query TT
+SHOW CREATE TABLE interdb
+----
+interdb                               CREATE TABLE interdb (
+                                      x INT NOT NULL,
+                                      CONSTRAINT "primary" PRIMARY KEY (x ASC),
+                                      FAMILY "primary" (x)
+) INTERLEAVE IN PARENT other.foo (x)
+
+statement ok
+CREATE TABLE t1 (id1 INT PRIMARY KEY, id2 INT, id3 INT);
+
+statement ok
+CREATE INDEX c on t1 (id2)
+   STORING (id1,id3)
+   INTERLEAVE in PARENT t1 (id2);
+
+statement ok
+DROP INDEX t1@c;
+
+statement ok
+DROP TABLE t1

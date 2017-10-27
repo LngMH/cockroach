@@ -11,36 +11,39 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
 import (
 	"io"
-	"time"
 
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
-	"sync/atomic"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/sql/mon"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
+
+// DistSQLVersion identifies DistSQL engine versions.
+type DistSQLVersion uint32
 
 // Version identifies the distsqlrun protocol version.
 //
@@ -65,18 +68,41 @@ import (
 //  - at some later point, we can choose to deprecate version 1 and have
 //    servers only accept versions >= 2 (by setting
 //    MinAcceptedVersion to 2).
-const Version = 4
+//
+// ATTENTION: When updating these fields, add to version_history.txt explaining
+// what changed.
+const Version DistSQLVersion = 7
 
 // MinAcceptedVersion is the oldest version that the server is
 // compatible with; see above.
-const MinAcceptedVersion = 4
+const MinAcceptedVersion DistSQLVersion = 6
 
-var noteworthyMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEWORTHY_DISTSQL_MEMORY_USAGE", 10*1024)
+var settingUseTempStorageSorts = settings.RegisterBoolSetting(
+	"sql.distsql.temp_storage.sorts",
+	"set to true to enable use of disk for distributed sql sorts",
+	true,
+)
+
+var settingUseTempStorageJoins = settings.RegisterBoolSetting(
+	"sql.distsql.temp_storage.joins",
+	"set to true to enable use of disk for distributed sql joins",
+	true,
+)
+
+var settingWorkMemBytes = settings.RegisterByteSizeSetting(
+	"sql.distsql.temp_storage.workmem",
+	"maximum amount of memory in bytes a processor can use before falling back to temp storage",
+	64*1024*1024, /* 64MB */
+)
+
+var noteworthyMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEWORTHY_DISTSQL_MEMORY_USAGE", 1024*1024 /* 1MB */)
 
 // ServerConfig encompasses the configuration required to create a
 // DistSQLServer.
 type ServerConfig struct {
 	log.AmbientContext
+
+	Settings *cluster.Settings
 
 	// DB is a handle to the cluster.
 	DB *client.DB
@@ -89,30 +115,27 @@ type ServerConfig struct {
 	Stopper      *stop.Stopper
 	TestingKnobs TestingKnobs
 
-	ParentMemoryMonitor *mon.MemoryMonitor
-	Counter             *metric.Counter
-	Hist                *metric.Histogram
+	ParentMemoryMonitor *mon.BytesMonitor
 
 	// TempStorage is used by some DistSQL processors to store rows when the
-	// working set is larger than can be stored in memory. It can be nil, if this
-	// cockroach node does not have an engine for temporary storage.
+	// working set is larger than can be stored in memory.
 	TempStorage engine.Engine
+	// DiskMonitor is used to monitor temporary storage disk usage. Actual disk
+	// space used will be a small multiple (~1.1) of this because of RocksDB
+	// space amplification.
+	DiskMonitor *mon.BytesMonitor
+
+	Metrics *DistSQLMetrics
 
 	// NodeID is the id of the node on which this Server is running.
 	NodeID    *base.NodeIDContainer
 	ClusterID uuid.UUID
-}
 
-// TempStorageIDGenerator generates unique IDs for each processor to use as a
-// unique (unique to this node, on this uptime) prefix when writing to temp
-// storage.
-type TempStorageIDGenerator struct {
-	nextID uint64
-}
+	// JobRegistry manages jobs being used by this Server.
+	JobRegistry *jobs.Registry
 
-// NewID generates a new unique ID.
-func (t *TempStorageIDGenerator) NewID() uint64 {
-	return atomic.AddUint64(&t.nextID, 1)
+	// A handle to gossip used to broadcast the node's DistSQL version.
+	Gossip *gossip.Gossip
 }
 
 // ServerImpl implements the server for the distributed SQL APIs.
@@ -120,15 +143,8 @@ type ServerImpl struct {
 	ServerConfig
 	flowRegistry  *flowRegistry
 	flowScheduler *flowScheduler
-	memMonitor    mon.MemoryMonitor
+	memMonitor    mon.BytesMonitor
 	regexpCache   *parser.RegexpCache
-	// tempStorage is used by some DistSQL processors to store working sets
-	// larger than memory. It can be nil, in which case processors should still
-	// gracefully OOM if the working set gets too large.
-	tempStorage engine.Engine
-	// tempStorageIDGenerator is used to generate unique prefixes per processor so that
-	// each processor uses a nonoverlapping part of the localStorage keyspace.
-	tempStorageIDGenerator TempStorageIDGenerator
 }
 
 var _ DistSQLServer = &ServerImpl{}
@@ -138,12 +154,16 @@ func NewServer(ctx context.Context, cfg ServerConfig) *ServerImpl {
 	ds := &ServerImpl{
 		ServerConfig:  cfg,
 		regexpCache:   parser.NewRegexpCache(512),
-		flowRegistry:  makeFlowRegistry(),
-		flowScheduler: newFlowScheduler(cfg.AmbientContext, cfg.Stopper),
-		memMonitor: mon.MakeMonitor("distsql",
-			cfg.Counter, cfg.Hist, -1 /* increment: use default block size */, noteworthyMemoryUsageBytes),
-		tempStorage:            cfg.TempStorage,
-		tempStorageIDGenerator: TempStorageIDGenerator{},
+		flowRegistry:  makeFlowRegistry(cfg.NodeID.Get()),
+		flowScheduler: newFlowScheduler(cfg.AmbientContext, cfg.Stopper, cfg.Metrics),
+		memMonitor: mon.MakeMonitor(
+			"distsql",
+			mon.MemoryResource,
+			cfg.Metrics.CurBytesCount,
+			cfg.Metrics.MaxBytesHist,
+			-1, /* increment: use default block size */
+			noteworthyMemoryUsageBytes,
+		),
 	}
 	ds.memMonitor.Start(ctx, cfg.ParentMemoryMonitor, mon.BoundAccount{})
 	return ds
@@ -151,7 +171,35 @@ func NewServer(ctx context.Context, cfg ServerConfig) *ServerImpl {
 
 // Start launches workers for the server.
 func (ds *ServerImpl) Start() {
+	// Gossip the version info so that other nodes don't plan incompatible flows
+	// for us.
+	if err := ds.ServerConfig.Gossip.AddInfoProto(
+		gossip.MakeDistSQLNodeVersionKey(ds.ServerConfig.NodeID.Get()),
+		&DistSQLVersionGossipInfo{
+			Version:            Version,
+			MinAcceptedVersion: MinAcceptedVersion,
+		},
+		0, // ttl - no expiration
+	); err != nil {
+		panic(err)
+	}
+
 	ds.flowScheduler.Start()
+}
+
+// FlowVerIsCompatible checks a flow's version is compatible with this node's
+// DistSQL version.
+func FlowVerIsCompatible(flowVer, minAcceptedVersion, serverVersion DistSQLVersion) bool {
+	return flowVer >= minAcceptedVersion && flowVer <= serverVersion
+}
+
+// simpleCtxProvider always returns the context that it holds.
+type simpleCtxProvider struct {
+	ctx context.Context
+}
+
+func (s simpleCtxProvider) Ctx() context.Context {
+	return s.ctx
 }
 
 // Note: unless an error is returned, the returned context contains a span that
@@ -162,8 +210,7 @@ func (ds *ServerImpl) setupFlow(
 	req *SetupFlowRequest,
 	syncFlowConsumer RowReceiver,
 ) (context.Context, *Flow, error) {
-	if req.Version < MinAcceptedVersion ||
-		req.Version > Version {
+	if !FlowVerIsCompatible(req.Version, MinAcceptedVersion, Version) {
 		err := errors.Errorf(
 			"version mismatch in flow request: %d; this node accepts %d through %d",
 			req.Version, MinAcceptedVersion, Version,
@@ -187,10 +234,22 @@ func (ds *ServerImpl) setupFlow(
 	ctx = opentracing.ContextWithSpan(ctx, sp)
 
 	// The monitor and account opened here are closed in Flow.Cleanup().
-	monitor := mon.MakeMonitor("flow",
-		ds.Counter, ds.Hist, -1 /* use default block size */, noteworthyMemoryUsageBytes)
+	monitor := mon.MakeMonitor(
+		"flow",
+		mon.MemoryResource,
+		ds.Metrics.CurBytesCount,
+		ds.Metrics.MaxBytesHist,
+		-1, /* use default block size */
+		noteworthyMemoryUsageBytes,
+	)
 	monitor.Start(ctx, &ds.memMonitor, mon.BoundAccount{})
 	acc := monitor.MakeBoundAccount()
+
+	// The flow will run in a Txn that bypasses the local TxnCoordSender.
+	txn := client.NewTxnWithProto(ds.FlowDB, req.Flow.Gateway, req.Txn)
+	// DistSQL transactions get retryable errors that would otherwise be handled
+	// by the TxnCoordSender.
+	txn.AcceptUnhandledRetryableErrors()
 
 	location, err := sqlbase.TimeZoneStringToLocation(req.EvalContext.Location)
 	if err != nil {
@@ -200,37 +259,38 @@ func (ds *ServerImpl) setupFlow(
 	evalCtx := parser.EvalContext{
 		Location:     &location,
 		Database:     req.EvalContext.Database,
-		SearchPath:   parser.SearchPath(req.EvalContext.SearchPath),
+		User:         req.EvalContext.User,
+		SearchPath:   parser.MakeSearchPath(req.EvalContext.SearchPath),
 		ClusterID:    ds.ServerConfig.ClusterID,
 		NodeID:       nodeID,
 		ReCache:      ds.regexpCache,
 		Mon:          &monitor,
 		ActiveMemAcc: &acc,
-		Ctx: func() context.Context {
-			// TODO(andrei): This is wrong. Each processor should override Ctx with its
-			// own context.
-			return ctx
-		},
+		// TODO(andrei): This is wrong. Each processor should override Ctx with its
+		// own context.
+		CtxProvider: simpleCtxProvider{ctx: ctx},
+		Txn:         txn,
 	}
-	evalCtx.SetStmtTimestamp(time.Unix(0 /* sec */, req.EvalContext.StmtTimestampNanos))
-	evalCtx.SetTxnTimestamp(time.Unix(0 /* sec */, req.EvalContext.TxnTimestampNanos))
+	evalCtx.SetStmtTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.StmtTimestampNanos))
+	evalCtx.SetTxnTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.TxnTimestampNanos))
 	evalCtx.SetClusterTimestamp(req.EvalContext.ClusterTimestamp)
 
 	// TODO(radu): we should sanity check some of these fields (especially
 	// txnProto).
 	flowCtx := FlowCtx{
-		AmbientContext:         ds.AmbientContext,
-		stopper:                ds.Stopper,
-		id:                     req.Flow.FlowID,
-		evalCtx:                evalCtx,
-		rpcCtx:                 ds.RPCContext,
-		txnProto:               &req.Txn,
-		clientDB:               ds.DB,
-		remoteTxnDB:            ds.FlowDB,
-		testingKnobs:           ds.TestingKnobs,
-		nodeID:                 nodeID,
-		tempStorageIDGenerator: &ds.tempStorageIDGenerator,
-		tempStorage:            ds.tempStorage,
+		Settings:       ds.Settings,
+		AmbientContext: ds.AmbientContext,
+		stopper:        ds.Stopper,
+		id:             req.Flow.FlowID,
+		EvalCtx:        evalCtx,
+		rpcCtx:         ds.RPCContext,
+		txn:            txn,
+		clientDB:       ds.DB,
+		testingKnobs:   ds.TestingKnobs,
+		nodeID:         nodeID,
+		TempStorage:    ds.TempStorage,
+		diskMonitor:    ds.DiskMonitor,
+		JobRegistry:    ds.ServerConfig.JobRegistry,
 	}
 
 	ctx = flowCtx.AnnotateCtx(ctx)
@@ -277,9 +337,13 @@ func (ds *ServerImpl) RunSyncFlow(stream DistSQL_RunSyncFlowServer) error {
 	mbox.setFlowCtx(&f.FlowCtx)
 
 	if err := ds.Stopper.RunTask(ctx, "distsqlrun.ServerImpl: sync flow", func(ctx context.Context) {
-		f.waitGroup.Add(1)
-		mbox.start(ctx, &f.waitGroup)
-		f.Start(ctx, func() {})
+		ctx, ctxCancel := contextutil.WithCancel(ctx)
+		defer ctxCancel()
+		mbox.start(ctx, &f.waitGroup, ctxCancel)
+		if err := f.Start(ctx, func() {}); err != nil {
+			log.Fatalf(ctx, "unexpected error from syncFlow.Start(): %s "+
+				"The error should have gone to the consumer.", err)
+		}
 		f.Wait()
 		f.Cleanup(ctx)
 	}); err != nil {
@@ -297,7 +361,7 @@ func (ds *ServerImpl) SetupFlow(
 	// Note: the passed context will be canceled when this RPC completes, so we
 	// can't associate it with the flow.
 	ctx = ds.AnnotateCtx(context.Background())
-	ctx, f, err := ds.setupFlow(ctx, parentSpan, req, nil)
+	ctx, f, err := ds.setupFlow(ctx, parentSpan, req, nil /* syncFlowConsumer */)
 	if err == nil {
 		err = ds.flowScheduler.ScheduleFlow(ctx, f)
 	}
@@ -328,13 +392,13 @@ func (ds *ServerImpl) flowStreamInt(ctx context.Context, stream DistSQL_FlowStre
 		log.Infof(ctx, "connecting inbound stream %s/%d", flowID.Short(), streamID)
 	}
 	f, receiver, cleanup, err := ds.flowRegistry.ConnectInboundStream(
-		ctx, flowID, streamID, flowStreamDefaultTimeout)
+		ctx, flowID, streamID, stream, flowStreamDefaultTimeout)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 	log.VEventf(ctx, 1, "connected inbound stream %s/%d", flowID.Short(), streamID)
-	return ProcessInboundStream(f.AnnotateCtx(ctx), stream, msg, receiver)
+	return ProcessInboundStream(f.AnnotateCtx(ctx), stream, msg, receiver, f)
 }
 
 // FlowStream is part of the DistSQLServer interface.
@@ -362,6 +426,12 @@ type TestingKnobs struct {
 	// executing the chunk. It is always called even when the backfill
 	// function returns an error, or if the table has already been dropped.
 	RunAfterBackfillChunk func()
+
+	// MemoryLimitBytes specifies a maximum amount of working memory that a
+	// processor that supports falling back to disk can use. Must be >= 1 to
+	// enable. Once this limit is hit, processors employ their on-disk
+	// implementation regardless of applicable cluster settings.
+	MemoryLimitBytes int64
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

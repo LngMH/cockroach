@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package cli
 
@@ -23,6 +21,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/mattn/go-isatty"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"golang.org/x/net/context"
 
@@ -46,18 +45,36 @@ func Main() {
 		context.Background(),
 		os.Args[1],
 	)
-	defer log.RecoverAndReportPanic(context.Background())
 
+	defer log.RecoverAndReportPanic(context.Background(), &serverCfg.Settings.SV)
+
+	errCode := 0
 	if err := Run(os.Args[1:]); err != nil {
 		fmt.Fprintf(stderr, "Failed running %q\n", os.Args[1])
-		os.Exit(ErrorCode)
+		errCode = 1
+		if ec, ok := errors.Cause(err).(*cliError); ok {
+			errCode = ec.exitCode
+		}
 	}
+	os.Exit(errCode)
 }
+
+type cliError struct {
+	exitCode int
+	severity log.Severity
+	cause    error
+}
+
+func (e *cliError) Error() string { return e.cause.Error() }
 
 // stderr aliases log.OrigStderr; we use an alias here so that tests
 // in this package can redirect the output of CLI commands to stdout
 // to be captured.
 var stderr = log.OrigStderr
+
+// stdin aliases os.Stdin; we use an alias here so that tests in this
+// package can redirect the input of the CLI shell.
+var stdin = os.Stdin
 
 var versionCmd = &cobra.Command{
 	Use:   "version",
@@ -113,6 +130,7 @@ func init() {
 
 	cockroachCmd.AddCommand(
 		startCmd,
+		initCmd,
 		certCmd,
 		quitCmd,
 

@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlplan
 
 import (
 	"fmt"
+	"math/big"
 	"testing"
 
 	"golang.org/x/net/context"
@@ -34,15 +33,34 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
+var (
+	// diffCtx is a decimal context used to perform subtractions between
+	// local and non-local decimal results to check if they are within
+	// 1ulp. Decimals within 1ulp is acceptable for high-precision
+	// decimal calculations.
+	diffCtx = parser.DecimalCtx.WithPrecision(0)
+	// Use to check for 1ulp.
+	bigOne = big.NewInt(1)
+	// floatPrecFmt is the format string with a precision of 3 (after
+	// decimal point) specified for float comparisons. Float aggregation
+	// operations involve unavoidable off-by-last-few-digits errors, which
+	// is expected.
+	floatPrecFmt = "%.3f"
+)
+
 // runTestFlow runs a flow with the given processors and returns the results.
 // Any errors stop the current test.
 func runTestFlow(
-	t *testing.T, srv serverutils.TestServerInterface, procs ...distsqlrun.ProcessorSpec,
+	t *testing.T,
+	srv serverutils.TestServerInterface,
+	txn *client.Txn,
+	procs ...distsqlrun.ProcessorSpec,
 ) sqlbase.EncDatumRows {
 	distSQLSrv := srv.DistSQLServer().(*distsqlrun.ServerImpl)
 
 	req := distsqlrun.SetupFlowRequest{
 		Version: distsqlrun.Version,
+		Txn:     *txn.Proto(),
 		Flow: distsqlrun.FlowSpec{
 			FlowID:     distsqlrun.FlowID{UUID: uuid.MakeV4()},
 			Processors: procs,
@@ -55,7 +73,9 @@ func runTestFlow(
 	if err != nil {
 		t.Fatal(err)
 	}
-	flow.Start(ctx, func() {})
+	if err := flow.Start(ctx, func() {}); err != nil {
+		t.Fatal(err)
+	}
 	flow.Wait()
 	flow.Cleanup(ctx)
 
@@ -127,10 +147,12 @@ func checkDistAggregationInfo(
 		}
 	}
 
+	txn := client.NewTxn(srv.KVClient().(*client.DB), srv.NodeID())
+
 	// First run a flow that aggregates all the rows without any local stages.
 
 	rowsNonDist := runTestFlow(
-		t, srv,
+		t, srv, txn,
 		makeTableReader(1, numRows+1, 0),
 		distsqlrun.ProcessorSpec{
 			Input: []distsqlrun.InputSyncSpec{{
@@ -153,8 +175,16 @@ func checkDistAggregationInfo(
 	)
 
 	numIntermediary := len(info.LocalStage)
-	if len(info.FinalStage) != numIntermediary {
-		t.Fatalf("local and final stages have different lengths: %#v", info)
+	numFinal := len(info.FinalStage)
+	for _, finalInfo := range info.FinalStage {
+		if len(finalInfo.LocalIdxs) == 0 {
+			t.Fatalf("final stage must specify input local indices: %#v", info)
+		}
+		for _, localIdx := range finalInfo.LocalIdxs {
+			if localIdx >= uint32(numIntermediary) {
+				t.Fatalf("local index %d out of bounds of local stages: %#v", localIdx, info)
+			}
+		}
 	}
 
 	// Now run a flow with 4 separate table readers, each with its own local
@@ -178,12 +208,12 @@ func checkDistAggregationInfo(
 		// Local aggregations have the same input.
 		localAggregations[i] = distsqlrun.AggregatorSpec_Aggregation{Func: fn, ColIdx: []uint32{0}}
 	}
-	finalAggregations := make([]distsqlrun.AggregatorSpec_Aggregation, numIntermediary)
-	for i, fn := range info.FinalStage {
+	finalAggregations := make([]distsqlrun.AggregatorSpec_Aggregation, numFinal)
+	for i, finalInfo := range info.FinalStage {
 		// Each local aggregation feeds into a final aggregation.
 		finalAggregations[i] = distsqlrun.AggregatorSpec_Aggregation{
-			Func:   fn,
-			ColIdx: []uint32{uint32(i)},
+			Func:   finalInfo.Fn,
+			ColIdx: finalInfo.LocalIdxs,
 		}
 	}
 
@@ -205,6 +235,26 @@ func checkDistAggregationInfo(
 			},
 		}},
 	}
+
+	// The type(s) outputted by the final stage can be different than the
+	// input type (e.g. DECIMAL instead of INT).
+	finalOutputTypes := make([]sqlbase.ColumnType, numFinal)
+	// Passed into FinalIndexing as the indices for the IndexedVars inputs
+	// to the post processor.
+	varIdxs := make([]int, numFinal)
+	for i, finalInfo := range info.FinalStage {
+		inputTypes := make([]sqlbase.ColumnType, len(finalInfo.LocalIdxs))
+		for i, localIdx := range finalInfo.LocalIdxs {
+			inputTypes[i] = intermediaryTypes[localIdx]
+		}
+		var err error
+		_, finalOutputTypes[i], err = distsqlrun.GetAggregateInfo(finalInfo.Fn, inputTypes...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		varIdxs[i] = i
+	}
+
 	var procs []distsqlrun.ProcessorSpec
 	for i := 0; i < numParallel; i++ {
 		tr := makeTableReader(1+i*numRows/numParallel, 1+(i+1)*numRows/numParallel, 2*i)
@@ -232,9 +282,10 @@ func checkDistAggregationInfo(
 			StreamID: distsqlrun.StreamID(2*i + 1),
 		})
 	}
+
 	if info.FinalRendering != nil {
-		h := MakeTypeIndexedVarHelper(intermediaryTypes)
-		expr, err := info.FinalRendering(&h, 0 /* varIdxOffset */)
+		h := MakeTypeIndexedVarHelper(finalOutputTypes)
+		expr, err := info.FinalRendering(&h, varIdxs)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -242,21 +293,60 @@ func checkDistAggregationInfo(
 	}
 
 	procs = append(procs, finalProc)
-	rowsDist := runTestFlow(t, srv, procs...)
+	rowsDist := runTestFlow(t, srv, txn, procs...)
 
 	if len(rowsDist[0]) != len(rowsNonDist[0]) {
 		t.Errorf("different row lengths (dist: %d non-dist: %d)", len(rowsDist[0]), len(rowsNonDist[0]))
 	} else {
 		for i := range rowsDist[0] {
-			tDist := rowsDist[0][i].Type.String()
-			tNonDist := rowsNonDist[0][i].Type.String()
-			if tDist != tNonDist {
-				t.Errorf("different type for column %d (dist: %s non-dist: %s)", i, tDist, tNonDist)
+			rowDist := rowsDist[0][i]
+			rowNonDist := rowsNonDist[0][i]
+			if !rowDist.Datum.ResolvedType().FamilyEqual(rowNonDist.Datum.ResolvedType()) {
+				t.Fatalf("different type for column %d (dist: %s non-dist: %s)", i, rowDist.Datum.ResolvedType(), rowNonDist.Datum.ResolvedType())
+			}
+
+			var equiv bool
+			var strDist, strNonDist string
+			switch typedDist := rowDist.Datum.(type) {
+			case *parser.DDecimal:
+				// For some decimal operations, non-local and
+				// local computations may differ by the last
+				// digit (by 1 ulp).
+				decDist := &typedDist.Decimal
+				decNonDist := &rowNonDist.Datum.(*parser.DDecimal).Decimal
+				strDist = decDist.String()
+				strNonDist = decNonDist.String()
+				// We first check if they're equivalent, and if
+				// not, we check if they're within 1ulp.
+				equiv = decDist.Cmp(decNonDist) == 0
+				if !equiv {
+					if _, err := diffCtx.Sub(decNonDist, decNonDist, decDist); err != nil {
+						t.Fatal(err)
+					}
+					equiv = decNonDist.Coeff.Cmp(bigOne) == 0
+				}
+			case *parser.DFloat:
+				// Float results are highly variable and
+				// loss of precision between non-local and
+				// local is expected. We reduce the precision
+				// specified by floatPrecFmt and compare
+				// their string representations.
+				floatDist := float64(*typedDist)
+				floatNonDist := float64(*rowNonDist.Datum.(*parser.DFloat))
+				strDist = fmt.Sprintf(floatPrecFmt, floatDist)
+				strNonDist = fmt.Sprintf(floatPrecFmt, floatNonDist)
+				equiv = strDist == strNonDist
+			default:
+				// For all other types, a simple string
+				// representation comparison will suffice.
+				strDist = rowDist.Datum.String()
+				strNonDist = rowNonDist.Datum.String()
+				equiv = strDist == strNonDist
+			}
+			if !equiv {
+				t.Errorf("different results for column %d\nw/o local stage:   %s\nwith local stage:  %s", i, strDist, strNonDist)
 			}
 		}
-	}
-	if rowsDist.String() != rowsNonDist.String() {
-		t.Errorf("different results\nw/o local stage:   %s\nwith local stage:  %s", rowsNonDist, rowsDist)
 	}
 }
 
@@ -281,7 +371,7 @@ func TestDistAggregationTable(t *testing.T) {
 	rng, _ := randutil.NewPseudoRand()
 	sqlutils.CreateTable(
 		t, tc.ServerConn(0), "t",
-		"k INT PRIMARY KEY, int1 INT, int2 INT, bool1 BOOL, bool2 BOOL, dec1 DECIMAL, dec2 DECIMAL, b BYTES",
+		"k INT PRIMARY KEY, int1 INT, int2 INT, bool1 BOOL, bool2 BOOL, dec1 DECIMAL, dec2 DECIMAL, float1 FLOAT, float2 FLOAT, b BYTES",
 		numRows,
 		func(row int) []parser.Datum {
 			return []parser.Datum{
@@ -292,6 +382,8 @@ func TestDistAggregationTable(t *testing.T) {
 				parser.MakeDBool(parser.DBool(rng.Intn(10) != 0)),
 				sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_DECIMAL}, false),
 				sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_DECIMAL}, true),
+				sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_FLOAT}, false),
+				sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_FLOAT}, true),
 				parser.NewDBytes(parser.DBytes(randutil.RandBytes(rng, 10))),
 			}
 		},

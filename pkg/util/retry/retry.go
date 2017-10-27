@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package retry
 
@@ -21,6 +19,7 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"golang.org/x/net/context"
 )
 
@@ -46,7 +45,7 @@ type Retry struct {
 // Start returns a new Retry initialized to some default values. The Retry can
 // then be used in an exponential-backoff retry loop.
 func Start(opts Options) Retry {
-	return StartWithCtx(nil, opts)
+	return StartWithCtx(context.Background(), opts)
 }
 
 // StartWithCtx returns a new Retry initialized to some default values. The
@@ -67,9 +66,7 @@ func StartWithCtx(ctx context.Context, opts Options) Retry {
 	}
 
 	r := Retry{opts: opts}
-	if ctx != nil {
-		r.ctxDoneChan = ctx.Done()
-	}
+	r.ctxDoneChan = ctx.Done()
 	r.Reset()
 	return r
 }
@@ -154,4 +151,24 @@ func WithMaxAttempts(ctx context.Context, opts Options, n int, fn func() error) 
 		}
 	}
 	return err
+}
+
+// ForDuration will retry the given function until it either returns
+// without error, or the given duration has elapsed. The function is invoked
+// immediately at first and then successively with an exponential backoff
+// starting at 1ns and ending at the specified duration.
+func ForDuration(duration time.Duration, fn func() error) error {
+	deadline := timeutil.Now().Add(duration)
+	var lastErr error
+	for wait := time.Duration(1); timeutil.Now().Before(deadline); wait *= 2 {
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if wait > time.Second {
+			wait = time.Second
+		}
+		time.Sleep(wait)
+	}
+	return lastErr
 }

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
@@ -43,12 +41,16 @@ type fmtFlags struct {
 	bareStrings bool
 	// If true, identifiers will be rendered without wrapping quotes.
 	bareIdentifiers bool
+	// If true, strings will be formatted for being contents of ARRAYs.
+	withinArray bool
 	// If true, datums and placeholders will have type annotations (like
 	// :::interval) as necessary to disambiguate between possible type
 	// resolutions.
 	disambiguateDatumTypes bool
 	// If false, passwords are replaced by *****.
 	showPasswords bool
+	// if true, always prints qualified names even if originally omitted.
+	alwaysQualify bool
 }
 
 // FmtFlags enables conditional formatting in the pretty-printer.
@@ -69,6 +71,10 @@ var FmtShowTypes FmtFlags = &fmtFlags{showTypes: true}
 // FmtBareStrings instructs the pretty-printer to print strings without
 // wrapping quotes, if the string contains no special characters.
 var FmtBareStrings FmtFlags = &fmtFlags{bareStrings: true}
+
+// FmtArrays instructs the pretty-printer to print strings without
+// wrapping quotes, if the string contains no special characters.
+var FmtArrays FmtFlags = &fmtFlags{withinArray: true, bareStrings: true}
 
 // FmtBareIdentifiers instructs the pretty-printer to print
 // identifiers without wrapping quotes in any case.
@@ -98,6 +104,10 @@ var FmtHideConstants FmtFlags = &fmtFlags{hideConstants: true}
 // TODO(knz): temporary until a better solution is found for #13968
 var FmtAnonymize FmtFlags = &fmtFlags{anonymize: true}
 
+// FmtSimpleQualified instructs the pretty-printer to produce
+// a straightforward representation that qualifies table names.
+var FmtSimpleQualified FmtFlags = &fmtFlags{alwaysQualify: true}
+
 // FmtReformatTableNames returns FmtFlags that instructs the pretty-printer
 // to substitute the printing of table names using the provided function.
 func FmtReformatTableNames(
@@ -106,6 +116,14 @@ func FmtReformatTableNames(
 	f := *base
 	f.tableNameFormatter = fn
 	return &f
+}
+
+// StripTypeFormatting removes the flag that extracts types from the format flags,
+// so as to enable rendering expressions for which types have not been computed yet.
+func StripTypeFormatting(f FmtFlags) FmtFlags {
+	nf := *f
+	nf.showTypes = false
+	return &nf
 }
 
 // FmtExpr returns FmtFlags that indicate how the pretty-printer
@@ -195,6 +213,11 @@ func AsStringWithFlags(n NodeFormatter, f FmtFlags) string {
 // AsString pretty prints a node to a string.
 func AsString(n NodeFormatter) string {
 	return AsStringWithFlags(n, FmtSimple)
+}
+
+// ErrString pretty prints a node to a string. Identifiers are not quoted.
+func ErrString(n NodeFormatter) string {
+	return AsStringWithFlags(n, FmtBareIdentifiers)
 }
 
 // Serialize pretty prints a node to a string using FmtParsable; it is

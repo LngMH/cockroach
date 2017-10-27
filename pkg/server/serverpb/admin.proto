@@ -11,14 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Cuong Do (cdo@cockroachlabs.com)
 
 syntax = "proto3";
 package cockroach.server.serverpb;
 option go_package = "serverpb";
 
-import "cockroach/pkg/config/config.proto";
+import "cockroach/pkg/config/zone.proto";
+import "cockroach/pkg/sql/jobs/jobs.proto";
 import "cockroach/pkg/storage/engine/enginepb/mvcc.proto";
 import "cockroach/pkg/storage/liveness.proto";
 import "cockroach/pkg/storage/log.proto";
@@ -226,8 +225,8 @@ message UsersResponse {
 message EventsRequest {
   string type = 1;
   int64 target_id = 2;
-  // limit is the total number of results that are retreived by the query. If
-  // this is obmited or set to 0, the default maximum number of results are
+  // limit is the total number of results that are retrieved by the query. If
+  // this is omitted or set to 0, the default maximum number of results are
   // returned. When set to > 0, at most only that number of results are
   // returned. When set to < 0, an unlimited number of results are returned.
   int32 limit = 3;
@@ -299,7 +298,12 @@ message ClusterRequest {
 
 // ClusterResponse contains metadata for the cluster.
 message ClusterResponse {
+  // The unique ID used to identify this cluster.
   string cluster_id = 1 [(gogoproto.customname) = "ClusterID"];
+  // True if diagnostics reporting is enabled for the cluster.
+  bool reporting_enabled = 2;
+  // True if enterprise features are enabled for the cluster.
+  bool enterprise_enabled = 3;
 }
 
 enum DrainMode {
@@ -330,6 +334,37 @@ message DrainRequest {
 // modes which are activated after having processing the request.
 message DrainResponse {
   repeated int32 on = 1;
+}
+
+// DecommissionStatusRequest requests the decommissioning status for the
+// specified or, if none are specified, all nodes.
+message DecommissionStatusRequest {
+  repeated int32 node_ids = 1 [(gogoproto.customname) = "NodeIDs",
+                               (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+}
+
+// DecommissionRequest requests the server to set the Decommissioning flag on
+// all nodes specified by 'node_id' to the value of 'decommissioning'.
+//
+// If no 'node_id' is given, targets the recipient node.
+message DecommissionRequest {
+  repeated int32 node_ids = 1 [(gogoproto.customname) = "NodeIDs",
+                               (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+  bool decommissioning = 2;
+}
+
+// DecommissionStatusResponse lists decommissioning statuses for a number of NodeIDs.
+message DecommissionStatusResponse {
+  message Status {
+    int32 node_id = 1 [ (gogoproto.customname) = "NodeID",
+                        (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+    bool is_live = 2;
+    int64 replica_count = 3;
+    bool decommissioning = 4;
+    bool draining = 5;
+  }
+  // Status of all affected nodes.
+  repeated Status status = 2 [(gogoproto.nullable) = false];
 }
 
 // SettingsRequest inquires what are the current settings in the cluster.
@@ -368,13 +403,44 @@ message LivenessResponse {
   repeated cockroach.storage.Liveness livenesses = 1 [(gogoproto.nullable) = false];
 }
 
+// JobsRequest requests system job information of the given status and type.
+message JobsRequest {
+  int32 limit = 1;
+  string status = 2;
+  cockroach.sql.jobs.Type type = 3;
+}
+
+// JobsResponse contains the job record for each matching job.
+message JobsResponse {
+  message Job {
+    int64 id = 1 [(gogoproto.customname) = "ID"];
+    string type = 2;
+    string description = 3;
+    string username = 4;
+    repeated uint32 descriptor_ids = 5 [
+      (gogoproto.customname) = "DescriptorIDs",
+      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"
+    ];
+    string status = 6;
+    google.protobuf.Timestamp created = 7 [(gogoproto.stdtime) = true];
+    google.protobuf.Timestamp started = 8 [(gogoproto.stdtime) = true];
+    google.protobuf.Timestamp finished = 9 [(gogoproto.stdtime) = true];
+    google.protobuf.Timestamp modified = 10 [(gogoproto.stdtime) = true];
+    float fraction_completed = 11;
+    string error = 12;
+  }
+
+  repeated Job jobs = 1 [(gogoproto.nullable) = false];
+}
+
 // RangeLogRequest request the history of a range from the range log.
 message RangeLogRequest {
   // TODO(tamird): use [(gogoproto.customname) = "RangeID"] below. Need to
   // figure out how to teach grpc-gateway about custom names.
+  // If RangeID is 0, returns range log history without filtering by range.
   int64 range_id = 1;
-  // limit is the total number of results that are retreived by the query. If
-  // this is obmited or set to 0, the default maximum number of results are
+  // limit is the total number of results that are retrieved by the query. If
+  // this is omitted or set to 0, the default maximum number of results are
   // returned. When set to > 0, at most only that number of results are
   // returned. When set to < 0, an unlimited number of results are returned.
   int32 limit = 2;
@@ -382,7 +448,22 @@ message RangeLogRequest {
 
 // RangeLogResponse contains a list of entries from the range log table.
 message RangeLogResponse {
-  repeated storage.RangeLogEvent events = 1 [(gogoproto.nullable) = false];
+  // To avoid porting the pretty printing of keys and descriptors to
+  // javascript, they will be precomputed on the serverside.
+  message PrettyInfo {
+    string updated_desc = 1;
+    string new_desc = 2;
+    string added_replica = 3;
+    string removed_replica = 4;
+    string reason = 5;
+    string details = 6;
+  }
+  message Event {
+    storage.RangeLogEvent event = 1 [(gogoproto.nullable) = false];
+    PrettyInfo pretty_info = 2 [(gogoproto.nullable) = false];
+  }
+  reserved 1; // Previously used.
+  repeated Event events = 2 [(gogoproto.nullable) = false];
 }
 
 // QueryPlanRequest requests the query plans for a SQL string.
@@ -513,6 +594,13 @@ service Admin {
     };
   }
 
+  // Jobs returns the job records for all jobs of the given status and type.
+  rpc Jobs(JobsRequest) returns (JobsResponse) {
+    option (google.api.http) = {
+      get: "/_admin/v1/jobs"
+    };
+  }
+
   // QueryPlan returns the query plans for a SQL string.
   rpc QueryPlan(QueryPlanRequest) returns (QueryPlanResponse) {
     option (google.api.http) = {
@@ -529,11 +617,24 @@ service Admin {
     };
   }
 
+  // Decommission puts the node(s) into the specified decommissioning state.
+  rpc Decommission(DecommissionRequest) returns (DecommissionStatusResponse) {
+  }
+
+  // DecommissionStatus retrieves the decommissioning status of the specified nodes.
+  rpc DecommissionStatus(DecommissionStatusRequest) returns (DecommissionStatusResponse) {
+  }
+
+  // URL: /_admin/v1/rangelog
+  // URL: /_admin/v1/rangelog?limit=100
   // URL: /_admin/v1/rangelog/1
   // URL: /_admin/v1/rangelog/1?limit=100
   rpc RangeLog(RangeLogRequest) returns (RangeLogResponse) {
     option (google.api.http) = {
-      get: "/_admin/v1/rangelog/{range_id}"
+      get: "/_admin/v1/rangelog"
+      additional_bindings {
+        get: "/_admin/v1/rangelog/{range_id}"
+     }
     };
   }
 }

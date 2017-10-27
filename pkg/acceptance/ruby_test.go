@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@cockroachlabs.com)
 
 package acceptance
 
@@ -40,4 +38,7 @@ require 'pg'
 conn = PG.connect()
 res = conn.exec_params('SELECT 1, 2 > $1, $1', [%v])
 raise 'Unexpected: ' + res.values.to_s unless res.values == [["1", "f", "3"]]
+
+res = conn.exec('SELECT 1e1::decimal')
+raise 'Unexpected: ' + res.values.to_s unless res.values == [["1E+1"]]
 `

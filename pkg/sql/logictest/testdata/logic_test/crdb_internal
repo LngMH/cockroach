@@ -34,18 +34,11 @@ SELECT * FROM crdb_internal.schema_changes
 ----
 table_id parent_id name type target_id target_name state direction
 
-query IITTITRTTTTT colnames
+query IITTITRTTTT colnames
 SELECT * FROM crdb_internal.tables WHERE NAME = 'namespace'
 ----
-table_id  parent_id  name       database_name  version  mod_time                         mod_time_logical  format_version            state   sc_lease_node_id  sc_lease_expiration_time  create_table
-2         1          namespace  system         1        1970-01-01 00:00:00 +0000 +0000  0.0000000000      InterleavedFormatVersion  PUBLIC  NULL              NULL                      CREATE TABLE namespace (
-          "parentID" INT NOT NULL,
-          "name" STRING NOT NULL,
-          id INT NULL,
-          CONSTRAINT "primary" PRIMARY KEY ("parentID" ASC, "name" ASC),
-          FAMILY "primary" ("parentID", "name"),
-          FAMILY fam_3_id (id)
-)
+table_id  parent_id  name       database_name  version  mod_time                         mod_time_logical  format_version            state   sc_lease_node_id  sc_lease_expiration_time
+2         1          namespace  system         1        1970-01-01 00:00:00 +0000 +0000  0E-10             InterleavedFormatVersion  PUBLIC  NULL              NULL
 
 # Verify that table names are not double escaped.
 
@@ -75,30 +68,177 @@ Version
 
 
 # The validity of the rows in this table are tested elsewhere; we merely assert the columns.
-query ITTTTTTTTTRT colnames
-SELECT * FROM crdb_internal.jobs
+query ITTTTTTTTTRTI colnames
+SELECT * FROM crdb_internal.jobs WHERE false
 ----
-id  type  description  username  descriptor_ids  status  created  started  finished  modified  fraction_completed  error
+id  type  description  username  descriptor_ids  status  created  started  finished  modified  fraction_completed  error  coordinator_id
 
-query error pq: crdb_internal.force_internal_error\(\): foo
-SELECT crdb_internal.force_internal_error('foo')
+query IITTITTT colnames
+SELECT * FROM crdb_internal.schema_changes WHERE table_id < 0
+----
+table_id  parent_id  name  type  target_id  target_name  state  direction
 
-# Check that privileged builtins are only allowed for 'root'
+query IITITB colnames
+SELECT * FROM crdb_internal.leases WHERE node_id < 0
+----
+node_id  table_id  name  parent_id  expiration  deleted
+
+query ITTTTIIITFFFFFFFFFFFF colnames
+SELECT * FROM crdb_internal.node_statement_statistics WHERE node_id < 0
+----
+node_id  application_name  flags  key  anonymized  count  first_attempt_count  max_retries  last_error  rows_avg  rows_var  parse_lat_avg  parse_lat_var  plan_lat_avg  plan_lat_var  run_lat_avg  run_lat_var  service_lat_avg  service_lat_var  overhead_lat_avg  overhead_lat_var
+
+query IIITTTT colnames
+SELECT * FROM crdb_internal.session_trace WHERE txn_idx < 0
+----
+txn_idx  span_idx  message_idx  timestamp  duration  operation  message
+
+query TTTT colnames
+SELECT * FROM crdb_internal.cluster_settings WHERE name = ''
+----
+name  current_value  type  description
+
+query TT colnames
+SELECT * FROM crdb_internal.session_variables WHERE variable = ''
+----
+variable                       value
+
+query TITTTTTBT colnames
+SELECT * FROM crdb_internal.node_queries WHERE node_id < 0
+----
+query_id  node_id  username  start  query  client_address  application_name  distributed  phase
+
+query TITTTTTBT colnames
+SELECT * FROM crdb_internal.cluster_queries WHERE node_id < 0
+----
+query_id  node_id  username  start  query  client_address  application_name  distributed  phase
+
+query ITTTTTTTT colnames
+SELECT * FROM crdb_internal.node_sessions WHERE node_id < 0
+----
+node_id  username  client_address  application_name  active_queries  last_active_query  session_start  oldest_query_start  kv_txn
+
+query ITTTTTTTT colnames
+SELECT * FROM crdb_internal.cluster_sessions WHERE node_id < 0
+----
+node_id  username  client_address  application_name  active_queries  last_active_query  session_start  oldest_query_start  kv_txn
+
+query TTTT colnames
+SELECT * FROM crdb_internal.builtin_functions WHERE function = ''
+----
+function  signature  category  details
+
+query ITITTTT colnames
+SELECT * FROM crdb_internal.create_statements WHERE database_name = ''
+----
+database_id  database_name  descriptor_id  descriptor_type  descriptor_name  create_statement  state
+
+query ITITTBTB colnames
+SELECT * FROM crdb_internal.table_columns WHERE descriptor_name = ''
+----
+descriptor_id  descriptor_name  column_id  column_name  column_type  nullable  default_expr  hidden
+
+query ITITTB colnames
+SELECT * FROM crdb_internal.table_indexes WHERE descriptor_name = ''
+----
+descriptor_id  descriptor_name  index_id  index_name  index_type  is_unique
+
+query ITITTITT colnames
+SELECT * FROM crdb_internal.index_columns WHERE descriptor_name = ''
+----
+descriptor_id  descriptor_name  index_id  index_name  column_type  column_id  column_name  column_direction
+
+query ITIITITT colnames
+SELECT * FROM crdb_internal.backward_dependencies WHERE descriptor_name = ''
+----
+descriptor_id  descriptor_name  index_id  dependson_id  dependson_type  dependson_index_id  dependson_name  dependson_details
+
+query ITIITITT colnames
+SELECT * FROM crdb_internal.forward_dependencies WHERE descriptor_name = ''
+----
+descriptor_id  descriptor_name  index_id  dependedonby_id  dependedonby_type  dependedonby_index_id  dependedonby_name  dependedonby_details
+
+query ITTT colnames
+SELECT * FROM crdb_internal.zones WHERE false
+----
+id  cli_specifier  config_yaml  config_proto
+
+statement ok
+INSERT INTO system.zones (id, config) VALUES
+  (16, ''),
+  (17, ''),
+  (18, ''),
+  (51, ''),
+  (52, '')
+
+query IT
+SELECT id, cli_specifier FROM crdb_internal.zones ORDER BY id
+----
+0   .default
+16  .meta
+17  .system
+18  .timeseries
+51  testdb
+52  testdb.foo
+
+query error pq: foo
+SELECT crdb_internal.force_error('', 'foo')
+
+query error pgcode FOOYAA pq: foo
+SELECT crdb_internal.force_error('FOOYAA', 'foo')
+
 query I
 select crdb_internal.force_retry(interval '0s')
 ----
 0
 
+query error pq: crdb_internal.set_vmodule\(\): syntax error: expect comma-separated list of filename=N
+select crdb_internal.set_vmodule('not anything reasonable')
+
+query I
+select crdb_internal.set_vmodule('doesntexist=2,butitsok=4')
+----
+0
+
+query I
+select crdb_internal.set_vmodule('')
+----
+0
+
+query ITTT colnames
+select node_id, component, field, regexp_replace(regexp_replace(value, '^\d+$', '<port>'), e':\\d+', ':<port>') as value from crdb_internal.node_runtime_info
+----
+node_id  component  field   value
+1        DB         URL     postgresql://root@127.0.0.1:<port>?application_name=cockroach&sslcert=test_certs%2Fclient.root.crt&sslkey=test_certs%2Fclient.root.key&sslmode=verify-full&sslrootcert=test_certs%2Fca.crt
+1        DB         Scheme  postgresql
+1        DB         User    root
+1        DB         Host    127.0.0.1
+1        DB         Port    <port>
+1        DB         URI     /?application_name=cockroach&sslcert=test_certs%2Fclient.root.crt&sslkey=test_certs%2Fclient.root.key&sslmode=verify-full&sslrootcert=test_certs%2Fca.crt
+1        UI         URL     https://127.0.0.1:<port>
+1        UI         Scheme  https
+1        UI         User    ·
+1        UI         Host    127.0.0.1
+1        UI         Port    <port>
+1        UI         URI     /
+
+# Check that privileged builtins are only allowed for 'root'
 user testuser
 
 query error pq: insufficient privilege
 select crdb_internal.force_retry(interval '0s')
 
 query error pq: insufficient privilege
-select crdb_internal.force_internal_error('foo')
-
-query error pq: insufficient privilege
 select crdb_internal.force_panic('foo')
 
 query error pq: insufficient privilege
 select crdb_internal.force_log_fatal('foo')
+
+query error pq: insufficient privilege
+select crdb_internal.set_vmodule('')
+
+query error pq: only root can access the node runtime information
+select * from crdb_internal.node_runtime_info
+
+query error pq: only root is allowed to read crdb_internal.ranges
+select * from crdb_internal.ranges

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 // +build !stdmalloc
 
@@ -21,7 +19,7 @@ package cli
 // #cgo CPPFLAGS: -DJEMALLOC_NO_DEMANGLE
 // #cgo LDFLAGS: -ljemalloc
 // #cgo dragonfly freebsd LDFLAGS: -lm
-// #cgo linux LDFLAGS: -lrt -lm -lpthread -ldl
+// #cgo linux LDFLAGS: -lrt -lm -lpthread
 //
 // #include <jemalloc/jemalloc.h>
 // #include <stddef.h>

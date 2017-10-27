@@ -11,12 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package server
 
 import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/rsa"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,6 +27,7 @@ import (
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/coreos/etcd/raft"
@@ -52,6 +55,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 const (
@@ -66,20 +70,6 @@ const (
 
 	// statusVars exposes prometheus metrics for monitoring consumption.
 	statusVars = statusPrefix + "vars"
-
-	// rangeDebugEndpoint exposes an html page with information about a specific range.
-	rangeDebugEndpoint = "/debug/range"
-
-	// certificatesDebugEndpoint lists the certificates on a node.
-	certificatesDebugEndpoint = "/debug/certificates"
-
-	// networkDebugEndpoint exposes an html page that contains diagnostic
-	// information about network connections.
-	networkDebugEndpoint = "/debug/network"
-
-	// nodesDebugEndpoint exposes an html page with a list of active nodes
-	// and their statuses.
-	nodesDebugEndpoint = "/debug/nodes"
 
 	// raftStateDormant is used when there is no known raft state.
 	raftStateDormant = "StateDormant"
@@ -206,6 +196,190 @@ func (s *statusServer) Gossip(
 	return status.Gossip(ctx, req)
 }
 
+// Allocator returns simulated allocator info for the ranges on the given node.
+func (s *statusServer) Allocator(
+	ctx context.Context, req *serverpb.AllocatorRequest,
+) (*serverpb.AllocatorResponse, error) {
+	ctx = s.AnnotateCtx(ctx)
+	nodeID, local, err := s.parseNodeID(req.NodeId)
+	if err != nil {
+		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	if !local {
+		status, err := s.dialNode(nodeID)
+		if err != nil {
+			return nil, err
+		}
+		return status.Allocator(ctx, req)
+	}
+
+	output := new(serverpb.AllocatorResponse)
+	err = s.stores.VisitStores(func(store *storage.Store) error {
+		// All ranges requested:
+		if len(req.RangeIDs) == 0 {
+			// Use IterateRangeDescriptors to read from the engine only
+			// because it's already exported.
+			err := storage.IterateRangeDescriptors(ctx, store.Engine(),
+				func(desc roachpb.RangeDescriptor) (bool, error) {
+					rep, err := store.GetReplica(desc.RangeID)
+					if err != nil {
+						return true, err
+					}
+					if !rep.OwnsValidLease(store.Clock().Now()) {
+						return false, nil
+					}
+					allocatorSpans, err := store.AllocatorDryRun(ctx, rep)
+					if err != nil {
+						return true, err
+					}
+					output.DryRuns = append(output.DryRuns, &serverpb.AllocatorDryRun{
+						RangeID: desc.RangeID,
+						Events:  recordedSpansToAllocatorEvents(allocatorSpans),
+					})
+					return false, nil
+				})
+			return err
+		}
+
+		// Specific ranges requested:
+		for _, rid := range req.RangeIDs {
+			rep, err := store.GetReplica(rid)
+			if err != nil {
+				// Not found: continue.
+				continue
+			}
+			if !rep.OwnsValidLease(store.Clock().Now()) {
+				continue
+			}
+			allocatorSpans, err := store.AllocatorDryRun(ctx, rep)
+			if err != nil {
+				return err
+			}
+			output.DryRuns = append(output.DryRuns, &serverpb.AllocatorDryRun{
+				RangeID: rep.RangeID,
+				Events:  recordedSpansToAllocatorEvents(allocatorSpans),
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, grpc.Errorf(codes.Internal, err.Error())
+	}
+	return output, nil
+}
+
+func recordedSpansToAllocatorEvents(
+	spans []tracing.RecordedSpan,
+) []*serverpb.AllocatorDryRun_Event {
+	var output []*serverpb.AllocatorDryRun_Event
+	var buf bytes.Buffer
+	for _, sp := range spans {
+		for _, entry := range sp.Logs {
+			event := &serverpb.AllocatorDryRun_Event{
+				Time: entry.Time,
+			}
+			if len(entry.Fields) == 1 {
+				event.Message = entry.Fields[0].Value
+			} else {
+				buf.Reset()
+				for i, f := range entry.Fields {
+					if i != 0 {
+						buf.WriteByte(' ')
+					}
+					fmt.Fprintf(&buf, "%s:%v", f.Key, f.Value)
+				}
+				event.Message = buf.String()
+			}
+			output = append(output, event)
+		}
+	}
+	return output
+}
+
+// AllocatorRange returns simulated allocator info for the requested range.
+func (s *statusServer) AllocatorRange(
+	ctx context.Context, req *serverpb.AllocatorRangeRequest,
+) (*serverpb.AllocatorRangeResponse, error) {
+	ctx = s.AnnotateCtx(ctx)
+	nodeCtx, cancel := context.WithTimeout(ctx, base.NetworkTimeout)
+	defer cancel()
+
+	isLiveMap := s.nodeLiveness.GetIsLiveMap()
+	type nodeResponse struct {
+		nodeID roachpb.NodeID
+		resp   *serverpb.AllocatorResponse
+		err    error
+	}
+
+	responses := make(chan nodeResponse)
+	// TODO(bram): consider abstracting out this repeated pattern.
+	for nodeID := range isLiveMap {
+		nodeID := nodeID
+		if err := s.stopper.RunAsyncTask(
+			nodeCtx,
+			"server.statusServer: requesting remote Allocator simulation",
+			func(ctx context.Context) {
+				status, err := s.dialNode(nodeID)
+				var allocatorResponse *serverpb.AllocatorResponse
+				if err == nil {
+					allocatorRequest := &serverpb.AllocatorRequest{
+						RangeIDs: []roachpb.RangeID{roachpb.RangeID(req.RangeId)},
+					}
+					allocatorResponse, err = status.Allocator(ctx, allocatorRequest)
+				}
+				response := nodeResponse{
+					nodeID: nodeID,
+					resp:   allocatorResponse,
+					err:    err,
+				}
+
+				select {
+				case responses <- response:
+					// Response processed.
+				case <-ctx.Done():
+					// Context completed, response no longer needed.
+				}
+			}); err != nil {
+			return nil, grpc.Errorf(codes.Internal, err.Error())
+		}
+	}
+
+	errs := make(map[roachpb.NodeID]error)
+	for remainingResponses := len(isLiveMap); remainingResponses > 0; remainingResponses-- {
+		select {
+		case resp := <-responses:
+			if resp.err != nil {
+				errs[resp.nodeID] = resp.err
+				continue
+			}
+			if len(resp.resp.DryRuns) > 0 {
+				return &serverpb.AllocatorRangeResponse{
+					NodeID: resp.nodeID,
+					DryRun: resp.resp.DryRuns[0],
+				}, nil
+			}
+		case <-ctx.Done():
+			return nil, grpc.Errorf(codes.DeadlineExceeded, "request timed out")
+		}
+	}
+
+	// We didn't get a valid simulated Allocator run. Just return whatever errors
+	// we got instead. If we didn't even get any errors, then there is no active
+	// leaseholder for the range.
+	if len(errs) > 0 {
+		var buf bytes.Buffer
+		for nodeID, err := range errs {
+			if buf.Len() > 0 {
+				buf.WriteByte('\n')
+			}
+			fmt.Fprintf(&buf, "n%d: %s", nodeID, err)
+		}
+		return nil, grpc.Errorf(codes.Internal, buf.String())
+	}
+	return &serverpb.AllocatorRangeResponse{}, nil
+}
+
 // Certificates returns the x509 certificates.
 func (s *statusServer) Certificates(
 	ctx context.Context, req *serverpb.CertificatesRequest,
@@ -257,6 +431,9 @@ func (s *statusServer) Certificates(
 
 		if cert.Error == nil {
 			details.Data = cert.FileContents
+			if err := extractCertFields(details.Data, &details); err != nil {
+				details.ErrorMessage = err.Error()
+			}
 		} else {
 			details.ErrorMessage = cert.Error.Error()
 		}
@@ -264,6 +441,52 @@ func (s *statusServer) Certificates(
 	}
 
 	return cr, nil
+}
+
+func formatCertNames(p pkix.Name) string {
+	return fmt.Sprintf("CommonName=%s, Organization=%s", p.CommonName, strings.Join(p.Organization, ","))
+}
+
+func extractCertFields(contents []byte, details *serverpb.CertificateDetails) error {
+	certs, err := security.PEMContentsToX509(contents)
+	if err != nil {
+		return err
+	}
+
+	for _, c := range certs {
+		addresses := c.DNSNames
+		for _, ip := range c.IPAddresses {
+			addresses = append(addresses, ip.String())
+		}
+
+		extKeyUsage := make([]string, len(c.ExtKeyUsage))
+		for i, eku := range c.ExtKeyUsage {
+			extKeyUsage[i] = security.ExtKeyUsageToString(eku)
+		}
+
+		var pubKeyInfo string
+		if rsaPub, ok := c.PublicKey.(*rsa.PublicKey); ok {
+			pubKeyInfo = fmt.Sprintf("%d bit RSA", rsaPub.N.BitLen())
+		} else if ecdsaPub, ok := c.PublicKey.(*ecdsa.PublicKey); ok {
+			pubKeyInfo = fmt.Sprintf("%d bit ECDSA", ecdsaPub.Params().BitSize)
+		} else {
+			// go's x509 library does not support other types (so far).
+			pubKeyInfo = fmt.Sprintf("unknown key type %T", c.PublicKey)
+		}
+
+		details.Fields = append(details.Fields, serverpb.CertificateDetails_Fields{
+			Issuer:             formatCertNames(c.Issuer),
+			Subject:            formatCertNames(c.Subject),
+			ValidFrom:          c.NotBefore.UnixNano(),
+			ValidUntil:         c.NotAfter.UnixNano(),
+			Addresses:          addresses,
+			SignatureAlgorithm: c.SignatureAlgorithm.String(),
+			PublicKey:          pubKeyInfo,
+			KeyUsage:           security.KeyUsageToString(c.KeyUsage),
+			ExtendedKeyUsage:   extKeyUsage,
+		})
+	}
+	return nil
 }
 
 // Details returns node details.
@@ -638,7 +861,7 @@ func (s *statusServer) RaftDebug(
 			// Check for replica descs not matching.
 			if j > 0 {
 				prevDesc := rng.Nodes[j-1].Range.State.Desc
-				if !desc.Equal(&prevDesc) {
+				if !desc.Equal(prevDesc) {
 					prevNodeID := rng.Nodes[j-1].NodeID
 					rng.Errors = append(rng.Errors, serverpb.RaftRangeError{
 						Message: fmt.Sprintf("node %d range descriptor does not match node %d", node.NodeID, prevNodeID),
@@ -683,21 +906,21 @@ func (s *statusServer) Ranges(
 	}
 
 	convertRaftStatus := func(raftStatus *raft.Status) serverpb.RaftState {
-		var state serverpb.RaftState
 		if raftStatus == nil {
-			state.State = raftStateDormant
-			return state
+			return serverpb.RaftState{
+				State: raftStateDormant,
+			}
 		}
 
-		state.ReplicaID = raftStatus.ID
-		state.HardState = raftStatus.HardState
-		state.Applied = raftStatus.Applied
+		state := serverpb.RaftState{
+			ReplicaID: raftStatus.ID,
+			HardState: raftStatus.HardState,
+			Applied:   raftStatus.Applied,
+			Lead:      raftStatus.Lead,
+			State:     raftStatus.RaftState.String(),
+			Progress:  make(map[uint64]serverpb.RaftState_Progress),
+		}
 
-		// Grab Lead and State, which together form the SoftState.
-		state.Lead = raftStatus.Lead
-		state.State = raftStatus.RaftState.String()
-
-		state.Progress = make(map[uint64]serverpb.RaftState_Progress)
 		for id, progress := range raftStatus.Progress {
 			state.Progress[id] = serverpb.RaftState_Progress{
 				Match:           progress.Match,
@@ -727,6 +950,10 @@ func (s *statusServer) Ranges(
 			SourceNodeID:  nodeID,
 			SourceStoreID: storeID,
 			LeaseHistory:  leaseHistory,
+			Stats: serverpb.RangeStatistics{
+				QueriesPerSecond: rep.QueriesPerSecond(),
+				WritesPerSecond:  rep.WritesPerSecond(),
+			},
 			Problems: serverpb.RangeProblems{
 				Unavailable:          metrics.RangeCounter && metrics.Unavailable,
 				LeaderNotLeaseHolder: metrics.Leader && metrics.LeaseValid && !metrics.Leaseholder,
@@ -734,6 +961,10 @@ func (s *statusServer) Ranges(
 				Underreplicated:      metrics.Leader && metrics.Underreplicated,
 				NoLease:              metrics.Leader && !metrics.LeaseValid && !metrics.Quiescent,
 			},
+			CmdQLocal:   serverpb.CommandQueueMetrics(metrics.CmdQMetricsLocal),
+			CmdQGlobal:  serverpb.CommandQueueMetrics(metrics.CmdQMetricsGlobal),
+			LeaseStatus: metrics.LeaseStatus,
+			Quiescent:   metrics.Quiescent,
 		}
 	}
 
@@ -795,6 +1026,101 @@ func (s *statusServer) Ranges(
 		return nil, grpc.Errorf(codes.Internal, err.Error())
 	}
 	return &output, nil
+}
+
+// Range returns rangeInfos for all nodes in the cluster about a specific
+// range. It also returns the range history for that range as well.
+func (s *statusServer) Range(
+	ctx context.Context, req *serverpb.RangeRequest,
+) (*serverpb.RangeResponse, error) {
+	ctx = s.AnnotateCtx(ctx)
+	response := &serverpb.RangeResponse{
+		RangeID:           roachpb.RangeID(req.RangeId),
+		NodeID:            s.gossip.NodeID.Get(),
+		ResponsesByNodeID: make(map[roachpb.NodeID]serverpb.RangeResponse_NodeResponse),
+	}
+
+	nodeCtx, cancel := context.WithTimeout(ctx, base.NetworkTimeout)
+	defer cancel()
+
+	isLiveMap := s.nodeLiveness.GetIsLiveMap()
+	type nodeResponse struct {
+		nodeID roachpb.NodeID
+		resp   *serverpb.RangesResponse
+		err    error
+	}
+
+	responses := make(chan nodeResponse)
+	// TODO(bram): consider abstracting out this repeated pattern.
+	for nodeID := range isLiveMap {
+		nodeID := nodeID
+		if err := s.stopper.RunAsyncTask(
+			nodeCtx,
+			"server.statusServer: requesting remote ranges",
+			func(ctx context.Context) {
+				status, err := s.dialNode(nodeID)
+				var rangesResponse *serverpb.RangesResponse
+				if err == nil {
+					rangesRequest := &serverpb.RangesRequest{
+						RangeIDs: []roachpb.RangeID{roachpb.RangeID(req.RangeId)},
+					}
+					rangesResponse, err = status.Ranges(ctx, rangesRequest)
+				}
+				response := nodeResponse{
+					nodeID: nodeID,
+					resp:   rangesResponse,
+					err:    err,
+				}
+
+				select {
+				case responses <- response:
+					// Response processed.
+				case <-ctx.Done():
+					// Context completed, response no longer needed.
+				}
+			}); err != nil {
+			return nil, grpc.Errorf(codes.Internal, err.Error())
+		}
+	}
+	for remainingResponses := len(isLiveMap); remainingResponses > 0; remainingResponses-- {
+		select {
+		case resp := <-responses:
+			if resp.err != nil {
+				response.ResponsesByNodeID[resp.nodeID] = serverpb.RangeResponse_NodeResponse{
+					ErrorMessage: resp.err.Error(),
+				}
+				continue
+			}
+			response.ResponsesByNodeID[resp.nodeID] = serverpb.RangeResponse_NodeResponse{
+				Response: true,
+				Infos:    resp.resp.Ranges,
+			}
+		case <-ctx.Done():
+			return nil, grpc.Errorf(codes.DeadlineExceeded, "request timed out")
+		}
+	}
+
+	return response, nil
+}
+
+// CommandQueue returns a snapshot of the command queue state for the
+// specified range.
+func (s *statusServer) CommandQueue(
+	ctx context.Context, req *serverpb.CommandQueueRequest,
+) (*serverpb.CommandQueueResponse, error) {
+	rangeID := roachpb.RangeID(req.RangeId)
+	replica, err := s.stores.GetReplicaForRangeID(rangeID)
+	if err != nil {
+		return nil, err
+	}
+
+	if replica == nil {
+		return nil, roachpb.NewRangeNotFoundError(rangeID)
+	}
+
+	return &serverpb.CommandQueueResponse{
+		Snapshot: replica.GetCommandQueueSnapshot(),
+	}, nil
 }
 
 // ListLocalSessions returns a list of SQL sessions on this node.
@@ -896,6 +1222,37 @@ func (s *statusServer) ListSessions(
 		numNodes--
 	}
 	return &resp, nil
+}
+
+// CancelQuery responds to a query cancellation request, and cancels
+// the target query's associated context and sets a cancellation flag.
+func (s *statusServer) CancelQuery(
+	ctx context.Context, req *serverpb.CancelQueryRequest,
+) (*serverpb.CancelQueryResponse, error) {
+	ctx = s.AnnotateCtx(ctx)
+	nodeID, local, err := s.parseNodeID(req.NodeId)
+
+	if err != nil {
+		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	if !local {
+		status, err := s.dialNode(nodeID)
+		if err != nil {
+			return nil, err
+		}
+		return status.CancelQuery(ctx, req)
+	}
+
+	output := &serverpb.CancelQueryResponse{}
+	cancelled, err := s.sessionRegistry.CancelQuery(req.QueryID, req.Username)
+
+	if err != nil {
+		output.Error = err.Error()
+	}
+
+	output.Cancelled = cancelled
+	return output, nil
 }
 
 // SpanStats requests the total statistics stored on a node for a given key

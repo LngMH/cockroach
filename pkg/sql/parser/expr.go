@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
@@ -137,8 +135,16 @@ type AndExpr struct {
 
 func (*AndExpr) operatorExpr() {}
 
-func binExprFmtWithParen(buf *bytes.Buffer, f FmtFlags, e1 Expr, op string, e2 Expr) {
-	binExprFmtWithParenAndSubOp(buf, f, e1, "", op, e2)
+func binExprFmtWithParen(buf *bytes.Buffer, f FmtFlags, e1 Expr, op string, e2 Expr, pad bool) {
+	exprFmtWithParen(buf, f, e1)
+	if pad {
+		buf.WriteByte(' ')
+	}
+	buf.WriteString(op)
+	if pad {
+		buf.WriteByte(' ')
+	}
+	exprFmtWithParen(buf, f, e2)
 }
 
 func binExprFmtWithParenAndSubOp(
@@ -152,12 +158,14 @@ func binExprFmtWithParenAndSubOp(
 	}
 	buf.WriteString(op)
 	buf.WriteByte(' ')
-	exprFmtWithParen(buf, f, e2)
+	buf.WriteByte('(')
+	FormatNode(buf, f, StripParens(e2))
+	buf.WriteByte(')')
 }
 
 // Format implements the NodeFormatter interface.
 func (node *AndExpr) Format(buf *bytes.Buffer, f FmtFlags) {
-	binExprFmtWithParen(buf, f, node.Left, "AND", node.Right)
+	binExprFmtWithParen(buf, f, node.Left, "AND", node.Right, true)
 }
 
 // NewTypedAndExpr returns a new AndExpr that is verified to be well-typed.
@@ -188,7 +196,7 @@ func (*OrExpr) operatorExpr() {}
 
 // Format implements the NodeFormatter interface.
 func (node *OrExpr) Format(buf *bytes.Buffer, f FmtFlags) {
-	binExprFmtWithParen(buf, f, node.Left, "OR", node.Right)
+	binExprFmtWithParen(buf, f, node.Left, "OR", node.Right, true)
 }
 
 // NewTypedOrExpr returns a new OrExpr that is verified to be well-typed.
@@ -295,6 +303,11 @@ const (
 	IsNotDistinctFrom
 	Is
 	IsNot
+	Contains
+	ContainedBy
+	HasKey
+	HasSomeKey
+	HasAllKeys
 
 	// The following operators will always be used with an associated SubOperator.
 	// If Go had algebraic data types they would be defined in a self-contained
@@ -337,6 +350,11 @@ var comparisonOpName = [...]string{
 	IsNotDistinctFrom: "IS NOT DISTINCT FROM",
 	Is:                "IS",
 	IsNot:             "IS NOT",
+	Contains:          "@>",
+	ContainedBy:       "<@",
+	HasKey:            "?",
+	HasSomeKey:        "?|",
+	HasAllKeys:        "?&",
 	Any:               "ANY",
 	Some:              "SOME",
 	All:               "ALL",
@@ -379,7 +397,7 @@ func (node *ComparisonExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	if node.Operator.hasSubOperator() {
 		binExprFmtWithParenAndSubOp(buf, f, node.Left, node.SubOperator.String(), opStr, node.Right)
 	} else {
-		binExprFmtWithParen(buf, f, node.Left, opStr, node.Right)
+		binExprFmtWithParen(buf, f, node.Left, opStr, node.Right, true)
 	}
 }
 
@@ -465,7 +483,7 @@ func (node *RangeCond) Format(buf *bytes.Buffer, f FmtFlags) {
 	}
 	exprFmtWithParen(buf, f, node.Left)
 	buf.WriteString(notStr)
-	binExprFmtWithParen(buf, f, node.From, "AND", node.To)
+	binExprFmtWithParen(buf, f, node.From, "AND", node.To, true)
 }
 
 // TypedLeft returns the RangeCond's left expression as a TypedExpr.
@@ -750,22 +768,36 @@ const (
 	Concat
 	LShift
 	RShift
+	FetchVal
+	FetchText
+	FetchValPath
+	FetchTextPath
+	RemovePath
 )
 
 var binaryOpName = [...]string{
-	Bitand:   "&",
-	Bitor:    "|",
-	Bitxor:   "#",
-	Plus:     "+",
-	Minus:    "-",
-	Mult:     "*",
-	Div:      "/",
-	FloorDiv: "//",
-	Mod:      "%",
-	Pow:      "^",
-	Concat:   "||",
-	LShift:   "<<",
-	RShift:   ">>",
+	Bitand:        "&",
+	Bitor:         "|",
+	Bitxor:        "#",
+	Plus:          "+",
+	Minus:         "-",
+	Mult:          "*",
+	Div:           "/",
+	FloorDiv:      "//",
+	Mod:           "%",
+	Pow:           "^",
+	Concat:        "||",
+	LShift:        "<<",
+	RShift:        ">>",
+	FetchVal:      "->",
+	FetchText:     "->>",
+	FetchValPath:  "#>",
+	FetchTextPath: "#>>",
+	RemovePath:    "#-",
+}
+
+func (i BinaryOperator) isPadded() bool {
+	return !(i == FetchVal || i == FetchText || i == FetchValPath || i == FetchTextPath)
 }
 
 func (i BinaryOperator) String() string {
@@ -827,7 +859,7 @@ func newBinExprIfValidOverload(op BinaryOperator, left TypedExpr, right TypedExp
 
 // Format implements the NodeFormatter interface.
 func (node *BinaryExpr) Format(buf *bytes.Buffer, f FmtFlags) {
-	binExprFmtWithParen(buf, f, node.Left, node.Operator.String(), node.Right)
+	binExprFmtWithParen(buf, f, node.Left, node.Operator.String(), node.Right, node.Operator.isPadded())
 }
 
 // UnaryOperator represents a unary operator.
@@ -1080,13 +1112,16 @@ var (
 	decimalCastTypes = []Type{TypeNull, TypeBool, TypeInt, TypeFloat, TypeDecimal, TypeString, TypeCollatedString,
 		TypeTimestamp, TypeTimestampTZ, TypeDate, TypeInterval}
 	stringCastTypes = []Type{TypeNull, TypeBool, TypeInt, TypeFloat, TypeDecimal, TypeString, TypeCollatedString,
-		TypeBytes, TypeTimestamp, TypeTimestampTZ, TypeInterval, TypeUUID, TypeDate, TypeOid}
+		TypeBytes, TypeTimestamp, TypeTimestampTZ, TypeInterval, TypeUUID, TypeDate, TypeOid, TypeINet}
 	bytesCastTypes     = []Type{TypeNull, TypeString, TypeCollatedString, TypeBytes, TypeUUID}
 	dateCastTypes      = []Type{TypeNull, TypeString, TypeCollatedString, TypeDate, TypeTimestamp, TypeTimestampTZ, TypeInt}
 	timestampCastTypes = []Type{TypeNull, TypeString, TypeCollatedString, TypeDate, TypeTimestamp, TypeTimestampTZ, TypeInt}
 	intervalCastTypes  = []Type{TypeNull, TypeString, TypeCollatedString, TypeInt, TypeInterval}
 	oidCastTypes       = []Type{TypeNull, TypeString, TypeCollatedString, TypeInt, TypeOid}
 	uuidCastTypes      = []Type{TypeNull, TypeString, TypeCollatedString, TypeBytes, TypeUUID}
+	inetCastTypes      = []Type{TypeNull, TypeString, TypeCollatedString, TypeINet}
+	arrayCastTypes     = []Type{TypeNull, TypeString}
+	jsonCastTypes      = []Type{TypeNull, TypeString}
 )
 
 // validCastTypes returns a set of types that can be cast into the provided type.
@@ -1110,8 +1145,12 @@ func validCastTypes(t Type) []Type {
 		return timestampCastTypes
 	case TypeInterval:
 		return intervalCastTypes
+	case TypeJSON:
+		return jsonCastTypes
 	case TypeUUID:
 		return uuidCastTypes
+	case TypeINet:
+		return inetCastTypes
 	case TypeOid, TypeRegClass, TypeRegNamespace, TypeRegProc, TypeRegProcedure, TypeRegType:
 		return oidCastTypes
 	default:
@@ -1119,6 +1158,8 @@ func validCastTypes(t Type) []Type {
 		// directly to collated string.
 		if t.FamilyEqual(TypeCollatedString) {
 			return stringCastTypes
+		} else if t.FamilyEqual(TypeArray) {
+			return arrayCastTypes
 		}
 		return nil
 	}
@@ -1223,7 +1264,9 @@ func (node *DDecimal) String() string         { return AsString(node) }
 func (node *DFloat) String() string           { return AsString(node) }
 func (node *DInt) String() string             { return AsString(node) }
 func (node *DInterval) String() string        { return AsString(node) }
+func (node *DJSON) String() string            { return AsString(node) }
 func (node *DUuid) String() string            { return AsString(node) }
+func (node *DIPAddr) String() string          { return AsString(node) }
 func (node *DString) String() string          { return AsString(node) }
 func (node *DCollatedString) String() string  { return AsString(node) }
 func (node *DTimestamp) String() string       { return AsString(node) }
@@ -1257,3 +1300,5 @@ func (node DefaultVal) String() string        { return AsString(node) }
 func (node *Placeholder) String() string      { return AsString(node) }
 func (node dNull) String() string             { return AsString(node) }
 func (list NameList) String() string          { return AsString(list) }
+func (node PartitionDefault) String() string  { return AsString(node) }
+func (node PartitionMaxValue) String() string { return AsString(node) }

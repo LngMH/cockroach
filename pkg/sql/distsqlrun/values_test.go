@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
@@ -22,11 +20,41 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
+
+// generateValueSpec generates a ValuesCoreSpec that encodes the given rows. We pass
+// the types as well because zero rows are allowed.
+func generateValuesSpec(
+	colTypes []sqlbase.ColumnType, rows sqlbase.EncDatumRows, rowsPerChunk int,
+) (ValuesCoreSpec, error) {
+	var spec ValuesCoreSpec
+	spec.Columns = make([]DatumInfo, len(colTypes))
+	for i := range spec.Columns {
+		spec.Columns[i].Type = colTypes[i]
+		spec.Columns[i].Encoding = sqlbase.DatumEncoding_VALUE
+	}
+
+	var a sqlbase.DatumAlloc
+	for i := 0; i < len(rows); {
+		var buf []byte
+		for end := i + rowsPerChunk; i < len(rows) && i < end; i++ {
+			for j, info := range spec.Columns {
+				var err error
+				buf, err = rows[i][j].Encode(&colTypes[j], &a, info.Encoding, buf)
+				if err != nil {
+					return ValuesCoreSpec{}, err
+				}
+			}
+		}
+		spec.RawBytes = append(spec.RawBytes, buf)
+	}
+	return spec, nil
+}
 
 func TestValues(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -35,41 +63,15 @@ func TestValues(t *testing.T) {
 		for _, numCols := range []int{1, 3} {
 			for _, rowsPerChunk := range []int{1, 2, 5} {
 				t.Run(fmt.Sprintf("%d-%d-%d", numRows, numCols, rowsPerChunk), func(t *testing.T) {
-					var a sqlbase.DatumAlloc
-					var spec ValuesCoreSpec
-					spec.Columns = make([]DatumInfo, numCols)
-					for i := range spec.Columns {
-						spec.Columns[i].Type = sqlbase.RandColumnType(rng)
-						spec.Columns[i].Encoding = sqlbase.DatumEncoding_VALUE
-					}
+					inRows, colTypes := sqlbase.RandEncDatumRows(rng, numRows, numCols)
 
-					// Generate random rows.
-					inRows := make(sqlbase.EncDatumRows, numRows)
-					for i := 0; i < numRows; i++ {
-						inRows[i] = make(sqlbase.EncDatumRow, numCols)
-						for j, info := range spec.Columns {
-							d := sqlbase.RandDatum(rng, info.Type, true)
-							inRows[i][j] = sqlbase.DatumToEncDatum(info.Type, d)
-						}
-					}
-
-					// Encode the rows.
-					for i := 0; i < numRows; {
-						var buf []byte
-						for end := i + rowsPerChunk; i < numRows && i < end; i++ {
-							for j, info := range spec.Columns {
-								var err error
-								buf, err = inRows[i][j].Encode(&a, info.Encoding, buf)
-								if err != nil {
-									t.Fatal(err)
-								}
-							}
-						}
-						spec.RawBytes = append(spec.RawBytes, buf)
+					spec, err := generateValuesSpec(colTypes, inRows, rowsPerChunk)
+					if err != nil {
+						t.Fatal(err)
 					}
 
 					out := &RowBuffer{}
-					flowCtx := FlowCtx{}
+					flowCtx := FlowCtx{Settings: cluster.MakeTestingClusterSettings()}
 
 					v, err := newValuesProcessor(&flowCtx, &spec, &PostProcessSpec{}, out)
 					if err != nil {
@@ -98,17 +100,21 @@ func TestValues(t *testing.T) {
 
 					evalCtx := parser.NewTestingEvalContext()
 					defer evalCtx.Stop(context.Background())
+					var a sqlbase.DatumAlloc
 					for i := 0; i < numRows; i++ {
 						if len(res[i]) != numCols {
 							t.Fatalf("row %d incorrect length %d, expected %d", i, len(res[i]), numCols)
 						}
-						for j, res := range res[i] {
-							cmp, err := res.Compare(&a, evalCtx, &inRows[i][j])
+						for j, val := range res[i] {
+							cmp, err := val.Compare(&colTypes[j], &a, evalCtx, &inRows[i][j])
 							if err != nil {
 								t.Fatal(err)
 							}
 							if cmp != 0 {
-								t.Errorf("row %d, column %d: received %s, expected %s", i, j, &res, &inRows[i][j])
+								t.Errorf(
+									"row %d, column %d: received %s, expected %s",
+									i, j, val.String(&colTypes[j]), inRows[i][j].String(&colTypes[j]),
+								)
 							}
 						}
 					}

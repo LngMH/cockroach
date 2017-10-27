@@ -1,4 +1,4 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: default parallel-stmts distsql distsql-disk
 
 # The join condition logic is tricky to get right with NULL
 # values. Simple implementations can deal well with NULLs on the first
@@ -412,126 +412,126 @@ x  x  y  b  d  e
 query ITTT
 EXPLAIN (EXPRS) SELECT * FROM onecolumn JOIN twocolumn USING(x)
 ----
-0  render
-0                 render 0  x
-0                 render 1  y
-1  join
-1                 type      inner
-1                 equality  (x) = (x)
-2  scan
-2                 table     onecolumn@primary
-2                 spans     ALL
-2  scan
-2                 table     twocolumn@primary
-2                 spans     ALL
+0  render  ·         ·
+0  ·       render 0  x
+0  ·       render 1  y
+1  join    ·         ·
+1  ·       type      inner
+1  ·       equality  (x) = (x)
+2  scan    ·         ·
+2  ·       table     onecolumn@primary
+2  ·       spans     ALL
+2  scan    ·         ·
+2  ·       table     twocolumn@primary
+2  ·       spans     ALL
 
 # Check EXPLAIN.
 query ITTT
 EXPLAIN (EXPRS) SELECT * FROM twocolumn AS a JOIN twocolumn AS b ON a.x = b.y
 ----
-0  render
-0                 render 0  x
-0                 render 1  y
-0                 render 2  x
-0                 render 3  y
-1  join
-1                 type      inner
-1                 equality  (x) = (y)
-2  scan
-2                 table     twocolumn@primary
-2                 spans     ALL
-2  scan
-2                 table     twocolumn@primary
-2                 spans     ALL
+0  render  ·         ·
+0  ·       render 0  x
+0  ·       render 1  y
+0  ·       render 2  x
+0  ·       render 3  y
+1  join    ·         ·
+1  ·       type      inner
+1  ·       equality  (x) = (y)
+2  scan    ·         ·
+2  ·       table     twocolumn@primary
+2  ·       spans     ALL
+2  scan    ·         ·
+2  ·       table     twocolumn@primary
+2  ·       spans     ALL
 
 # Check EXPLAIN.
 query ITTT
 EXPLAIN (EXPRS) SELECT * FROM twocolumn AS a JOIN twocolumn AS b ON a.x = 44
 ----
-0  render
-0                 render 0  x
-0                 render 1  y
-0                 render 2  x
-0                 render 3  y
-1  join
-1                 type      cross
-2  scan
-2                 table     twocolumn@primary
-2                 spans     ALL
-2                 filter    x = 44
-2  scan
-2                 table     twocolumn@primary
-2                 spans     ALL
+0  render  ·         ·
+0  ·       render 0  x
+0  ·       render 1  y
+0  ·       render 2  x
+0  ·       render 3  y
+1  join    ·         ·
+1  ·       type      cross
+2  scan    ·         ·
+2  ·       table     twocolumn@primary
+2  ·       spans     ALL
+2  ·       filter    x = 44
+2  scan    ·         ·
+2  ·       table     twocolumn@primary
+2  ·       spans     ALL
 
 # Check EXPLAIN.
 query ITTT
 EXPLAIN (EXPRS) SELECT * FROM onecolumn AS a JOIN twocolumn AS b ON ((a.x)) = ((b.y))
 ----
-0  render
-0                 render 0  x
-0                 render 1  x
-0                 render 2  y
-1  join
-1                 type      inner
-1                 equality  (x) = (y)
-2  scan
-2                 table     onecolumn@primary
-2                 spans     ALL
-2  scan
-2                 table     twocolumn@primary
-2                 spans     ALL
+0  render  ·         ·
+0  ·       render 0  x
+0  ·       render 1  x
+0  ·       render 2  y
+1  join    ·         ·
+1  ·       type      inner
+1  ·       equality  (x) = (y)
+2  scan    ·         ·
+2  ·       table     onecolumn@primary
+2  ·       spans     ALL
+2  scan    ·         ·
+2  ·       table     twocolumn@primary
+2  ·       spans     ALL
 
 # Check EXPLAIN.
 query ITTT
 EXPLAIN (EXPRS) SELECT * FROM onecolumn JOIN twocolumn ON onecolumn.x = twocolumn.y
 ----
-0  render
-0                 render 0  x
-0                 render 1  x
-0                 render 2  y
-1  join
-1                 type      inner
-1                 equality  (x) = (y)
-2  scan
-2                 table     onecolumn@primary
-2                 spans     ALL
-2  scan
-2                 table     twocolumn@primary
-2                 spans     ALL
+0  render  ·         ·
+0  ·       render 0  x
+0  ·       render 1  x
+0  ·       render 2  y
+1  join    ·         ·
+1  ·       type      inner
+1  ·       equality  (x) = (y)
+2  scan    ·         ·
+2  ·       table     onecolumn@primary
+2  ·       spans     ALL
+2  scan    ·         ·
+2  ·       table     twocolumn@primary
+2  ·       spans     ALL
 
 
 query ITTT
 EXPLAIN (EXPRS) SELECT * FROM (onecolumn CROSS JOIN twocolumn JOIN onecolumn AS a(b) ON a.b=twocolumn.x JOIN twocolumn AS c(d,e) ON a.b=c.d AND c.d=onecolumn.x) LIMIT 1
 ----
-0  limit
-0                 count     1
-1  render
-1                 render 0  x
-1                 render 1  x
-1                 render 2  y
-1                 render 3  b
-1                 render 4  d
-1                 render 5  e
-2  join
-2                 type      inner
-2                 equality  (b, x) = (d, d)
-3  join
-3                 type      inner
-3                 equality  (x) = (b)
-4  join
-4                 type      cross
-5  scan
-5                 table     onecolumn@primary
-5                 spans     ALL
-5  scan
-5                 table     twocolumn@primary
-5                 spans     ALL
-4  scan
-4                 table     onecolumn@primary
-4                 spans     ALL
-3  scan
-3                 table     twocolumn@primary
-3                 spans     ALL
+0  limit   ·         ·
+0  ·       count     1
+1  render  ·         ·
+1  ·       render 0  x
+1  ·       render 1  x
+1  ·       render 2  y
+1  ·       render 3  b
+1  ·       render 4  d
+1  ·       render 5  e
+2  join    ·         ·
+2  ·       type      inner
+2  ·       equality  (b, x) = (d, d)
+3  join    ·         ·
+3  ·       type      inner
+3  ·       equality  (x) = (b)
+4  join    ·         ·
+4  ·       type      cross
+5  scan    ·         ·
+5  ·       table     onecolumn@primary
+5  ·       spans     ALL
+5  scan    ·         ·
+5  ·       table     twocolumn@primary
+5  ·       spans     ALL
+4  scan    ·         ·
+4  ·       table     onecolumn@primary
+4  ·       spans     ALL
+3  scan    ·         ·
+3  ·       table     twocolumn@primary
+3  ·       spans     ALL
 
 # Check sub-queries in ON conditions.
 query III colnames
@@ -623,74 +623,74 @@ CREATE TABLE s(x INT); INSERT INTO s(x) VALUES (1),(2),(3),(4),(5),(6),(7),(8),(
 query ITTTTT
 EXPLAIN (METADATA) SELECT a.x, b.y FROM twocolumn AS a, twocolumn AS b
 ----
-0  render                            (x, y)
-1  join                              (x, y[omitted], rowid[hidden,omitted], x[omitted], y, rowid[hidden,omitted])
-1          type   cross
-2  scan                              (x, y[omitted], rowid[hidden,omitted])
-2          table  twocolumn@primary
-2          spans  ALL
-2  scan                              (x[omitted], y, rowid[hidden,omitted])
-2          table  twocolumn@primary
-2          spans  ALL
+0  render  ·      ·                  (x, y)                                                                        ·
+1  join    ·      ·                  (x, y[omitted], rowid[hidden,omitted], x[omitted], y, rowid[hidden,omitted])  ·
+1  ·       type   cross              ·                                                                             ·
+2  scan    ·      ·                  (x, y[omitted], rowid[hidden,omitted])                                        rowid!=NULL; key(rowid)
+2  ·       table  twocolumn@primary  ·                                                                             ·
+2  ·       spans  ALL                ·                                                                             ·
+2  scan    ·      ·                  (x[omitted], y, rowid[hidden,omitted])                                        rowid!=NULL; key(rowid)
+2  ·       table  twocolumn@primary  ·                                                                             ·
+2  ·       spans  ALL                ·                                                                             ·
 
 query ITTTTT
 EXPLAIN (METADATA) SELECT b.y FROM (twocolumn AS a JOIN twocolumn AS b USING(x))
 ----
-0  render                               (y)
-1  join                                 (x[omitted], x[hidden,omitted], y[omitted], rowid[hidden,omitted], x[hidden,omitted], y, rowid[hidden,omitted])
-1          type      inner
-1          equality  (x) = (x)
-2  scan                                 (x, y[omitted], rowid[hidden,omitted])
-2          table     twocolumn@primary
-2          spans     ALL
-2  scan                                 (x, y, rowid[hidden,omitted])
-2          table     twocolumn@primary
-2          spans     ALL
+0  render  ·         ·                  (y)                                                                                                              ·
+1  join    ·         ·                  (x[omitted], x[hidden,omitted], y[omitted], rowid[hidden,omitted], x[hidden,omitted], y, rowid[hidden,omitted])  ·
+1  ·       type      inner              ·                                                                                                                ·
+1  ·       equality  (x) = (x)          ·                                                                                                                ·
+2  scan    ·         ·                  (x, y[omitted], rowid[hidden,omitted])                                                                           rowid!=NULL; key(rowid)
+2  ·       table     twocolumn@primary  ·                                                                                                                ·
+2  ·       spans     ALL                ·                                                                                                                ·
+2  scan    ·         ·                  (x, y, rowid[hidden,omitted])                                                                                    rowid!=NULL; key(rowid)
+2  ·       table     twocolumn@primary  ·                                                                                                                ·
+2  ·       spans     ALL                ·                                                                                                                ·
 
 query ITTTTT
 EXPLAIN (METADATA) SELECT b.y FROM (twocolumn AS a JOIN twocolumn AS b ON a.x = b.x)
 ----
-0  render                               (y)
-1  join                                 (x[omitted], y[omitted], rowid[hidden,omitted], x[omitted], y, rowid[hidden,omitted])
-1          type      inner
-1          equality  (x) = (x)
-2  scan                                 (x, y[omitted], rowid[hidden,omitted])
-2          table     twocolumn@primary
-2          spans     ALL
-2  scan                                 (x, y, rowid[hidden,omitted])
-2          table     twocolumn@primary
-2          spans     ALL
+0  render  ·         ·                  (y)                                                                                    ·
+1  join    ·         ·                  (x[omitted], y[omitted], rowid[hidden,omitted], x[omitted], y, rowid[hidden,omitted])  ·
+1  ·       type      inner              ·                                                                                      ·
+1  ·       equality  (x) = (x)          ·                                                                                      ·
+2  scan    ·         ·                  (x, y[omitted], rowid[hidden,omitted])                                                 rowid!=NULL; key(rowid)
+2  ·       table     twocolumn@primary  ·                                                                                      ·
+2  ·       spans     ALL                ·                                                                                      ·
+2  scan    ·         ·                  (x, y, rowid[hidden,omitted])                                                          rowid!=NULL; key(rowid)
+2  ·       table     twocolumn@primary  ·                                                                                      ·
+2  ·       spans     ALL                ·                                                                                      ·
 
 query ITTTTT
 EXPLAIN (METADATA) SELECT a.x FROM (twocolumn AS a JOIN twocolumn AS b ON a.x < b.y)
 ----
-0  render                            (x)
-1  join                              (x, y[omitted], rowid[hidden,omitted], x[omitted], y[omitted], rowid[hidden,omitted])
-1          type   inner
-2  scan                              (x, y[omitted], rowid[hidden,omitted])
-2          table  twocolumn@primary
-2          spans  ALL
-2  scan                              (x[omitted], y, rowid[hidden,omitted])
-2          table  twocolumn@primary
-2          spans  ALL
+0  render  ·      ·                  (x)                                                                                    ·
+1  join    ·      ·                  (x, y[omitted], rowid[hidden,omitted], x[omitted], y[omitted], rowid[hidden,omitted])  ·
+1  ·       type   inner              ·                                                                                      ·
+2  scan    ·      ·                  (x, y[omitted], rowid[hidden,omitted])                                                 rowid!=NULL; key(rowid)
+2  ·       table  twocolumn@primary  ·                                                                                      ·
+2  ·       spans  ALL                ·                                                                                      ·
+2  scan    ·      ·                  (x[omitted], y, rowid[hidden,omitted])                                                 rowid!=NULL; key(rowid)
+2  ·       table  twocolumn@primary  ·                                                                                      ·
+2  ·       spans  ALL                ·                                                                                      ·
 
 # Ensure that the ordering information for the result of joins is sane. (#12037)
 query ITTTTT
 EXPLAIN (METADATA) SELECT * FROM (SELECT * FROM (VALUES (9, 1), (8, 2)) AS a (u, k) ORDER BY k)
-				INNER JOIN (VALUES (1, 1), (2, 2)) AS b (k, w) USING (k) ORDER BY u
+                INNER JOIN (VALUES (1, 1), (2, 2)) AS b (k, w) USING (k) ORDER BY u
 ----
-0  sort                                 (k, u, w)                                        +u
-0          order     +u
-1  render                               (k, u, w)
-2  join                                 (k, u, k[hidden,omitted], k[hidden,omitted], w)
-2          type      inner
-2          equality  (k) = (k)
-3  sort                                 (u, k)                                           +k
-3          order     +k
-4  values                               (u, k)
-4          size      2 columns, 2 rows
-3  values                               (column1, column2)
-3          size      2 columns, 2 rows
+0  sort    ·         ·                  (k, u, w)                                        +u
+0  ·       order     +u                 ·                                                ·
+1  render  ·         ·                  (k, u, w)                                        ·
+2  join    ·         ·                  (k, u, k[hidden,omitted], k[hidden,omitted], w)  ·
+2  ·       type      inner              ·                                                ·
+2  ·       equality  (k) = (k)          ·                                                ·
+3  sort    ·         ·                  (u, k)                                           +k
+3  ·       order     +k                 ·                                                ·
+4  values  ·         ·                  (u, k)                                           ·
+4  ·       size      2 columns, 2 rows  ·                                                ·
+3  values  ·         ·                  (column1, column2)                               ·
+3  ·       size      2 columns, 2 rows  ·                                                ·
 
 # Ensure that large cross-joins are optimized somehow (#10633)
 statement ok
@@ -698,49 +698,49 @@ CREATE TABLE customers(id INT PRIMARY KEY NOT NULL); CREATE TABLE orders(id INT,
 
 query ITTT
 SELECT * FROM [EXPLAIN SELECT
-	   NULL::text  AS pktable_cat,
-	   pkn.nspname AS pktable_schem,
-	   pkc.relname AS pktable_name,
-	   pka.attname AS pkcolumn_name,
-	   NULL::text  AS fktable_cat,
-	   fkn.nspname AS fktable_schem,
-	   fkc.relname AS fktable_name,
-	   fka.attname AS fkcolumn_name,
-	   pos.n       AS key_seq,
-	   CASE con.confupdtype
-		    WHEN 'c' THEN 0
-		    WHEN 'n' THEN 2
-		    WHEN 'd' THEN 4
-		    WHEN 'r' THEN 1
-		    WHEN 'a' THEN 3
-		    ELSE NULL
-	   END AS update_rule,
-	   CASE con.confdeltype
-		    WHEN 'c' THEN 0
-		    WHEN 'n' THEN 2
-		    WHEN 'd' THEN 4
-		    WHEN 'r' THEN 1
-		    WHEN 'a' THEN 3
-		    ELSE NULL
-	   END          AS delete_rule,
-	   con.conname  AS fk_name,
-	   pkic.relname AS pk_name,
-	   CASE
-		    WHEN con.condeferrable
-		    AND      con.condeferred THEN 5
-		    WHEN con.condeferrable THEN 6
-		    ELSE 7
-	   END AS deferrability
+       NULL::text  AS pktable_cat,
+       pkn.nspname AS pktable_schem,
+       pkc.relname AS pktable_name,
+       pka.attname AS pkcolumn_name,
+       NULL::text  AS fktable_cat,
+       fkn.nspname AS fktable_schem,
+       fkc.relname AS fktable_name,
+       fka.attname AS fkcolumn_name,
+       pos.n       AS key_seq,
+       CASE con.confupdtype
+            WHEN 'c' THEN 0
+            WHEN 'n' THEN 2
+            WHEN 'd' THEN 4
+            WHEN 'r' THEN 1
+            WHEN 'a' THEN 3
+            ELSE NULL
+       END AS update_rule,
+       CASE con.confdeltype
+            WHEN 'c' THEN 0
+            WHEN 'n' THEN 2
+            WHEN 'd' THEN 4
+            WHEN 'r' THEN 1
+            WHEN 'a' THEN 3
+            ELSE NULL
+       END          AS delete_rule,
+       con.conname  AS fk_name,
+       pkic.relname AS pk_name,
+       CASE
+            WHEN con.condeferrable
+            AND      con.condeferred THEN 5
+            WHEN con.condeferrable THEN 6
+            ELSE 7
+       END AS deferrability
   FROM     pg_catalog.pg_namespace pkn,
-	   pg_catalog.pg_class pkc,
-	   pg_catalog.pg_attribute pka,
-	   pg_catalog.pg_namespace fkn,
-	   pg_catalog.pg_class fkc,
-	   pg_catalog.pg_attribute fka,
-	   pg_catalog.pg_constraint con,
-	   pg_catalog.generate_series(1, 32) pos(n),
-	   pg_catalog.pg_depend dep,
-	   pg_catalog.pg_class pkic
+       pg_catalog.pg_class pkc,
+       pg_catalog.pg_attribute pka,
+       pg_catalog.pg_namespace fkn,
+       pg_catalog.pg_class fkc,
+       pg_catalog.pg_attribute fka,
+       pg_catalog.pg_constraint con,
+       pg_catalog.generate_series(1, 32) pos(n),
+       pg_catalog.pg_depend dep,
+       pg_catalog.pg_class pkic
   WHERE    pkn.oid = pkc.relnamespace
   AND      pkc.oid = pka.attrelid
   AND      pka.attnum = con.confkey[pos.n]
@@ -758,89 +758,89 @@ SELECT * FROM [EXPLAIN SELECT
   AND      fkn.nspname = 'test'
   AND      fkc.relname = 'orders'
   ORDER BY pkn.nspname,
-	   pkc.relname,
-	   con.conname,
-	   pos.n
-  ] WHERE type <> 'values' AND field <> 'size'
+           pkc.relname,
+           con.conname,
+           pos.n
+  ] WHERE "Type" <> 'values' AND "Field" <> 'size'
 ----
-0   sort
-0              order     +pktable_schem,+pktable_name,+fk_name,+key_seq
-1   render
-2   join
-2              type      inner
-2              equality  (oid) = (relnamespace)
-3   join
-3              type      inner
-3              equality  (oid, oid) = (attrelid, confrelid)
-4   join
-4              type      inner
-5   join
-5              type      inner
-5              equality  (oid) = (relnamespace)
-6   filter
-6   join
-6              type      inner
-6              equality  (oid, oid) = (attrelid, conrelid)
-7   filter
-7   join
-7              type      inner
-8   join
-8              type      inner
-8              equality  (oid) = (objid)
-9   filter
-9   join
-9              type      cross
-10  generator
-10  join
-10             type      inner
-10             equality  (refobjid) = (oid)
-11  filter
-11  filter
+0   sort       ·         ·
+0   ·          order     +pktable_schem,+pktable_name,+fk_name,+key_seq
+1   render     ·         ·
+2   join       ·         ·
+2   ·          type      inner
+2   ·          equality  (oid) = (relnamespace)
+3   join       ·         ·
+3   ·          type      inner
+3   ·          equality  (oid, oid) = (attrelid, confrelid)
+4   join       ·         ·
+4   ·          type      inner
+5   join       ·         ·
+5   ·          type      inner
+5   ·          equality  (oid) = (relnamespace)
+6   filter     ·         ·
+6   join       ·         ·
+6   ·          type      inner
+6   ·          equality  (oid, oid) = (attrelid, conrelid)
+7   filter     ·         ·
+7   join       ·         ·
+7   ·          type      inner
+8   join       ·         ·
+8   ·          type      inner
+8   ·          equality  (oid) = (objid)
+9   filter     ·         ·
+9   join       ·         ·
+9   ·          type      cross
+10  generator  ·         ·
+10  join       ·         ·
+10  ·          type      inner
+10  ·          equality  (refobjid) = (oid)
+11  filter     ·         ·
+11  filter     ·         ·
 
 query TTTTTTTTIIITTI
 SELECT     NULL::text  AS pktable_cat,
-	   pkn.nspname AS pktable_schem,
-	   pkc.relname AS pktable_name,
-	   pka.attname AS pkcolumn_name,
-	   NULL::text  AS fktable_cat,
-	   fkn.nspname AS fktable_schem,
-	   fkc.relname AS fktable_name,
-	   fka.attname AS fkcolumn_name,
-	   pos.n       AS key_seq,
-	   CASE con.confupdtype
-		    WHEN 'c' THEN 0
-		    WHEN 'n' THEN 2
-		    WHEN 'd' THEN 4
-		    WHEN 'r' THEN 1
-		    WHEN 'a' THEN 3
-		    ELSE NULL
-	   END AS update_rule,
-	   CASE con.confdeltype
-		    WHEN 'c' THEN 0
-		    WHEN 'n' THEN 2
-		    WHEN 'd' THEN 4
-		    WHEN 'r' THEN 1
-		    WHEN 'a' THEN 3
-		    ELSE NULL
-	   END          AS delete_rule,
-	   con.conname  AS fk_name,
-	   pkic.relname AS pk_name,
-	   CASE
-		    WHEN con.condeferrable
-		    AND      con.condeferred THEN 5
-		    WHEN con.condeferrable THEN 6
-		    ELSE 7
-	   END AS deferrability
+       pkn.nspname AS pktable_schem,
+       pkc.relname AS pktable_name,
+       pka.attname AS pkcolumn_name,
+       NULL::text  AS fktable_cat,
+       fkn.nspname AS fktable_schem,
+       fkc.relname AS fktable_name,
+       fka.attname AS fkcolumn_name,
+       pos.n       AS key_seq,
+       CASE con.confupdtype
+            WHEN 'c' THEN 0
+            WHEN 'n' THEN 2
+            WHEN 'd' THEN 4
+            WHEN 'r' THEN 1
+            WHEN 'a' THEN 3
+            ELSE NULL
+       END AS update_rule,
+       CASE con.confdeltype
+            WHEN 'c' THEN 0
+            WHEN 'n' THEN 2
+            WHEN 'd' THEN 4
+            WHEN 'r' THEN 1
+            WHEN 'a' THEN 3
+            ELSE NULL
+       END          AS delete_rule,
+       con.conname  AS fk_name,
+       pkic.relname AS pk_name,
+       CASE
+            WHEN con.condeferrable
+            AND      con.condeferred THEN 5
+            WHEN con.condeferrable THEN 6
+            ELSE 7
+       END AS deferrability
   FROM     pg_catalog.pg_namespace pkn,
-	   pg_catalog.pg_class pkc,
-	   pg_catalog.pg_attribute pka,
-	   pg_catalog.pg_namespace fkn,
-	   pg_catalog.pg_class fkc,
-	   pg_catalog.pg_attribute fka,
-	   pg_catalog.pg_constraint con,
-	   pg_catalog.generate_series(1, 32) pos(n),
-	   pg_catalog.pg_depend dep,
-	   pg_catalog.pg_class pkic
+       pg_catalog.pg_class pkc,
+       pg_catalog.pg_attribute pka,
+       pg_catalog.pg_namespace fkn,
+       pg_catalog.pg_class fkc,
+       pg_catalog.pg_attribute fka,
+       pg_catalog.pg_constraint con,
+       pg_catalog.generate_series(1, 32) pos(n),
+       pg_catalog.pg_depend dep,
+       pg_catalog.pg_class pkic
   WHERE    pkn.oid = pkc.relnamespace
   AND      pkc.oid = pka.attrelid
   AND      pka.attnum = con.confkey[pos.n]
@@ -858,9 +858,9 @@ SELECT     NULL::text  AS pktable_cat,
   AND      fkn.nspname = 'test'
   AND      fkc.relname = 'orders'
   ORDER BY pkn.nspname,
-	   pkc.relname,
-	   con.conname,
-	   pos.n
+       pkc.relname,
+       con.conname,
+       pos.n
 ----
 NULL test customers id NULL test orders cust 1 3 3 fk_cust_ref_customers primary 7
 
@@ -883,16 +883,16 @@ INSERT INTO pairs VALUES (1,1), (1,2), (1,3), (1,4), (1,5), (1,6), (2,3), (2,4),
 query ITTT
 EXPLAIN SELECT * FROM pairs, square WHERE pairs.b = square.n
 ----
-0  render
-1  join
-1        type      inner
-1        equality  (b) = (n)
-2  scan
-2        table     pairs@primary
-2        spans     ALL
-2  scan
-2        table     square@primary
-2        spans     ALL
+0  render  ·         ·
+1  join    ·         ·
+1  ·       type      inner
+1  ·       equality  (b) = (n)
+2  scan    ·         ·
+2  ·       table     pairs@primary
+2  ·       spans     ALL
+2  scan    ·         ·
+2  ·       table     square@primary
+2  ·       spans     ALL
 
 query IIII rowsort
 SELECT * FROM pairs, square WHERE pairs.b = square.n
@@ -917,20 +917,20 @@ SELECT * FROM pairs, square WHERE pairs.b = square.n
 query ITTTTT
 EXPLAIN (VERBOSE) SELECT * FROM pairs, square WHERE pairs.a + pairs.b = square.sq
 ----
-0  render                                                            (a, b, n, sq)
-0          render 0  test.pairs.a
-0          render 1  test.pairs.b
-0          render 2  test.square.n
-0          render 3  test.square.sq
-1  join                                                              (a, b, rowid[hidden,omitted], n, sq)
-1          type      inner
-1          pred      (test.pairs.a + test.pairs.b) = test.square.sq
-2  scan                                                              (a, b, rowid[hidden,omitted])
-2          table     pairs@primary
-2          spans     ALL
-2  scan                                                              (n, sq)
-2          table     square@primary
-2          spans     ALL
+0  render  ·         ·                                               (a, b, n, sq)                         ·
+0  ·       render 0  test.pairs.a                                    ·                                     ·
+0  ·       render 1  test.pairs.b                                    ·                                     ·
+0  ·       render 2  test.square.n                                   ·                                     ·
+0  ·       render 3  test.square.sq                                  ·                                     ·
+1  join    ·         ·                                               (a, b, rowid[hidden,omitted], n, sq)  ·
+1  ·       type      inner                                           ·                                     ·
+1  ·       pred      (test.pairs.a + test.pairs.b) = test.square.sq  ·                                     ·
+2  scan    ·         ·                                               (a, b, rowid[hidden,omitted])         rowid!=NULL; key(rowid)
+2  ·       table     pairs@primary                                   ·                                     ·
+2  ·       spans     ALL                                             ·                                     ·
+2  scan    ·         ·                                               (n, sq)                               n!=NULL; key(n)
+2  ·       table     square@primary                                  ·                                     ·
+2  ·       spans     ALL                                             ·                                     ·
 
 query IIII rowsort
 SELECT * FROM pairs, square WHERE pairs.a + pairs.b = square.sq
@@ -945,27 +945,27 @@ SELECT * FROM pairs, square WHERE pairs.a + pairs.b = square.sq
 query ITTTTT
 EXPLAIN (VERBOSE) SELECT a, b, n, sq FROM (SELECT a, b, a + b AS sum, n, sq FROM pairs, square) WHERE sum = sq
 ----
-0  render                                         (a, b, n, sq)
-0          render 0  a
-0          render 1  b
-0          render 2  n
-0          render 3  sq
-1  filter                                         (a, b, sum, n, sq)
-1          filter    sum = sq
-2  render                                         (a, b, sum, n, sq)
-2          render 0  test.pairs.a
-2          render 1  test.pairs.b
-2          render 2  test.pairs.a + test.pairs.b
-2          render 3  test.square.n
-2          render 4  test.square.sq
-3  join                                           (a, b, rowid[hidden,omitted], n, sq)
-3          type      cross
-4  scan                                           (a, b, rowid[hidden,omitted])
-4          table     pairs@primary
-4          spans     ALL
-4  scan                                           (n, sq)
-4          table     square@primary
-4          spans     ALL
+0  render  ·         ·                            (a, b, n, sq)                         sq!=NULL
+0  ·       render 0  a                            ·                                     ·
+0  ·       render 1  b                            ·                                     ·
+0  ·       render 2  n                            ·                                     ·
+0  ·       render 3  sq                           ·                                     ·
+1  filter  ·         ·                            (a, b, sum, n, sq)                    sum=sq; sum!=NULL; sq!=NULL
+1  ·       filter    sum = sq                     ·                                     ·
+2  render  ·         ·                            (a, b, sum, n, sq)                    ·
+2  ·       render 0  test.pairs.a                 ·                                     ·
+2  ·       render 1  test.pairs.b                 ·                                     ·
+2  ·       render 2  test.pairs.a + test.pairs.b  ·                                     ·
+2  ·       render 3  test.square.n                ·                                     ·
+2  ·       render 4  test.square.sq               ·                                     ·
+3  join    ·         ·                            (a, b, rowid[hidden,omitted], n, sq)  ·
+3  ·       type      cross                        ·                                     ·
+4  scan    ·         ·                            (a, b, rowid[hidden,omitted])         rowid!=NULL; key(rowid)
+4  ·       table     pairs@primary                ·                                     ·
+4  ·       spans     ALL                          ·                                     ·
+4  scan    ·         ·                            (n, sq)                               n!=NULL; key(n)
+4  ·       table     square@primary               ·                                     ·
+4  ·       spans     ALL                          ·                                     ·
 
 query IIII rowsort
 SELECT a, b, n, sq FROM (SELECT a, b, a + b AS sum, n, sq FROM pairs, square) WHERE sum = sq
@@ -978,20 +978,20 @@ SELECT a, b, n, sq FROM (SELECT a, b, a + b AS sum, n, sq FROM pairs, square) WH
 query ITTTTT
 EXPLAIN (VERBOSE) SELECT * FROM pairs FULL OUTER JOIN square ON pairs.a + pairs.b = square.sq
 ----
-0  render                                                            (a, b, n, sq)
-0          render 0  test.pairs.a
-0          render 1  test.pairs.b
-0          render 2  test.square.n
-0          render 3  test.square.sq
-1  join                                                              (a, b, rowid[hidden,omitted], n, sq)
-1          type      full outer
-1          pred      (test.pairs.a + test.pairs.b) = test.square.sq
-2  scan                                                              (a, b, rowid[hidden,omitted])
-2          table     pairs@primary
-2          spans     ALL
-2  scan                                                              (n, sq)
-2          table     square@primary
-2          spans     ALL
+0  render  ·         ·                                               (a, b, n, sq)                         ·
+0  ·       render 0  test.pairs.a                                    ·                                     ·
+0  ·       render 1  test.pairs.b                                    ·                                     ·
+0  ·       render 2  test.square.n                                   ·                                     ·
+0  ·       render 3  test.square.sq                                  ·                                     ·
+1  join    ·         ·                                               (a, b, rowid[hidden,omitted], n, sq)  ·
+1  ·       type      full outer                                      ·                                     ·
+1  ·       pred      (test.pairs.a + test.pairs.b) = test.square.sq  ·                                     ·
+2  scan    ·         ·                                               (a, b, rowid[hidden,omitted])         rowid!=NULL; key(rowid)
+2  ·       table     pairs@primary                                   ·                                     ·
+2  ·       spans     ALL                                             ·                                     ·
+2  scan    ·         ·                                               (n, sq)                               n!=NULL; key(n)
+2  ·       table     square@primary                                  ·                                     ·
+2  ·       spans     ALL                                             ·                                     ·
 
 query IIII rowsort
 SELECT * FROM pairs FULL OUTER JOIN square ON pairs.a + pairs.b = square.sq
@@ -1019,25 +1019,307 @@ NULL  NULL  6     36
 query ITTTTT
 EXPLAIN (VERBOSE) SELECT * FROM pairs FULL OUTER JOIN square ON pairs.a + pairs.b = square.sq WHERE pairs.b%2 <> square.sq%2
 ----
-0  render                                                            (a, b, n, sq)
-0          render 0  test.pairs.a
-0          render 1  test.pairs.b
-0          render 2  test.square.n
-0          render 3  test.square.sq
-1  filter                                                            (a, b, rowid[hidden,omitted], n, sq)
-1          filter    (test.pairs.b % 2) != (test.square.sq % 2)
-2  join                                                              (a, b, rowid[hidden,omitted], n, sq)
-2          type      full outer
-2          pred      (test.pairs.a + test.pairs.b) = test.square.sq
-3  scan                                                              (a, b, rowid[hidden,omitted])
-3          table     pairs@primary
-3          spans     ALL
-3  scan                                                              (n, sq)
-3          table     square@primary
-3          spans     ALL
+0  render  ·         ·                                               (a, b, n, sq)                         b!=NULL; sq!=NULL
+0  ·       render 0  test.pairs.a                                    ·                                     ·
+0  ·       render 1  test.pairs.b                                    ·                                     ·
+0  ·       render 2  test.square.n                                   ·                                     ·
+0  ·       render 3  test.square.sq                                  ·                                     ·
+1  filter  ·         ·                                               (a, b, rowid[hidden,omitted], n, sq)  b!=NULL; sq!=NULL
+1  ·       filter    (test.pairs.b % 2) != (test.square.sq % 2)      ·                                     ·
+2  join    ·         ·                                               (a, b, rowid[hidden,omitted], n, sq)  ·
+2  ·       type      full outer                                      ·                                     ·
+2  ·       pred      (test.pairs.a + test.pairs.b) = test.square.sq  ·                                     ·
+3  scan    ·         ·                                               (a, b, rowid[hidden,omitted])         rowid!=NULL; key(rowid)
+3  ·       table     pairs@primary                                   ·                                     ·
+3  ·       spans     ALL                                             ·                                     ·
+3  scan    ·         ·                                               (n, sq)                               n!=NULL; key(n)
+3  ·       table     square@primary                                  ·                                     ·
+3  ·       spans     ALL                                             ·                                     ·
 
 query IIII rowsort
 SELECT * FROM pairs FULL OUTER JOIN square ON pairs.a + pairs.b = square.sq WHERE pairs.b%2 <> square.sq%2
 ----
 1     3     2     4
 3     6     3     9
+
+# Filter propagation through outer joins.
+
+query IIII rowsort
+SELECT *
+  FROM (SELECT * FROM pairs LEFT JOIN square ON b = sq AND a > 1 AND n < 6)
+ WHERE b > 1 AND (n IS NULL OR n > 1) AND (n IS NULL OR a  < sq)
+----
+1  2  NULL  NULL
+1  3  NULL  NULL
+1  4  NULL  NULL
+1  5  NULL  NULL
+1  6  NULL  NULL
+2  3  NULL  NULL
+2  4  2     4
+2  5  NULL  NULL
+2  6  NULL  NULL
+3  4  2     4
+3  5  NULL  NULL
+3  6  NULL  NULL
+4  5  NULL  NULL
+4  6  NULL  NULL
+
+query ITTT
+EXPLAIN(EXPRS)
+SELECT *
+  FROM (SELECT * FROM pairs LEFT JOIN square ON b = sq AND a > 1 AND n < 6)
+ WHERE b > 1 AND (n IS NULL OR n > 1) AND (n IS NULL OR a  < sq)
+----
+0  render  ·         ·
+0  ·       render 0  a
+0  ·       render 1  b
+0  ·       render 2  n
+0  ·       render 3  sq
+1  filter  ·         ·
+1  ·       filter    ((n IS NULL) OR (n > 1)) AND ((n IS NULL) OR (a < sq))
+2  join    ·         ·
+2  ·       type      left outer
+2  ·       equality  (b) = (sq)
+2  ·       pred      test.pairs.a > 1
+3  scan    ·         ·
+3  ·       table     pairs@primary
+3  ·       spans     ALL
+3  ·       filter    b > 1
+3  scan    ·         ·
+3  ·       table     square@primary
+3  ·       spans     /#-/6
+
+query IIII rowsort
+SELECT *
+  FROM (SELECT * FROM pairs RIGHT JOIN square ON b = sq AND a > 1 AND n < 6)
+ WHERE (a IS NULL OR a > 2) AND n > 1 AND (a IS NULL OR a < sq)
+----
+3     4     2  4
+NULL  NULL  3  9
+NULL  NULL  4  16
+NULL  NULL  5  25
+NULL  NULL  6  36
+
+query ITTT
+EXPLAIN(EXPRS)
+SELECT *
+  FROM (SELECT * FROM pairs RIGHT JOIN square ON b = sq AND a > 1 AND n < 6)
+ WHERE (a IS NULL OR a > 2) AND n > 1 AND (a IS NULL OR a < sq)
+----
+0  render  ·         ·
+0  ·       render 0  a
+0  ·       render 1  b
+0  ·       render 2  n
+0  ·       render 3  sq
+1  filter  ·         ·
+1  ·       filter    ((a IS NULL) OR (a > 2)) AND ((a IS NULL) OR (a < sq))
+2  join    ·         ·
+2  ·       type      right outer
+2  ·       equality  (b) = (sq)
+2  ·       pred      test.square.n < 6
+3  scan    ·         ·
+3  ·       table     pairs@primary
+3  ·       spans     ALL
+3  ·       filter    a > 1
+3  scan    ·         ·
+3  ·       table     square@primary
+3  ·       spans     /2-
+
+# The simpler plan for an inner join, to compare.
+query ITTT
+EXPLAIN(EXPRS)
+SELECT *
+  FROM (SELECT * FROM pairs JOIN square ON b = sq AND a > 1 AND n < 6)
+ WHERE (a IS NULL OR a > 2) AND n > 1 AND (a IS NULL OR a < sq)
+----
+0  render  ·         ·
+0  ·       render 0  a
+0  ·       render 1  b
+0  ·       render 2  n
+0  ·       render 3  sq
+1  join    ·         ·
+1  ·       type      inner
+1  ·       equality  (b) = (sq)
+1  ·       pred      (test.pairs.a IS NULL) OR (test.pairs.a < test.square.sq)
+2  scan    ·         ·
+2  ·       table     pairs@primary
+2  ·       spans     ALL
+2  ·       filter    ((a IS NULL) OR (a > 2)) AND (a > 1)
+2  scan    ·         ·
+2  ·       table     square@primary
+2  ·       spans     /2-/6
+
+
+statement ok
+CREATE TABLE t1 (col1 INT, x INT, col2 INT, y INT)
+
+statement ok
+CREATE TABLE t2 (col3 INT, y INT, x INT, col4 INT)
+
+statement ok
+INSERT INTO t1 VALUES (10, 1, 11, 1), (20, 2, 21, 1), (30, 3, 31, 1)
+
+statement ok
+INSERT INTO t2 VALUES (100, 1, 1, 101), (200, 1, 201, 2), (400, 1, 401, 4)
+
+query IIIIIII
+SELECT * FROM t1 JOIN t2 USING(x)
+----
+1    10    11    1    100    1    101
+
+query IIIIII
+SELECT * FROM t1 NATURAL JOIN t2
+----
+1    1    10    11    100    101
+
+query IIIIIIII
+SELECT * FROM t1 JOIN t2 ON t2.x=t1.x
+----
+10    1    11    1    100    1    1    101
+
+query IIIIIII rowsort
+SELECT * FROM t1 FULL OUTER JOIN t2 USING(x)
+----
+   1      10      11       1     100       1     101
+   2      20      21       1    NULL    NULL    NULL
+   3      30      31       1    NULL    NULL    NULL
+ 201    NULL    NULL    NULL     200       1       2
+ 401    NULL    NULL    NULL     400       1       4
+
+query IIIIII rowsort
+SELECT * FROM t1 NATURAL FULL OUTER JOIN t2
+----
+  1    1      10      11     100     101
+  2    1      20      21    NULL    NULL
+  3    1      30      31    NULL    NULL
+201    1    NULL    NULL     200       2
+401    1    NULL    NULL     400       4
+
+query IIIIIIII rowsort
+SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.x=t2.x
+----
+  10       1      11       1     100       1       1     101
+  20       2      21       1    NULL    NULL    NULL    NULL
+  30       3      31       1    NULL    NULL    NULL    NULL
+NULL    NULL    NULL    NULL     200       1     201       2
+NULL    NULL    NULL    NULL     400       1     401       4
+
+query III
+SELECT t2.x, t1.x, x FROM t1 JOIN t2 USING(x)
+----
+1    1    1
+
+query III rowsort
+SELECT t2.x, t1.x, x FROM t1 FULL OUTER JOIN t2 USING(x)
+----
+   1       1      1
+NULL       2      2
+NULL       3      3
+ 201    NULL    201
+ 401    NULL    401
+
+# Test for #19536.
+query I
+SELECT x FROM t1 NATURAL JOIN (SELECT * FROM t2)
+----
+1
+
+query ITTTTT
+EXPLAIN (VERBOSE) SELECT x FROM t1 NATURAL JOIN (SELECT * FROM t2)
+----
+0  render  ·         ·                (x)                                                                                                                                                                             ·
+0  ·       render 0  x                ·                                                                                                                                                                               ·
+1  join    ·         ·                (x, y[omitted], col1[omitted], x[hidden,omitted], col2[omitted], y[hidden,omitted], rowid[hidden,omitted], col3[omitted], y[hidden,omitted], x[hidden,omitted], col4[omitted])  ·
+1  ·       type      inner            ·                                                                                                                                                                               ·
+1  ·       equality  (x, y) = (x, y)  ·                                                                                                                                                                               ·
+2  scan    ·         ·                (col1[omitted], x, col2[omitted], y, rowid[hidden,omitted])                                                                                                                     rowid!=NULL; key(rowid)
+2  ·       table     t1@primary       ·                                                                                                                                                                               ·
+2  ·       spans     ALL              ·                                                                                                                                                                               ·
+2  render  ·         ·                (col3[omitted], y, x, col4[omitted])                                                                                                                                            ·
+2  ·       render 0  NULL             ·                                                                                                                                                                               ·
+2  ·       render 1  test.t2.y        ·                                                                                                                                                                               ·
+2  ·       render 2  test.t2.x        ·                                                                                                                                                                               ·
+2  ·       render 3  NULL             ·                                                                                                                                                                               ·
+3  scan    ·         ·                (col3[omitted], y, x, col4[omitted], rowid[hidden,omitted])                                                                                                                     rowid!=NULL; key(rowid)
+3  ·       table     t2@primary       ·                                                                                                                                                                               ·
+3  ·       spans     ALL              ·                                                                                                                                                                               ·
+
+# Tests for merge join ordering information.
+statement ok
+CREATE TABLE pkBA (a INT, b INT, c INT, d INT, PRIMARY KEY(b,a))
+
+statement ok
+CREATE TABLE pkBC (a INT, b INT, c INT, d INT, PRIMARY KEY(b,c))
+
+statement ok
+CREATE TABLE pkBAC (a INT, b INT, c INT, d INT, PRIMARY KEY(b,a,c))
+
+statement ok
+CREATE TABLE pkBAD (a INT, b INT, c INT, d INT, PRIMARY KEY(b,a,d))
+
+query ITTTTT
+EXPLAIN (VERBOSE) SELECT * FROM pkBA AS l JOIN pkBC AS r ON l.a = r.a AND l.b = r.b AND l.c = r.c
+----
+0  join  ·               ·                      (a, b, c, d, a, b, c, d)  a=a; b=b; c=c; a!=NULL; b!=NULL; c!=NULL; key(a,b); key(b,c)
+0  ·     type            inner                  ·                         ·
+0  ·     equality        (a, b, c) = (a, b, c)  ·                         ·
+0  ·     mergeJoinOrder  +"(b=b)"               ·                         ·
+1  scan  ·               ·                      (a, b, c, d)              a!=NULL; b!=NULL; key(a,b); +b
+1  ·     table           pkba@primary           ·                         ·
+1  ·     spans           ALL                    ·                         ·
+1  scan  ·               ·                      (a, b, c, d)              b!=NULL; c!=NULL; key(b,c); +b
+1  ·     table           pkbc@primary           ·                         ·
+1  ·     spans           ALL                    ·                         ·
+
+query ITTTTT
+EXPLAIN (VERBOSE) SELECT * FROM pkBA NATURAL JOIN pkBAD
+----
+0  render  ·               ·                            (a, b, c, d)                                                                                                                                                          a!=NULL; b!=NULL; c!=NULL; d!=NULL; key(a,b)
+0  ·       render 0        a                            ·                                                                                                                                                                     ·
+0  ·       render 1        b                            ·                                                                                                                                                                     ·
+0  ·       render 2        c                            ·                                                                                                                                                                     ·
+0  ·       render 3        d                            ·                                                                                                                                                                     ·
+1  join    ·               ·                            (a, b, c, d, a[hidden,omitted], b[hidden,omitted], c[hidden,omitted], d[hidden,omitted], a[hidden,omitted], b[hidden,omitted], c[hidden,omitted], d[hidden,omitted])  a=a=a; b=b=b; c=c=c; d=d=d; a!=NULL; b!=NULL; c!=NULL; d!=NULL; key(a,b)
+1  ·       type            inner                        ·                                                                                                                                                                     ·
+1  ·       equality        (a, b, c, d) = (a, b, c, d)  ·                                                                                                                                                                     ·
+1  ·       mergeJoinOrder  +"(b=b)",+"(a=a)",+"(d=d)"   ·                                                                                                                                                                     ·
+2  scan    ·               ·                            (a, b, c, d)                                                                                                                                                          a!=NULL; b!=NULL; key(a,b); +b,+a
+2  ·       table           pkba@primary                 ·                                                                                                                                                                     ·
+2  ·       spans           ALL                          ·                                                                                                                                                                     ·
+2  scan    ·               ·                            (a, b, c, d)                                                                                                                                                          a!=NULL; b!=NULL; d!=NULL; key(a,b,d); +b,+a,+d
+2  ·       table           pkbad@primary                ·                                                                                                                                                                     ·
+2  ·       spans           ALL                          ·                                                                                                                                                                     ·
+
+query ITTTTT
+EXPLAIN (VERBOSE) SELECT * FROM pkBAC AS l JOIN pkBAC AS r USING(a, b, c)
+----
+0  render  ·               ·                           (a, b, c, d, d)                                                                                                                    a!=NULL; b!=NULL; c!=NULL; key(a,b,c)
+0  ·       render 0        a                           ·                                                                                                                                  ·
+0  ·       render 1        b                           ·                                                                                                                                  ·
+0  ·       render 2        c                           ·                                                                                                                                  ·
+0  ·       render 3        l.d                         ·                                                                                                                                  ·
+0  ·       render 4        r.d                         ·                                                                                                                                  ·
+1  join    ·               ·                           (a, b, c, a[hidden,omitted], b[hidden,omitted], c[hidden,omitted], d, a[hidden,omitted], b[hidden,omitted], c[hidden,omitted], d)  a=a=a; b=b=b; c=c=c; a!=NULL; b!=NULL; c!=NULL; key(a,b,c)
+1  ·       type            inner                       ·                                                                                                                                  ·
+1  ·       equality        (a, b, c) = (a, b, c)       ·                                                                                                                                  ·
+1  ·       mergeJoinOrder  +"(b=b)",+"(a=a)",+"(c=c)"  ·                                                                                                                                  ·
+2  scan    ·               ·                           (a, b, c, d)                                                                                                                       a!=NULL; b!=NULL; c!=NULL; key(a,b,c); +b,+a,+c
+2  ·       table           pkbac@primary               ·                                                                                                                                  ·
+2  ·       spans           ALL                         ·                                                                                                                                  ·
+2  scan    ·               ·                           (a, b, c, d)                                                                                                                       a!=NULL; b!=NULL; c!=NULL; key(a,b,c); +b,+a,+c
+2  ·       table           pkbac@primary               ·                                                                                                                                  ·
+2  ·       spans           ALL                         ·                                                                                                                                  ·
+
+query ITTTTT
+EXPLAIN (VERBOSE) SELECT * FROM pkBAC AS l JOIN pkBAD AS r ON l.c = r.d AND l.a = r.a AND l.b = r.b
+----
+0  join  ·               ·                           (a, b, c, d, a, b, c, d)  a=a; b=b; c=d; a!=NULL; b!=NULL; c!=NULL; key(a,b,c)
+0  ·     type            inner                       ·                         ·
+0  ·     equality        (c, a, b) = (d, a, b)       ·                         ·
+0  ·     mergeJoinOrder  +"(b=b)",+"(a=a)",+"(c=d)"  ·                         ·
+1  scan  ·               ·                           (a, b, c, d)              a!=NULL; b!=NULL; c!=NULL; key(a,b,c); +b,+a,+c
+1  ·     table           pkbac@primary               ·                         ·
+1  ·     spans           ALL                         ·                         ·
+1  scan  ·               ·                           (a, b, c, d)              a!=NULL; b!=NULL; d!=NULL; key(a,b,d); +b,+a,+d
+1  ·     table           pkbad@primary               ·                         ·
+1  ·     spans           ALL                         ·                         ·

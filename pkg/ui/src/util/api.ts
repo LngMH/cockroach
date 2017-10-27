@@ -7,6 +7,7 @@ import "whatwg-fetch"; // needed for jsdom?
 import moment from "moment";
 
 import * as protos from "src/js/protos";
+import { FixLong } from "src/util/fixLong";
 
 export type DatabasesRequestMessage = protos.cockroach.server.serverpb.DatabasesRequest;
 export type DatabasesResponseMessage = protos.cockroach.server.serverpb.DatabasesResponse;
@@ -50,11 +51,31 @@ export type LogEntriesResponseMessage = protos.cockroach.server.serverpb.LogEntr
 export type LivenessRequestMessage = protos.cockroach.server.serverpb.LivenessRequest;
 export type LivenessResponseMessage = protos.cockroach.server.serverpb.LivenessResponse;
 
+export type JobsRequestMessage = protos.cockroach.server.serverpb.JobsRequest;
+export type JobsResponseMessage = protos.cockroach.server.serverpb.JobsResponse;
+
 export type QueryPlanRequestMessage = protos.cockroach.server.serverpb.QueryPlanRequest;
 export type QueryPlanResponseMessage = protos.cockroach.server.serverpb.QueryPlanResponse;
 
 export type ProblemRangesRequestMessage = protos.cockroach.server.serverpb.ProblemRangesRequest;
 export type ProblemRangesResponseMessage = protos.cockroach.server.serverpb.ProblemRangesResponse;
+
+export type CertificatesRequestMessage = protos.cockroach.server.serverpb.CertificatesRequest;
+export type CertificatesResponseMessage = protos.cockroach.server.serverpb.CertificatesResponse;
+
+export type RangeRequestMessage = protos.cockroach.server.serverpb.RangeRequest;
+export type RangeResponseMessage = protos.cockroach.server.serverpb.RangeResponse;
+
+export type AllocatorRangeRequestMessage = protos.cockroach.server.serverpb.AllocatorRangeRequest;
+export type AllocatorRangeResponseMessage = protos.cockroach.server.serverpb.AllocatorRangeResponse;
+
+export type RangeLogRequestMessage =
+  protos.cockroach.server.serverpb.RangeLogRequest;
+export type RangeLogResponseMessage =
+  protos.cockroach.server.serverpb.RangeLogResponse;
+
+export type CommandQueueRequestMessage = protos.cockroach.server.serverpb.CommandQueueRequest;
+export type CommandQueueResponseMessage = protos.cockroach.server.serverpb.CommandQueueResponse;
 
 // API constants
 
@@ -98,9 +119,9 @@ export function toArrayBuffer(encodedRequest: Uint8Array): ArrayBuffer {
 // objects themselves. TResponseBuilder is an interface implemented by
 // the builder objects provided at runtime by protobuf.js.
 function timeoutFetch<TResponse$Properties, TResponse, TResponseBuilder extends {
-  new (properties?: TResponse$Properties): TResponse
+  new(properties?: TResponse$Properties): TResponse
   encode(message: TResponse$Properties, writer?: protobuf.Writer): protobuf.Writer
-  decode(reader: (protobuf.Reader|Uint8Array), length?: number): TResponse;
+  decode(reader: (protobuf.Reader | Uint8Array), length?: number): TResponse;
 }>(builder: TResponseBuilder, url: string, req: TRequest = null, timeout: moment.Duration = moment.duration(30, "s")): Promise<TResponse> {
   const params: RequestInit = {
     headers: {
@@ -193,6 +214,10 @@ export function getHealth(_req: HealthRequestMessage, timeout?: moment.Duration)
   return timeoutFetch(serverpb.HealthResponse, `${API_PREFIX}/health`, null, timeout);
 }
 
+export function getJobs(req: JobsRequestMessage, timeout?: moment.Duration): Promise<JobsResponseMessage> {
+  return timeoutFetch(serverpb.JobsResponse, `${API_PREFIX}/jobs?status=${req.status}&type=${req.type}&limit=${req.limit}`, null, timeout);
+}
+
 // getCluster gets info about the cluster
 export function getCluster(_req: ClusterRequestMessage, timeout?: moment.Duration): Promise<ClusterResponseMessage> {
   return timeoutFetch(serverpb.ClusterResponse, `${API_PREFIX}/cluster`, null, timeout);
@@ -223,4 +248,40 @@ export function getQueryPlan(req: QueryPlanRequestMessage, timeout?: moment.Dura
 export function getProblemRanges(req: ProblemRangesRequestMessage, timeout?: moment.Duration): Promise<ProblemRangesResponseMessage> {
   const query = (!_.isEmpty(req.node_id)) ? `?node_id=${req.node_id}` : "";
   return timeoutFetch(serverpb.ProblemRangesResponse, `${STATUS_PREFIX}/problemranges${query}`, null, timeout);
+}
+
+// getCertificates returns information about a node's certificates.
+export function getCertificates(req: CertificatesRequestMessage, timeout?: moment.Duration): Promise<CertificatesResponseMessage> {
+  return timeoutFetch(serverpb.CertificatesResponse, `${STATUS_PREFIX}/certificates/${req.node_id}`, null, timeout);
+}
+
+// getRange returns information about a range form all nodes.
+export function getRange(req: RangeRequestMessage, timeout?: moment.Duration): Promise<RangeResponseMessage> {
+  return timeoutFetch(serverpb.RangeResponse, `${STATUS_PREFIX}/range/${req.range_id}`, null, timeout);
+}
+
+// getAllocatorRange returns simulated Allocator info for the requested range
+export function getAllocatorRange(req: AllocatorRangeRequestMessage, timeout?: moment.Duration): Promise<AllocatorRangeResponseMessage> {
+  return timeoutFetch(serverpb.AllocatorRangeResponse, `${STATUS_PREFIX}/allocator/range/${req.range_id}`, null, timeout);
+}
+
+// getRangeLog returns the range log for all ranges or a specific range
+export function getRangeLog(
+  req: RangeLogRequestMessage,
+  timeout?: moment.Duration,
+): Promise<RangeLogResponseMessage> {
+  const rangeID = FixLong(req.range_id);
+  const rangeIDQuery = (rangeID.eq(0)) ? "" : `/${rangeID.toString()}`;
+  const limit = (!_.isNil(req.limit)) ? `?limit=${req.limit}` : "";
+  return timeoutFetch(
+    serverpb.RangeLogResponse,
+    `${API_PREFIX}/rangelog${rangeIDQuery}${limit}`,
+    null,
+    timeout,
+  );
+}
+
+// getCommandQueue returns a representation of the command queue for a given range id
+export function getCommandQueue(req: CommandQueueRequestMessage, timeout?: moment.Duration): Promise<CommandQueueResponseMessage> {
+  return timeoutFetch(serverpb.CommandQueueResponse, `${STATUS_PREFIX}/range/${req.range_id}/cmdqueue`, null, timeout);
 }

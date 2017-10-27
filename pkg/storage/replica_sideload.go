@@ -15,23 +15,56 @@
 package storage
 
 import (
-	"fmt"
-	"path/filepath"
+	"runtime/debug"
+	"time"
 
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/pkg/errors"
 )
+
+const bulkIOWriteLimiterLongWait = 500 * time.Millisecond
+
+func limitBulkIOWrite(ctx context.Context, st *cluster.Settings, cost int) {
+	// The limiter disallows anything greater than its burst (set to
+	// BulkIOWriteLimiterBurst), so cap the batch size if it would overflow.
+	//
+	// TODO(dan): This obviously means the limiter is no longer accounting for
+	// the full cost. I've tried calling WaitN in a loop to fully cover the
+	// cost, but that doesn't seem to be as smooth in practice (TPCH-10 restores
+	// on azure local disks), I think because the file is written all at once at
+	// the end. This could be fixed by writing the file in chunks, which also
+	// would likely help the overall smoothness, too.
+	if cost > cluster.BulkIOWriteLimiterBurst {
+		cost = cluster.BulkIOWriteLimiterBurst
+	}
+
+	begin := timeutil.Now()
+	if err := st.BulkIOWriteLimiter.WaitN(ctx, cost); err != nil {
+		log.Errorf(ctx, "error rate limiting bulk io write: %+v", err)
+	}
+
+	if d := timeutil.Since(begin); d > bulkIOWriteLimiterLongWait {
+		log.Warningf(ctx, "bulk io write limiter took %s (>%s):\n%s",
+			d, bulkIOWriteLimiterLongWait, debug.Stack())
+	}
+}
 
 var errSideloadedFileNotFound = errors.New("sideloaded file not found")
 
 // sideloadStorage is the interface used for Raft SSTable sideloading.
 // Implementations do not need to be thread safe.
 type sideloadStorage interface {
+	// The directory in which the sideloaded files are stored. May or may not
+	// exist.
+	Dir() string
 	// Writes the given contents to the file specified by the given index and
 	// term. Does not perform the write if the file exists.
 	PutIfNotExists(_ context.Context, index, term uint64, contents []byte) error
@@ -49,83 +82,8 @@ type sideloadStorage interface {
 	// the given one.
 	TruncateTo(_ context.Context, index uint64) error
 	// Returns an absolute path to the file that Get() would return the contents
-	// of.
+	// of. Does not check whether the file actually exists.
 	Filename(_ context.Context, index, term uint64) (string, error)
-}
-
-type slKey struct {
-	index, term uint64
-}
-
-type inMemSideloadStorage struct {
-	m      map[slKey][]byte
-	prefix string
-}
-
-func newInMemSideloadStorage(
-	rangeID roachpb.RangeID, replicaID roachpb.ReplicaID, baseDir string,
-) sideloadStorage {
-	return &inMemSideloadStorage{
-		prefix: filepath.Join(baseDir, fmt.Sprintf("%d.%d", rangeID, replicaID)),
-		m:      make(map[slKey][]byte),
-	}
-}
-
-func (imss *inMemSideloadStorage) key(index, term uint64) slKey {
-	return slKey{index: index, term: term}
-}
-
-func (imss *inMemSideloadStorage) PutIfNotExists(
-	_ context.Context, index, term uint64, contents []byte,
-) error {
-	key := imss.key(index, term)
-	if _, ok := imss.m[key]; ok {
-		return nil
-	}
-	imss.m[key] = contents
-	return nil
-}
-
-func (imss *inMemSideloadStorage) Get(_ context.Context, index, term uint64) ([]byte, error) {
-	key := imss.key(index, term)
-	data, ok := imss.m[key]
-	if !ok {
-		return nil, errSideloadedFileNotFound
-	}
-	return data, nil
-}
-
-func (imss *inMemSideloadStorage) Filename(_ context.Context, index, term uint64) (string, error) {
-	key := imss.key(index, term)
-	_, ok := imss.m[key]
-	if !ok {
-		return "", errSideloadedFileNotFound
-	}
-	return filepath.Join(imss.prefix, fmt.Sprintf("i%d.t%d", index, term)), nil
-}
-
-func (imss *inMemSideloadStorage) Purge(_ context.Context, index, term uint64) error {
-	k := imss.key(index, term)
-	if _, ok := imss.m[k]; !ok {
-		return errSideloadedFileNotFound
-	}
-	delete(imss.m, k)
-	return nil
-}
-
-func (imss *inMemSideloadStorage) Clear(_ context.Context) error {
-	imss.m = make(map[slKey][]byte)
-	return nil
-}
-
-func (imss *inMemSideloadStorage) TruncateTo(_ context.Context, index uint64) error {
-	// Not efficient, but this storage is for testing purposes only anyway.
-	for k := range imss.m {
-		if k.index < index {
-			delete(imss.m, k)
-		}
-	}
-	return nil
 }
 
 // maybeSideloadEntriesRaftMuLocked should be called with a slice of "fat"
@@ -138,7 +96,7 @@ func (imss *inMemSideloadStorage) TruncateTo(_ context.Context, index uint64) er
 // The passed-in slice is not mutated.
 func (r *Replica) maybeSideloadEntriesRaftMuLocked(
 	ctx context.Context, entriesToAppend []raftpb.Entry,
-) ([]raftpb.Entry, error) {
+) (_ []raftpb.Entry, sideloadedEntriesSize int64, _ error) {
 	// TODO(tschottdorf): allocating this closure could be expensive. If so make
 	// it a method on Replica.
 	maybeRaftCommand := func(cmdID storagebase.CmdIDKey) (storagebase.RaftCommand, bool) {
@@ -164,7 +122,7 @@ func maybeSideloadEntriesImpl(
 	entriesToAppend []raftpb.Entry,
 	sideloaded sideloadStorage,
 	maybeRaftCommand func(storagebase.CmdIDKey) (storagebase.RaftCommand, bool),
-) ([]raftpb.Entry, error) {
+) (_ []raftpb.Entry, sideloadedEntriesSize int64, _ error) {
 
 	cow := false
 	for i := range entriesToAppend {
@@ -198,8 +156,8 @@ func maybeSideloadEntriesImpl(
 				// Bad luck: we didn't have the proposal in-memory, so we'll
 				// have to unmarshal it.
 				log.Event(ctx, "proposal not already in memory; unmarshaling")
-				if err := strippedCmd.Unmarshal(data); err != nil {
-					return nil, err
+				if err := protoutil.Unmarshal(data, &strippedCmd); err != nil {
+					return nil, 0, err
 				}
 			}
 
@@ -217,20 +175,21 @@ func maybeSideloadEntriesImpl(
 
 			{
 				var err error
-				data, err = strippedCmd.Marshal()
+				data, err = protoutil.Marshal(&strippedCmd)
 				if err != nil {
-					return nil, errors.Wrap(err, "while marshalling stripped sideloaded command")
+					return nil, 0, errors.Wrap(err, "while marshalling stripped sideloaded command")
 				}
 			}
 
 			ent.Data = encodeRaftCommandV2(cmdID, data)
 			log.Eventf(ctx, "writing payload at index=%d term=%d", ent.Index, ent.Term)
 			if err = sideloaded.PutIfNotExists(ctx, ent.Index, ent.Term, dataToSideload); err != nil {
-				return nil, err
+				return nil, 0, err
 			}
+			sideloadedEntriesSize += int64(len(dataToSideload))
 		}
 	}
-	return entriesToAppend, nil
+	return entriesToAppend, sideloadedEntriesSize, nil
 }
 
 func sniffSideloadedRaftCommand(data []byte) (sideloaded bool) {
@@ -274,19 +233,27 @@ func maybeInlineSideloadedRaftCommand(
 	log.Event(ctx, "inlined entry not cached")
 	// Out of luck, for whatever reason the inlined proposal isn't in the cache.
 	cmdID, data := DecodeRaftCommand(ent.Data)
-	ent.Data = nil // no reuse of potentially shared slice
 
 	var command storagebase.RaftCommand
-	if err := command.Unmarshal(data); err != nil {
+	if err := protoutil.Unmarshal(data, &command); err != nil {
 		return nil, err
 	}
+
+	if len(command.ReplicatedEvalResult.AddSSTable.Data) > 0 {
+		// The entry we started out with was already "fat". This happens when
+		// the entry reached us through a preemptive snapshot (when we didn't
+		// have a ReplicaID yet).
+		log.Event(ctx, "entry already inlined")
+		return &ent, nil
+	}
+
 	sideloadedData, err := sideloaded.Get(ctx, ent.Index, ent.Term)
 	if err != nil {
 		return nil, errors.Wrap(err, "loading sideloaded data")
 	}
 	command.ReplicatedEvalResult.AddSSTable.Data = sideloadedData
 	{
-		data, err := command.Marshal()
+		data, err := protoutil.Marshal(&command)
 		if err != nil {
 			return nil, err
 		}

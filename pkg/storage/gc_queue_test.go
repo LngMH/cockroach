@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -24,7 +22,6 @@ import (
 	"testing/quick"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
@@ -38,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -99,7 +97,7 @@ func TestGCQueueMakeGCScoreInvariantQuick(t *testing.T) {
 	if err := quick.Check(func(
 		seed uint16, uTTLSec uint32, uTimePassed time.Duration, uGCBytes uint32, uGCByteAge uint32,
 	) bool {
-		ttlSec, timePassed := int32(uTTLSec), time.Duration(uTimePassed)
+		ttlSec, timePassed := int32(uTTLSec), uTimePassed
 		gcBytes, gcByteAge := int64(uGCBytes), int64(uGCByteAge)
 
 		ms := enginepb.MVCCStats{
@@ -548,7 +546,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 	now := manual.UnixNano()
 
 	gcTxnAndAC := now - txnCleanupThreshold.Nanoseconds()
-	gcACOnly := now - abortCacheAgeThreshold.Nanoseconds()
+	gcACOnly := now - abortSpanAgeThreshold.Nanoseconds()
 	if gcTxnAndAC >= gcACOnly {
 		t.Fatalf("test assumption violated due to changing constants; needs adjustment")
 	}
@@ -560,10 +558,10 @@ func TestGCQueueTransactionTable(t *testing.T) {
 		newStatus   roachpb.TransactionStatus // -1 for GCed
 		failResolve bool                      // do we want to fail resolves in this trial?
 		expResolve  bool                      // expect attempt at removing txn-persisted intents?
-		expAbortGC  bool                      // expect abort cache entries removed?
+		expAbortGC  bool                      // expect AbortSpan entries removed?
 	}
 	// Describes the state of the Txn table before the test.
-	// Many of the abort cache entries deleted wouldn't even be there, so don't
+	// Many of the AbortSpan entries deleted wouldn't even be there, so don't
 	// be confused by that.
 	testCases := map[string]spec{
 		// Too young, should not touch.
@@ -572,7 +570,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 			orig:      gcACOnly + 1,
 			newStatus: roachpb.PENDING,
 		},
-		// A little older, so the AbortCache gets cleaned up.
+		// A little older, so the AbortSpan gets cleaned up.
 		"ab": {
 			status:     roachpb.PENDING,
 			orig:       gcTxnAndAC + 1,
@@ -580,7 +578,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 			expAbortGC: true,
 		},
 		// Old and pending, but still heartbeat (so no Push attempted; it would succeed).
-		// It's old enough to delete the abort cache entry though.
+		// It's old enough to delete the AbortSpan entry though.
 		"ba": {
 			status:     roachpb.PENDING,
 			orig:       1, // immaterial
@@ -588,7 +586,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 			newStatus:  roachpb.PENDING,
 			expAbortGC: true,
 		},
-		// Not old enough for Txn GC, but old enough to remove the abort cache entry.
+		// Not old enough for Txn GC, but old enough to remove the AbortSpan entry.
 		"bb": {
 			status:     roachpb.ABORTED,
 			orig:       gcACOnly - 1,
@@ -597,7 +595,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 		},
 		// Old, pending and abandoned. Should push and abort it successfully,
 		// but not GC it just yet (this is an artifact of the implementation).
-		// The abort cache gets cleaned up though.
+		// The AbortSpan gets cleaned up though.
 		"c": {
 			status:     roachpb.PENDING,
 			orig:       gcTxnAndAC - 1,
@@ -612,7 +610,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 			expResolve: true,
 			expAbortGC: true,
 		},
-		// Committed and fresh, so no action. But the abort cache entry is old
+		// Committed and fresh, so no action. But the AbortSpan entry is old
 		// enough to be discarded.
 		"e": {
 			status:     roachpb.COMMITTED,
@@ -682,13 +680,13 @@ func TestGCQueueTransactionTable(t *testing.T) {
 		txn.Timestamp.Forward(hlc.MaxTimestamp)
 		txns[strKey] = *txn
 		for _, addrKey := range []roachpb.Key{baseKey, outsideKey} {
-			key := keys.TransactionKey(addrKey, *txn.ID)
+			key := keys.TransactionKey(addrKey, txn.ID)
 			if err := engine.MVCCPutProto(context.Background(), tc.engine, nil, key, hlc.Timestamp{}, nil, txn); err != nil {
 				t.Fatal(err)
 			}
 		}
-		entry := roachpb.AbortCacheEntry{Key: txn.Key, Timestamp: txn.LastActive()}
-		if err := tc.repl.abortCache.Put(context.Background(), tc.engine, nil, *txn.ID, &entry); err != nil {
+		entry := roachpb.AbortSpanEntry{Key: txn.Key, Timestamp: txn.LastActive()}
+		if err := tc.repl.abortSpan.Put(context.Background(), tc.engine, nil, txn.ID, &entry); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -707,7 +705,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		for strKey, sp := range testCases {
 			txn := &roachpb.Transaction{}
-			key := keys.TransactionKey(roachpb.Key(strKey), *txns[strKey].ID)
+			key := keys.TransactionKey(roachpb.Key(strKey), txns[strKey].ID)
 			ok, err := engine.MVCCGetProto(context.Background(), tc.engine, key, hlc.Timestamp{}, true, nil, txn)
 			if err != nil {
 				return err
@@ -727,13 +725,13 @@ func TestGCQueueTransactionTable(t *testing.T) {
 				return fmt.Errorf("%s: unexpected intent resolutions:\nexpected: %s\nobserved: %s",
 					strKey, expIntents, resolved[strKey])
 			}
-			entry := &roachpb.AbortCacheEntry{}
-			abortExists, err := tc.repl.abortCache.Get(context.Background(), tc.store.Engine(), *txns[strKey].ID, entry)
+			entry := &roachpb.AbortSpanEntry{}
+			abortExists, err := tc.repl.abortSpan.Get(context.Background(), tc.store.Engine(), txns[strKey].ID, entry)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if abortExists == sp.expAbortGC {
-				return fmt.Errorf("%s: expected abort cache gc: %t, found %+v", strKey, sp.expAbortGC, entry)
+				return fmt.Errorf("%s: expected AbortSpan gc: %t, found %+v", strKey, sp.expAbortGC, entry)
 			}
 		}
 		return nil
@@ -767,7 +765,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 	tc.repl.mu.Unlock()
 
 	// Verify that the new TxnSpanGCThreshold has reached the Replica.
-	if expWT := int64(gcTxnAndAC); txnSpanThreshold.WallTime != expWT {
+	if expWT := gcTxnAndAC; txnSpanThreshold.WallTime != expWT {
 		t.Fatalf("expected TxnSpanGCThreshold.Walltime %d, got timestamp %s",
 			expWT, txnSpanThreshold)
 	}
@@ -826,7 +824,7 @@ func TestGCQueueIntentResolution(t *testing.T) {
 	err := tc.store.Engine().Iterate(engine.MakeMVCCMetadataKey(roachpb.KeyMin),
 		engine.MakeMVCCMetadataKey(roachpb.KeyMax), func(kv engine.MVCCKeyValue) (bool, error) {
 			if !kv.Key.IsValue() {
-				if err := proto.Unmarshal(kv.Value, meta); err != nil {
+				if err := protoutil.Unmarshal(kv.Value, meta); err != nil {
 					return false, err
 				}
 				if meta.Txn != nil {

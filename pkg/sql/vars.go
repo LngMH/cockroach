@@ -17,6 +17,7 @@ package sql
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,8 @@ import (
 const (
 	// PgServerVersion is the latest version of postgres that we claim to support.
 	PgServerVersion = "9.5.0"
+	// PgServerVersionNum is the latest version of postgres that we claim to support in the numeric format of "server_version_num".
+	PgServerVersionNum = "90500"
 )
 
 // sessionVar provides a unified interface for performing operations on
@@ -191,14 +194,14 @@ var varGen = map[string]sessionVar{
 			if err != nil {
 				return err
 			}
-			switch parser.Name(s).Normalize() {
-			case parser.ReNormalizeName("off"):
+			switch strings.ToLower(s) {
+			case "off":
 				session.DistSQLMode = DistSQLOff
-			case parser.ReNormalizeName("on"):
+			case "on":
 				session.DistSQLMode = DistSQLOn
-			case parser.ReNormalizeName("auto"):
+			case "auto":
 				session.DistSQLMode = DistSQLAuto
-			case parser.ReNormalizeName("always"):
+			case "always":
 				session.DistSQLMode = DistSQLAlways
 			default:
 				return fmt.Errorf("set distsql: \"%s\" not supported", s)
@@ -210,10 +213,7 @@ var varGen = map[string]sessionVar{
 			return session.DistSQLMode.String()
 		},
 		Reset: func(session *Session) error {
-			session.DistSQLMode = DistSQLExecModeFromInt(DistSQLClusterExecMode.Get())
-			if session.execCfg.TestingKnobs.OverrideDistSQLMode != nil {
-				session.DistSQLMode = DistSQLExecModeFromInt(session.execCfg.TestingKnobs.OverrideDistSQLMode.Get())
-			}
+			session.DistSQLMode = DistSQLExecMode(DistSQLClusterExecMode.Get(&session.execCfg.Settings.SV))
 			return nil
 		},
 	},
@@ -231,33 +231,33 @@ var varGen = map[string]sessionVar{
 		Get: func(session *Session) string { return fmt.Sprintf("%d", session.tables.leaseMgr.nodeID.Get()) },
 	},
 
+	`sql_safe_updates`: {
+		Get: func(session *Session) string { return strconv.FormatBool(session.SafeUpdates) },
+		Set: func(_ context.Context, session *Session, values []parser.TypedExpr) error {
+			b, err := getSingleBool("sql_safe_updates", session, values)
+			if err != nil {
+				return err
+			}
+			session.SafeUpdates = (b == parser.DBoolTrue)
+			return nil
+		},
+	},
+
 	`search_path`: {
 		Set: func(_ context.Context, session *Session, values []parser.TypedExpr) error {
 			// https://www.postgresql.org/docs/9.6/static/runtime-config-client.html
-			newSearchPath := make(parser.SearchPath, len(values))
-			foundPgCatalog := false
+			paths := make([]string, len(values))
 			for i, v := range values {
 				s, err := datumAsString(session, "search_path", v)
 				if err != nil {
 					return err
 				}
-				if s == pgCatalogName {
-					foundPgCatalog = true
-				}
-				newSearchPath[i] = parser.Name(s).Normalize()
+				paths[i] = s
 			}
-			if !foundPgCatalog {
-				// "The system catalog schema, pg_catalog, is always searched,
-				// whether it is mentioned in the path or not. If it is
-				// mentioned in the path then it will be searched in the
-				// specified order. If pg_catalog is not in the path then it
-				// will be searched before searching any of the path items."
-				newSearchPath = append([]string{"pg_catalog"}, newSearchPath...)
-			}
-			session.SearchPath = newSearchPath
+			session.SearchPath = parser.MakeSearchPath(paths)
 			return nil
 		},
-		Get: func(session *Session) string { return strings.Join(session.SearchPath, ", ") },
+		Get: func(session *Session) string { return session.SearchPath.String() },
 		Reset: func(session *Session) error {
 			session.SearchPath = sqlbase.DefaultSearchPath
 			return nil
@@ -267,6 +267,11 @@ var varGen = map[string]sessionVar{
 	`server_version`: {
 		Get: func(*Session) string { return PgServerVersion },
 	},
+
+	`server_version_num`: {
+		Get: func(*Session) string { return PgServerVersionNum },
+	},
+
 	`session_user`: {
 		Get: func(session *Session) string { return session.User },
 	},
@@ -281,7 +286,7 @@ var varGen = map[string]sessionVar{
 			if err != nil {
 				return err
 			}
-			if parser.Name(s).Normalize() != parser.ReNormalizeName("on") {
+			if strings.ToLower(s) != "on" {
 				return fmt.Errorf("set standard_conforming_strings: \"%s\" not supported", s)
 			}
 
@@ -330,7 +335,7 @@ var varGen = map[string]sessionVar{
 		Get: func(session *Session) string { return getTransactionState(&session.TxnState) },
 	},
 
-	`trace`: {
+	`tracing`: {
 		Get: func(session *Session) string {
 			if session.Tracing.Enabled() {
 				val := "on"
@@ -380,7 +385,7 @@ func enableTracing(session *Session, values []parser.TypedExpr) error {
 		case "cluster":
 			recordingType = tracing.SnowballRecording
 		default:
-			return errors.Errorf("set trace: unknown mode %q", s)
+			return errors.Errorf("set tracing: unknown mode %q", s)
 		}
 	}
 	if !enableMode {
@@ -404,3 +409,22 @@ var varNames = func() []string {
 	sort.Strings(res)
 	return res
 }()
+
+func getSingleBool(
+	name string, session *Session, values []parser.TypedExpr,
+) (*parser.DBool, error) {
+	if len(values) != 1 {
+		return nil, fmt.Errorf("set %s requires a single argument", name)
+	}
+	evalCtx := session.evalCtx()
+	val, err := values[0].Eval(&evalCtx)
+	if err != nil {
+		return nil, err
+	}
+	b, ok := val.(*parser.DBool)
+	if !ok {
+		return nil, fmt.Errorf("set %s requires a boolean value: %s is a %s",
+			name, values[0], val.ResolvedType())
+	}
+	return b, nil
+}

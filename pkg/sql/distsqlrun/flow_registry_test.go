@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
@@ -23,6 +21,7 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -36,7 +35,11 @@ import (
 func lookupFlow(fr *flowRegistry, fid FlowID, timeout time.Duration) *Flow {
 	fr.Lock()
 	defer fr.Unlock()
-	entry := fr.waitForFlowLocked(context.TODO(), fid, timeout)
+	entry := fr.getEntryLocked(fid)
+	if entry.flow != nil {
+		return entry.flow
+	}
+	entry = fr.waitForFlowLocked(context.TODO(), fid, timeout)
 	if entry == nil {
 		return nil
 	}
@@ -64,7 +67,7 @@ func lookupStreamInfo(fr *flowRegistry, fid FlowID, sid StreamID) (inboundStream
 
 func TestFlowRegistry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	reg := makeFlowRegistry()
+	reg := makeFlowRegistry(roachpb.NodeID(0))
 
 	id1 := FlowID{uuid.MakeV4()}
 	f1 := &Flow{}
@@ -89,7 +92,11 @@ func TestFlowRegistry(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	reg.RegisterFlow(ctx, id1, f1, nil /* inboundStreams */, flowStreamDefaultTimeout)
+	if err := reg.RegisterFlow(
+		ctx, id1, f1, nil /* inboundStreams */, flowStreamDefaultTimeout,
+	); err != nil {
+		t.Fatal(err)
+	}
 
 	if f := lookupFlow(reg, id1, 0); f != f1 {
 		t.Error("couldn't lookup previously registered flow")
@@ -105,7 +112,11 @@ func TestFlowRegistry(t *testing.T) {
 
 	go func() {
 		time.Sleep(jiffy)
-		reg.RegisterFlow(ctx, id1, f1, nil /* inboundStreams */, flowStreamDefaultTimeout)
+		if err := reg.RegisterFlow(
+			ctx, id1, f1, nil /* inboundStreams */, flowStreamDefaultTimeout,
+		); err != nil {
+			t.Error(err)
+		}
 	}()
 
 	if f := lookupFlow(reg, id1, 10*jiffy); f != f1 {
@@ -136,7 +147,11 @@ func TestFlowRegistry(t *testing.T) {
 	}()
 
 	time.Sleep(jiffy)
-	reg.RegisterFlow(ctx, id2, f2, nil /* inboundStreams */, flowStreamDefaultTimeout)
+	if err := reg.RegisterFlow(
+		ctx, id2, f2, nil /* inboundStreams */, flowStreamDefaultTimeout,
+	); err != nil {
+		t.Fatal(err)
+	}
 	wg.Wait()
 
 	// -- Multiple lookups, with the first one failing. --
@@ -161,14 +176,22 @@ func TestFlowRegistry(t *testing.T) {
 	}()
 
 	wg1.Wait()
-	reg.RegisterFlow(ctx, id3, f3, nil /* inboundStreams */, flowStreamDefaultTimeout)
+	if err := reg.RegisterFlow(
+		ctx, id3, f3, nil /* inboundStreams */, flowStreamDefaultTimeout,
+	); err != nil {
+		t.Fatal(err)
+	}
 	wg2.Wait()
 
 	// -- Lookup with huge timeout, register in the meantime. --
 
 	go func() {
 		time.Sleep(jiffy)
-		reg.RegisterFlow(ctx, id4, f4, nil /* inboundStreams */, flowStreamDefaultTimeout)
+		if err := reg.RegisterFlow(
+			ctx, id4, f4, nil /* inboundStreams */, flowStreamDefaultTimeout,
+		); err != nil {
+			t.Error(err)
+		}
 	}()
 
 	// This should return in a jiffy.
@@ -181,7 +204,7 @@ func TestFlowRegistry(t *testing.T) {
 // are propagated to their consumers and future attempts to connect them fail.
 func TestStreamConnectionTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	reg := makeFlowRegistry()
+	reg := makeFlowRegistry(roachpb.NodeID(0))
 
 	jiffy := time.Nanosecond
 
@@ -196,14 +219,18 @@ func TestStreamConnectionTimeout(t *testing.T) {
 	inboundStreams := map[StreamID]*inboundStreamInfo{
 		streamID1: {receiver: consumer, waitGroup: wg},
 	}
-	reg.RegisterFlow(context.TODO(), id1, f1, inboundStreams, jiffy)
+	if err := reg.RegisterFlow(
+		context.TODO(), id1, f1, inboundStreams, jiffy,
+	); err != nil {
+		t.Fatal(err)
+	}
 
 	testutils.SucceedsSoon(t, func() error {
 		si, err := lookupStreamInfo(reg, id1, streamID1)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !si.timedOut {
+		if !si.cancelled {
 			return errors.Errorf("not timed out yet")
 		}
 		return nil
@@ -213,7 +240,14 @@ func TestStreamConnectionTimeout(t *testing.T) {
 		t.Fatalf("expected consumer to have been closed when the flow timed out")
 	}
 
-	_, _, _, err := reg.ConnectInboundStream(context.TODO(), id1, streamID1, jiffy)
+	// Create a dummy server stream to pass to ConnectInboundStream.
+	serverStream, _ /* clientStream */, cleanup, err := createDummyStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	_, _, _, err = reg.ConnectInboundStream(context.TODO(), id1, streamID1, serverStream, jiffy)
 	if !testutils.IsError(err, "came too late") {
 		t.Fatalf("expected %q, got: %v", "came too late", err)
 	}
@@ -221,8 +255,109 @@ func TestStreamConnectionTimeout(t *testing.T) {
 	// Unregister the flow. Subsequent attempts to connect a stream should result
 	// in a different error than before.
 	reg.UnregisterFlow(id1)
-	_, _, _, err = reg.ConnectInboundStream(context.TODO(), id1, streamID1, jiffy)
+	_, _, _, err = reg.ConnectInboundStream(context.TODO(), id1, streamID1, serverStream, jiffy)
 	if !testutils.IsError(err, "not found") {
 		t.Fatalf("expected %q, got: %v", "not found", err)
+	}
+}
+
+// Test that the FlowRegistry send the correct handshake messages:
+// - if an inbound stream arrives to the registry before the consumer is
+// scheduled, then a Handshake message informing that the consumer is not yet
+// connected is sent;
+// - once the consumer connects, another Handshake message is sent.
+func TestHandshake(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	reg := makeFlowRegistry(roachpb.NodeID(0))
+
+	tests := []struct {
+		name                   string
+		consumerConnectedEarly bool
+	}{
+		{
+			name: "consumer early",
+			consumerConnectedEarly: true,
+		},
+		{
+			name: "consumer late",
+			consumerConnectedEarly: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			flowID := FlowID{uuid.MakeV4()}
+			streamID := StreamID(1)
+
+			serverStream, clientStream, cleanup, err := createDummyStream()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+
+			connectProducer := func() {
+				// Simulate a producer connecting to the server. This should be called
+				// async because the consumer is not yet there and ConnectInboundStream
+				// is blocking.
+				if _, _, _, err := reg.ConnectInboundStream(
+					context.TODO(), flowID, streamID, serverStream, time.Hour,
+				); err != nil {
+					t.Error(err)
+				}
+			}
+			connectConsumer := func() {
+				f1 := &Flow{}
+				consumer := &RowBuffer{}
+				wg := &sync.WaitGroup{}
+				wg.Add(1)
+				inboundStreams := map[StreamID]*inboundStreamInfo{
+					streamID: {receiver: consumer, waitGroup: wg},
+				}
+				if err := reg.RegisterFlow(
+					context.TODO(), flowID, f1, inboundStreams, time.Hour, /* timeout */
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// If the consumer is supposed to be connected early, then we connect the
+			// consumer and then we connect the producer. Otherwise, we connect the
+			// producer and expect a first handshake and only then we connect the
+			// consumer.
+			if tc.consumerConnectedEarly {
+				connectConsumer()
+				go connectProducer()
+			} else {
+				go connectProducer()
+
+				// Expect the client (the producer) to receive a Handshake saying that the
+				// consumer is not connected yet.
+				consumerSignal, err := clientStream.Recv()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if consumerSignal.Handshake == nil {
+					t.Fatalf("expected handshake, got: %+v", consumerSignal)
+				}
+				if consumerSignal.Handshake.ConsumerScheduled {
+					t.Fatal("expected !ConsumerScheduled")
+				}
+
+				connectConsumer()
+			}
+
+			// Now expect another Handshake message telling the producer that the consumer
+			// has connected.
+			consumerSignal, err := clientStream.Recv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if consumerSignal.Handshake == nil {
+				t.Fatalf("expected handshake, got: %+v", consumerSignal)
+			}
+			if !consumerSignal.Handshake.ConsumerScheduled {
+				t.Fatal("expected ConsumerScheduled")
+			}
+		})
 	}
 }

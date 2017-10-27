@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 // This file implements the SHOW TESTING_RANGES statement:
 //   SHOW TESTING_RANGES FROM TABLE t
@@ -45,7 +43,6 @@ func (p *planner) ShowRanges(ctx context.Context, n *parser.ShowRanges) (planNod
 	// Note: for interleaved tables, the ranges we report will include rows from
 	// interleaving.
 	return &showRangesNode{
-		p:      p,
 		span:   tableDesc.IndexSpan(index.ID),
 		values: make([]parser.Datum, len(showRangesColumns)),
 	}, nil
@@ -54,7 +51,6 @@ func (p *planner) ShowRanges(ctx context.Context, n *parser.ShowRanges) (planNod
 type showRangesNode struct {
 	optColumnsSlot
 
-	p    *planner
 	span roachpb.Span
 
 	// descriptorKVs are KeyValues returned from scanning the
@@ -76,9 +72,13 @@ var showRangesColumns = sqlbase.ResultColumns{
 		Typ:  parser.TypeString,
 	},
 	{
+		Name: "Range ID",
+		Typ:  parser.TypeInt,
+	},
+	{
 		Name: "Replicas",
 		// The INTs in the array are Store IDs.
-		Typ: parser.TypeIntArray,
+		Typ: parser.TArray{Typ: parser.TypeInt},
 	},
 	{
 		Name: "Lease Holder",
@@ -87,13 +87,13 @@ var showRangesColumns = sqlbase.ResultColumns{
 	},
 }
 
-func (n *showRangesNode) Start(ctx context.Context) error {
+func (n *showRangesNode) Start(params runParams) error {
 	var err error
-	n.descriptorKVs, err = scanMetaKVs(ctx, n.p.txn, n.span)
+	n.descriptorKVs, err = scanMetaKVs(params.ctx, params.p.txn, n.span)
 	return err
 }
 
-func (n *showRangesNode) Next(ctx context.Context) (bool, error) {
+func (n *showRangesNode) Next(params runParams) (bool, error) {
 	if n.rowIdx >= len(n.descriptorKVs) {
 		return false, nil
 	}
@@ -114,6 +114,8 @@ func (n *showRangesNode) Next(ctx context.Context) (bool, error) {
 		n.values[1] = parser.NewDString(sqlbase.PrettyKey(desc.EndKey.AsRawKey(), 2))
 	}
 
+	n.values[2] = parser.NewDInt(parser.DInt(desc.RangeID))
+
 	var replicas []int
 	for _, rd := range desc.Replicas {
 		replicas = append(replicas, int(rd.StoreID))
@@ -125,7 +127,7 @@ func (n *showRangesNode) Next(ctx context.Context) (bool, error) {
 	for i, r := range replicas {
 		replicaArr.Array[i] = parser.NewDInt(parser.DInt(r))
 	}
-	n.values[2] = replicaArr
+	n.values[3] = replicaArr
 
 	// Get the lease holder.
 	// TODO(radu): this will be slow if we have a lot of ranges; find a way to
@@ -136,11 +138,11 @@ func (n *showRangesNode) Next(ctx context.Context) (bool, error) {
 			Key: desc.StartKey.AsRawKey(),
 		},
 	})
-	if err := n.p.txn.Run(ctx, b); err != nil {
+	if err := params.p.txn.Run(params.ctx, b); err != nil {
 		return false, errors.Wrap(err, "error getting lease info")
 	}
 	resp := b.RawResponse().Responses[0].GetInner().(*roachpb.LeaseInfoResponse)
-	n.values[3] = parser.NewDInt(parser.DInt(resp.Lease.Replica.StoreID))
+	n.values[4] = parser.NewDInt(parser.DInt(resp.Lease.Replica.StoreID))
 
 	n.rowIdx++
 	return true, nil
@@ -158,14 +160,14 @@ func (n *showRangesNode) Close(_ context.Context) {
 func scanMetaKVs(
 	ctx context.Context, txn *client.Txn, span roachpb.Span,
 ) ([]client.KeyValue, error) {
-	metaStart := keys.RangeMetaKey(keys.MustAddr(span.Key))
+	metaStart := keys.RangeMetaKey(keys.MustAddr(span.Key).Next())
 	metaEnd := keys.RangeMetaKey(keys.MustAddr(span.EndKey))
 
 	kvs, err := txn.Scan(ctx, metaStart, metaEnd, 0)
 	if err != nil {
 		return nil, err
 	}
-	if len(kvs) == 0 || !kvs[len(kvs)-1].Key.Equal(metaEnd) {
+	if len(kvs) == 0 || !kvs[len(kvs)-1].Key.Equal(metaEnd.AsRawKey()) {
 		// Normally we need to scan one more KV because the ranges are addressed by
 		// the end key.
 		extraKV, err := txn.Scan(ctx, metaEnd, keys.Meta2Prefix.PrefixEnd(), 1 /* one result */)

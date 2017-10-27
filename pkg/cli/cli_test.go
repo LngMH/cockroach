@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package cli
 
@@ -264,8 +262,8 @@ func captureOutput(f func()) (out string, err error) {
 
 func (c cliTest) RunWithArgs(origArgs []string) {
 	sqlCtx.execStmts = nil
-	zoneConfig = ""
-	zoneDisableReplication = false
+	zoneCtx.zoneConfig = ""
+	zoneCtx.zoneDisableReplication = false
 
 	if err := func() error {
 		args := append([]string(nil), origArgs[:1]...)
@@ -296,8 +294,8 @@ func (c cliTest) RunWithArgs(origArgs []string) {
 
 func (c cliTest) RunWithCAArgs(origArgs []string) {
 	sqlCtx.execStmts = nil
-	zoneConfig = ""
-	zoneDisableReplication = false
+	zoneCtx.zoneConfig = ""
+	zoneCtx.zoneDisableReplication = false
 
 	if err := func() error {
 		args := append([]string(nil), origArgs[:1]...)
@@ -392,31 +390,44 @@ func Example_ranges() {
 	c.Run("debug range ls")
 
 	// Output:
-	// debug range split ranges3
-	// debug range ls
-	// /Min-/System/"" [1]
-	// 	0: node-id=1 store-id=1
-	// /System/""-/System/tsd [2]
-	// 	0: node-id=1 store-id=1
-	// /System/tsd-/System/"tse" [3]
-	// 	0: node-id=1 store-id=1
-	// /System/"tse"-"ranges3" [4]
-	// 	0: node-id=1 store-id=1
-	// "ranges3"-/Table/0 [11]
-	// 	0: node-id=1 store-id=1
-	// /Table/0-/Table/11 [5]
-	// 	0: node-id=1 store-id=1
-	// /Table/11-/Table/12 [6]
-	// 	0: node-id=1 store-id=1
-	// /Table/12-/Table/13 [7]
-	// 	0: node-id=1 store-id=1
-	// /Table/13-/Table/14 [8]
-	// 	0: node-id=1 store-id=1
-	// /Table/14-/Table/15 [9]
-	// 	0: node-id=1 store-id=1
-	// /Table/15-/Max [10]
-	// 	0: node-id=1 store-id=1
-	// 11 result(s)
+	//debug range split ranges3
+	//debug range ls
+	///Min-/System/"" [1]
+	//	0: node-id=1 store-id=1
+	///System/""-/System/NodeLiveness [2]
+	//	0: node-id=1 store-id=1
+	///System/NodeLiveness-/System/NodeLivenessMax [3]
+	//	0: node-id=1 store-id=1
+	///System/NodeLivenessMax-/System/tsd [4]
+	//	0: node-id=1 store-id=1
+	///System/tsd-/System/"tse" [5]
+	//	0: node-id=1 store-id=1
+	///System/"tse"-"ranges3" [6]
+	//	0: node-id=1 store-id=1
+	//"ranges3"-/Table/SystemConfigSpan/Start [17]
+	//	0: node-id=1 store-id=1
+	///Table/SystemConfigSpan/Start-/Table/11 [7]
+	//	0: node-id=1 store-id=1
+	///Table/11-/Table/12 [8]
+	//	0: node-id=1 store-id=1
+	///Table/12-/Table/13 [9]
+	//	0: node-id=1 store-id=1
+	///Table/13-/Table/14 [10]
+	//	0: node-id=1 store-id=1
+	///Table/14-/Table/15 [11]
+	//	0: node-id=1 store-id=1
+	///Table/15-/Table/16 [12]
+	//	0: node-id=1 store-id=1
+	///Table/16-/Table/17 [13]
+	//	0: node-id=1 store-id=1
+	///Table/17-/Table/18 [14]
+	//	0: node-id=1 store-id=1
+	///Table/18-/Table/19 [15]
+	//	0: node-id=1 store-id=1
+	///Table/19-/Max [16]
+	//	0: node-id=1 store-id=1
+	//17 result(s)
+
 }
 
 func Example_logging() {
@@ -432,29 +443,29 @@ func Example_logging() {
 
 	// Output:
 	// sql --logtostderr=false -e select 1
-	// 1 row
 	// 1
 	// 1
+	// # 1 row
 	// sql --log-backtrace-at=foo.go:1 -e select 1
-	// 1 row
 	// 1
 	// 1
+	// # 1 row
 	// sql --log-dir= -e select 1
-	// 1 row
 	// 1
 	// 1
+	// # 1 row
 	// sql --logtostderr=true -e select 1
-	// 1 row
 	// 1
 	// 1
+	// # 1 row
 	// sql --verbosity=0 -e select 1
-	// 1 row
 	// 1
 	// 1
+	// # 1 row
 	// sql --vmodule=foo=1 -e select 1
-	// 1 row
 	// 1
 	// 1
+	// # 1 row
 }
 
 func Example_max_results() {
@@ -466,20 +477,20 @@ func Example_max_results() {
 	c.Run("debug range ls --max-results=5")
 
 	// Output:
-	// debug range split max_results3
-	// debug range split max_results4
-	// debug range ls --max-results=5
-	// /Min-/System/"" [1]
-	// 	0: node-id=1 store-id=1
-	// /System/""-/System/tsd [2]
-	// 	0: node-id=1 store-id=1
-	// /System/tsd-/System/"tse" [3]
-	// 	0: node-id=1 store-id=1
-	// /System/"tse"-"max_results3" [4]
-	// 	0: node-id=1 store-id=1
-	// "max_results3"-"max_results4" [11]
-	// 	0: node-id=1 store-id=1
-	// 5 result(s)
+	//debug range split max_results3
+	//debug range split max_results4
+	//debug range ls --max-results=5
+	///Min-/System/"" [1]
+	//	0: node-id=1 store-id=1
+	///System/""-/System/NodeLiveness [2]
+	//	0: node-id=1 store-id=1
+	///System/NodeLiveness-/System/NodeLivenessMax [3]
+	//	0: node-id=1 store-id=1
+	///System/NodeLivenessMax-/System/tsd [4]
+	//	0: node-id=1 store-id=1
+	///System/tsd-/System/"tse" [5]
+	//	0: node-id=1 store-id=1
+	//5 result(s)
 }
 
 func Example_zone() {
@@ -491,8 +502,8 @@ func Example_zone() {
 	c.Run("zone ls")
 	c.Run("zone get .meta")
 	c.Run("zone get system.nonexistent")
-	c.Run("zone get system.lease")
-	c.Run("zone set system.lease --file=./testdata/zone_attrs.yaml")
+	c.Run("zone get system.descriptor")
+	c.Run("zone set system.descriptor --file=./testdata/zone_attrs.yaml")
 	c.Run("zone set system.namespace --file=./testdata/zone_attrs.yaml")
 	c.Run("zone set system.nonexistent --file=./testdata/zone_attrs.yaml")
 	c.Run("zone set system --file=./testdata/zone_range_max_bytes.yaml")
@@ -525,7 +536,7 @@ func Example_zone() {
 	// range_min_bytes: 1048576
 	// range_max_bytes: 67108864
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 1
 	// constraints: [us-east-1a, ssd]
 	// zone ls
@@ -536,30 +547,30 @@ func Example_zone() {
 	// range_min_bytes: 1048576
 	// range_max_bytes: 67108864
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 1
 	// constraints: []
 	// zone get system.nonexistent
-	// system.nonexistent not found
-	// zone get system.lease
+	// pq: relation "system.nonexistent" does not exist
+	// zone get system.descriptor
 	// system
 	// range_min_bytes: 1048576
 	// range_max_bytes: 67108864
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 1
 	// constraints: [us-east-1a, ssd]
-	// zone set system.lease --file=./testdata/zone_attrs.yaml
-	// setting zone configs for individual system tables is not supported; try setting your config on the entire "system" database instead
+	// zone set system.descriptor --file=./testdata/zone_attrs.yaml
+	// pq: cannot set zone configs for system config tables; try setting your config on the entire "system" database instead
 	// zone set system.namespace --file=./testdata/zone_attrs.yaml
-	// setting zone configs for individual system tables is not supported; try setting your config on the entire "system" database instead
+	// pq: cannot set zone configs for system config tables; try setting your config on the entire "system" database instead
 	// zone set system.nonexistent --file=./testdata/zone_attrs.yaml
-	// system.nonexistent not found
+	// pq: relation "system.nonexistent" does not exist
 	// zone set system --file=./testdata/zone_range_max_bytes.yaml
 	// range_min_bytes: 1048576
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 3
 	// constraints: [us-east-1a, ssd]
 	// zone get system
@@ -567,34 +578,34 @@ func Example_zone() {
 	// range_min_bytes: 1048576
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 3
 	// constraints: [us-east-1a, ssd]
 	// zone rm system
-	// DELETE 1
+	// CONFIGURE ZONE 1
 	// zone ls
 	// .default
 	// zone rm .default
-	// unable to remove special zone .default
+	// pq: cannot remove default zone
 	// zone set .meta --file=./testdata/zone_range_max_bytes.yaml
 	// range_min_bytes: 1048576
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 3
 	// constraints: []
 	// zone set .system --file=./testdata/zone_range_max_bytes.yaml
 	// range_min_bytes: 1048576
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 3
 	// constraints: []
 	// zone set .timeseries --file=./testdata/zone_range_max_bytes.yaml
 	// range_min_bytes: 1048576
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 3
 	// constraints: []
 	// zone get .system
@@ -602,7 +613,7 @@ func Example_zone() {
 	// range_min_bytes: 1048576
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 3
 	// constraints: []
 	// zone ls
@@ -614,7 +625,7 @@ func Example_zone() {
 	// range_min_bytes: 1048576
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 3
 	// constraints: []
 	// zone get system
@@ -622,14 +633,14 @@ func Example_zone() {
 	// range_min_bytes: 1048576
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 3
 	// constraints: []
 	// zone set .default --disable-replication
 	// range_min_bytes: 1048576
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 1
 	// constraints: []
 	// zone get system
@@ -637,33 +648,35 @@ func Example_zone() {
 	// range_min_bytes: 1048576
 	// range_max_bytes: 134217728
 	// gc:
-	//   ttlseconds: 86400
+	//   ttlseconds: 90000
 	// num_replicas: 1
 	// constraints: []
 	// zone rm .meta
-	// DELETE 1
+	// CONFIGURE ZONE 1
 	// zone rm .system
-	// DELETE 1
+	// CONFIGURE ZONE 1
 	// zone ls
 	// .default
 	// .timeseries
 	// zone rm .timeseries
-	// DELETE 1
+	// CONFIGURE ZONE 1
 	// zone ls
 	// .default
 	// zone rm .meta
-	// DELETE 0
+	// CONFIGURE ZONE 0
 	// zone rm .system
-	// DELETE 0
+	// CONFIGURE ZONE 0
 	// zone rm .timeseries
-	// DELETE 0
+	// CONFIGURE ZONE 0
 }
 
 func Example_sql() {
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
 
+	c.RunWithArgs([]string{"sql", "-e", "show application_name"})
 	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.f (x int, y int); insert into t.f values (42, 69)"})
+	c.RunWithArgs([]string{"sql", "-e", "delete from t.f"})
 	c.RunWithArgs([]string{"sql", "-e", "select 3", "-e", "select * from t.f"})
 	c.RunWithArgs([]string{"sql", "-e", "begin", "-e", "select 3", "-e", "commit"})
 	c.RunWithArgs([]string{"sql", "-e", "select * from t.f"})
@@ -676,54 +689,70 @@ func Example_sql() {
 	// It must be possible to create the current database after the
 	// connection was established.
 	c.RunWithArgs([]string{"sql", "-d", "nonexistent", "-e", "create database nonexistent; create table foo(x int); select * from foo"})
+	// COPY should return an intelligible error message.
+	c.RunWithArgs([]string{"sql", "-e", "copy t.f from stdin"})
+	// --echo-sql should print out the SQL statements.
+	c.RunWithArgs([]string{"user", "ls", "--echo-sql"})
 
 	// Output:
+	// sql -e show application_name
+	// application_name
+	// cockroach
+	// # 1 row
 	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
 	// INSERT 1
+	// sql -e delete from t.f
+	// pq: rejected: DELETE without WHERE clause (sql_safe_updates = true)
 	// sql -e select 3 -e select * from t.f
-	// 1 row
 	// 3
 	// 3
-	// 1 row
+	// # 1 row
 	// x	y
 	// 42	69
+	// # 1 row
 	// sql -e begin -e select 3 -e commit
 	// BEGIN
-	// 1 row
 	// 3
 	// 3
+	// # 1 row
 	// COMMIT
 	// sql -e select * from t.f
-	// 1 row
 	// x	y
 	// 42	69
+	// # 1 row
 	// sql --execute=show databases
-	// 5 rows
 	// Database
 	// crdb_internal
 	// information_schema
 	// pg_catalog
 	// system
 	// t
+	// # 5 rows
 	// sql -e select 1; select 2
-	// 1 row
 	// 1
 	// 1
-	// 1 row
+	// # 1 row
 	// 2
 	// 2
+	// # 1 row
 	// sql -e select 1; select 2 where false
-	// 1 row
 	// 1
 	// 1
-	// 0 rows
+	// # 1 row
 	// 2
+	// # 0 rows
 	// sql -d nonexistent -e select count(*) from pg_class limit 0
-	// 0 rows
 	// count(*)
+	// # 0 rows
 	// sql -d nonexistent -e create database nonexistent; create table foo(x int); select * from foo
-	// 0 rows
 	// x
+	// # 0 rows
+	// sql -e copy t.f from stdin
+	// woops! COPY has confused this client! Suggestion: use 'psql' for COPY
+	// user ls --echo-sql
+	// > SELECT username FROM system.users
+	// username
+	// # 0 rows
 }
 
 func Example_sql_format() {
@@ -740,9 +769,9 @@ func Example_sql_format() {
 	// sql -e insert into t.times values ('2016-01-25 10:10:10', '2016-01-25 10:10:10-05:00')
 	// INSERT 1
 	// sql -e select * from t.times
-	// 1 row
 	// bare	withtz
 	// 2016-01-25 10:10:10+00:00	2016-01-25 15:10:10+00:00
+	// # 1 row
 }
 
 func Example_sql_column_labels() {
@@ -768,7 +797,6 @@ func Example_sql_column_labels() {
 	// sql -e insert into t.u values (0, 0, 0, 0, 0, 0)
 	// INSERT 1
 	// sql -e show columns from t.u
-	// 6 rows
 	// Field	Type	Null	Default	Indices
 	// """foo"	INT	true	NULL	{}
 	// \foo	INT	true	NULL	{}
@@ -777,10 +805,11 @@ func Example_sql_column_labels() {
 	// κόσμε	INT	true	NULL	{}
 	// a|b	INT	true	NULL	{}
 	// ܈85	INT	true	NULL	{}
+	// # 6 rows
 	// sql -e select * from t.u
-	// 1 row
 	// """foo"	\foo	"""foo\nbar"""	κόσμε	a|b	܈85
 	// 0	0	0	0	0	0
+	// # 1 row
 	// sql --format=pretty -e show columns from t.u
 	// +---------+------+------+---------+---------+
 	// |  Field  | Type | Null | Default | Indices |
@@ -802,13 +831,13 @@ func Example_sql_column_labels() {
 	// +------+------+------------+-------+-----+-----+
 	// (1 row)
 	// sql --format=tsv -e select * from t.u
-	// 1 row
 	// """foo"	\foo	"""foo\nbar"""	κόσμε	a|b	܈85
 	// 0	0	0	0	0	0
+	// # 1 row
 	// sql --format=csv -e select * from t.u
-	// 1 row
 	// """foo",\foo,"""foo\nbar""",κόσμε,a|b,܈85
 	// 0,0,0,0,0,0
+	// # 1 row
 	// sql --format=sql -e select * from t.u
 	// CREATE TABLE results (
 	//   """foo" STRING,
@@ -822,11 +851,11 @@ func Example_sql_column_labels() {
 	// INSERT INTO results VALUES ('0', '0', '0', '0', '0', '0');
 	// sql --format=html -e select * from t.u
 	// <table>
-	// <thead><tr><th>&#34;foo</th><th>\foo</th><th>&#34;foo\nbar&#34;</th><th>κόσμε</th><th>a|b</th><th>܈85</th></tr></head>
+	// <thead><tr><th>row</th><th>&#34;foo</th><th>\foo</th><th>&#34;foo\nbar&#34;</th><th>κόσμε</th><th>a|b</th><th>܈85</th></tr></head>
 	// <tbody>
-	// <tr><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+	// <tr><td>1</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
 	// </tbody>
-	// </table>
+	// <tfoot><tr><td colspan=7>1 row</td></tr></tfoot></table>
 	// sql --format=records -e select * from t.u
 	// -[ RECORD 1 ]
 	// "foo       | 0
@@ -835,6 +864,113 @@ func Example_sql_column_labels() {
 	// κόσμε      | 0
 	// a|b        | 0
 	// ܈85        | 0
+}
+
+func Example_sql_empty_table() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	c.RunWithArgs([]string{"sql", "-e", "create database t;" +
+		"create table t.norows(x int);" +
+		"create table t.nocolsnorows();" +
+		"create table t.nocols(); insert into t.nocols(rowid) values (1),(2),(3);"})
+	for _, table := range []string{"norows", "nocols", "nocolsnorows"} {
+		for _, format := range []string{"pretty", "tsv", "csv", "sql", "html", "raw", "records"} {
+			c.RunWithArgs([]string{"sql", "--format=" + format, "-e", "select * from t." + table})
+		}
+	}
+
+	// Output:
+	// sql -e create database t;create table t.norows(x int);create table t.nocolsnorows();create table t.nocols(); insert into t.nocols(rowid) values (1),(2),(3);
+	// INSERT 3
+	// sql --format=pretty -e select * from t.norows
+	// +---+
+	// | x |
+	// +---+
+	// +---+
+	// (0 rows)
+	// sql --format=tsv -e select * from t.norows
+	// x
+	// # 0 rows
+	// sql --format=csv -e select * from t.norows
+	// x
+	// # 0 rows
+	// sql --format=sql -e select * from t.norows
+	// CREATE TABLE results (
+	//   x STRING
+	// );
+	//
+	// sql --format=html -e select * from t.norows
+	// <table>
+	// <thead><tr><th>row</th><th>x</th></tr></head>
+	// </tbody>
+	// <tfoot><tr><td colspan=2>0 rows</td></tr></tfoot></table>
+	// sql --format=raw -e select * from t.norows
+	// # 1 column
+	// # 0 rows
+	// sql --format=records -e select * from t.norows
+	// sql --format=pretty -e select * from t.nocols
+	// --
+	// (3 rows)
+	// sql --format=tsv -e select * from t.nocols
+	// # no columns
+	// # empty
+	// # empty
+	// # empty
+	// # 3 rows
+	// sql --format=csv -e select * from t.nocols
+	// # no columns
+	// # empty
+	// # empty
+	// # empty
+	// # 3 rows
+	// sql --format=sql -e select * from t.nocols
+	// CREATE TABLE results (
+	// );
+	//
+	// INSERT INTO results(rowid) VALUES (DEFAULT);
+	// INSERT INTO results(rowid) VALUES (DEFAULT);
+	// INSERT INTO results(rowid) VALUES (DEFAULT);
+	// sql --format=html -e select * from t.nocols
+	// <table>
+	// <thead><tr><th>row</th></tr></head>
+	// <tbody>
+	// <tr><td>1</td></tr>
+	// <tr><td>2</td></tr>
+	// <tr><td>3</td></tr>
+	// </tbody>
+	// <tfoot><tr><td colspan=1>3 rows</td></tr></tfoot></table>
+	// sql --format=raw -e select * from t.nocols
+	// # 0 columns
+	// # row 1
+	// # row 2
+	// # row 3
+	// # 3 rows
+	// sql --format=records -e select * from t.nocols
+	// (3 rows)
+	// sql --format=pretty -e select * from t.nocolsnorows
+	// --
+	// (0 rows)
+	// sql --format=tsv -e select * from t.nocolsnorows
+	// # no columns
+	// # 0 rows
+	// sql --format=csv -e select * from t.nocolsnorows
+	// # no columns
+	// # 0 rows
+	// sql --format=sql -e select * from t.nocolsnorows
+	// CREATE TABLE results (
+	// );
+	//
+	// sql --format=html -e select * from t.nocolsnorows
+	// <table>
+	// <thead><tr><th>row</th></tr></head>
+	// </tbody>
+	// <tfoot><tr><td colspan=1>0 rows</td></tr></tfoot></table>
+	// sql --format=raw -e select * from t.nocolsnorows
+	// # 0 columns
+	// # 0 rows
+	// sql --format=records -e select * from t.nocolsnorows
+	// (0 rows)
 }
 
 func Example_sql_table() {
@@ -884,13 +1020,13 @@ func Example_sql_table() {
 	// INSERT 1
 	// sql -e insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
 	// pq: invalid UTF-8 byte sequence
+	// DETAIL: source SQL:
 	// insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
 	//                         ^
-	//
+	// HINT: try \h VALUES
 	// sql -e insert into t.t values (e'a\tb\tc\n12\t123123213\t12313', 'tabs')
 	// INSERT 1
 	// sql -e select * from t.t
-	// 9 rows
 	// s	d
 	// foo	printable ASCII
 	// """foo"	printable ASCII with quotes
@@ -903,6 +1039,7 @@ func Example_sql_table() {
 	// ܈85	UTF8 string with RTL char
 	// "a	b	c
 	// 12	123123213	12313"	tabs
+	// # 9 rows
 	// sql --format=pretty -e select * from t.t
 	// +--------------------------------+--------------------------------+
 	// |               s                |               d                |
@@ -921,7 +1058,6 @@ func Example_sql_table() {
 	// +--------------------------------+--------------------------------+
 	// (9 rows)
 	// sql --format=tsv -e select * from t.t
-	// 9 rows
 	// s	d
 	// foo	printable ASCII
 	// """foo"	printable ASCII with quotes
@@ -934,8 +1070,8 @@ func Example_sql_table() {
 	// ܈85	UTF8 string with RTL char
 	// "a	b	c
 	// 12	123123213	12313"	tabs
+	// # 9 rows
 	// sql --format=csv -e select * from t.t
-	// 9 rows
 	// s,d
 	// foo,printable ASCII
 	// """foo",printable ASCII with quotes
@@ -948,6 +1084,7 @@ func Example_sql_table() {
 	// ܈85,UTF8 string with RTL char
 	// "a	b	c
 	// 12	123123213	12313",tabs
+	// # 9 rows
 	// sql --format=sql -e select * from t.t
 	// CREATE TABLE results (
 	//   s STRING,
@@ -965,19 +1102,19 @@ func Example_sql_table() {
 	// INSERT INTO results VALUES (e'a\tb\tc\n12\t123123213\t12313', 'tabs');
 	// sql --format=html -e select * from t.t
 	// <table>
-	// <thead><tr><th>s</th><th>d</th></tr></head>
+	// <thead><tr><th>row</th><th>s</th><th>d</th></tr></head>
 	// <tbody>
-	// <tr><td>foo</td><td>printable ASCII</td></tr>
-	// <tr><td>&#34;foo</td><td>printable ASCII with quotes</td></tr>
-	// <tr><td>\foo</td><td>printable ASCII with backslash</td></tr>
-	// <tr><td>foo<br/>bar</td><td>non-printable ASCII</td></tr>
-	// <tr><td>κόσμε</td><td>printable UTF8</td></tr>
-	// <tr><td>ñ</td><td>printable UTF8 using escapes</td></tr>
-	// <tr><td>&#34;\x01&#34;</td><td>non-printable UTF8 string</td></tr>
-	// <tr><td>܈85</td><td>UTF8 string with RTL char</td></tr>
-	// <tr><td>a	b	c<br/>12	123123213	12313</td><td>tabs</td></tr>
+	// <tr><td>1</td><td>foo</td><td>printable ASCII</td></tr>
+	// <tr><td>2</td><td>&#34;foo</td><td>printable ASCII with quotes</td></tr>
+	// <tr><td>3</td><td>\foo</td><td>printable ASCII with backslash</td></tr>
+	// <tr><td>4</td><td>foo<br/>bar</td><td>non-printable ASCII</td></tr>
+	// <tr><td>5</td><td>κόσμε</td><td>printable UTF8</td></tr>
+	// <tr><td>6</td><td>ñ</td><td>printable UTF8 using escapes</td></tr>
+	// <tr><td>7</td><td>&#34;\x01&#34;</td><td>non-printable UTF8 string</td></tr>
+	// <tr><td>8</td><td>܈85</td><td>UTF8 string with RTL char</td></tr>
+	// <tr><td>9</td><td>a	b	c<br/>12	123123213	12313</td><td>tabs</td></tr>
 	// </tbody>
-	// </table>
+	// <tfoot><tr><td colspan=3>9 rows</td></tr></tfoot></table>
 	// sql --format=raw -e select * from t.t
 	// # 2 columns
 	// # row 1
@@ -1117,8 +1254,8 @@ func Example_user() {
 
 	// Output:
 	// user ls
-	// 0 rows
 	// username
+	// # 0 rows
 	// user ls --format=pretty
 	// +----------+
 	// | username |
@@ -1126,8 +1263,8 @@ func Example_user() {
 	// +----------+
 	// (0 rows)
 	// user ls --format=tsv
-	// 0 rows
 	// username
+	// # 0 rows
 	// user set FOO
 	// INSERT 1
 	// user set Foo
@@ -1226,13 +1363,14 @@ func TestFlagUsage(t *testing.T) {
 
 Available Commands:
   start       start a node
+  init        initialize a cluster
   cert        create ca, node, and client certs
   quit        drain and shutdown node
 
   sql         open a sql shell
   user        get, set, list and remove users
   zone        get, set, list and remove zones
-  node        list nodes and show their status
+  node        list, inspect or remove nodes
   dump        dump sql tables
 
   gen         generate auxiliary files
@@ -1241,6 +1379,7 @@ Available Commands:
   help        Help about any command
 
 Flags:
+  -h, --help                             help for cockroach
       --log-backtrace-at traceLocation   when logging hits line file:N, emit a stack trace (default :0)
       --log-dir string                   if non-empty, write log files in this directory
       --log-dir-max-size bytes           maximum combined size of all log files (default 100 MiB)
@@ -1325,9 +1464,9 @@ func Example_node() {
 
 	// Output:
 	// node ls
-	// 1 row
 	// id
 	// 1
+	// # 1 row
 	// node ls --format=pretty
 	// +----+
 	// | id |
@@ -1357,6 +1496,42 @@ func TestNodeStatus(t *testing.T) {
 	}
 	checkNodeStatus(t, c, out, start)
 
+	out, err = c.RunWithCapture("node status --ranges --format=pretty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNodeStatus(t, c, out, start)
+
+	out, err = c.RunWithCapture("node status --stats --format=pretty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNodeStatus(t, c, out, start)
+
+	out, err = c.RunWithCapture("node status --ranges --stats --format=pretty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNodeStatus(t, c, out, start)
+
+	out, err = c.RunWithCapture("node status --decommission --format=pretty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNodeStatus(t, c, out, start)
+
+	out, err = c.RunWithCapture("node status --ranges --stats --decommission --format=pretty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNodeStatus(t, c, out, start)
+
+	out, err = c.RunWithCapture("node status --all --format=pretty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNodeStatus(t, c, out, start)
+
 	out, err = c.RunWithCapture("node status --format=pretty")
 	if err != nil {
 		t.Fatal(err)
@@ -1367,6 +1542,12 @@ func TestNodeStatus(t *testing.T) {
 func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 	buf := bytes.NewBufferString(output)
 	s := bufio.NewScanner(buf)
+
+	type testCase struct {
+		name   string
+		idx    int
+		maxval int64
+	}
 
 	// Skip command line.
 	if !s.Scan() {
@@ -1383,8 +1564,8 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 	if err != nil {
 		t.Fatalf("%s", err)
 	}
-	if !reflect.DeepEqual(cols, nodesColumnHeaders) {
-		t.Fatalf("columns (%s) don't match expected (%s)", cols, nodesColumnHeaders)
+	if !reflect.DeepEqual(cols, getStatusNodeHeaders()) {
+		t.Fatalf("columns (%s) don't match expected (%s)", cols, getStatusNodeHeaders())
 	}
 
 	checkSeparatorLine(t, s)
@@ -1422,21 +1603,37 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 	checkTimeElapsed(t, fields[3], 15*time.Second, start)
 	checkTimeElapsed(t, fields[4], 15*time.Second, start)
 
-	// Verify all byte/range metrics.
-	testcases := []struct {
-		name   string
-		idx    int
-		maxval int64
-	}{
-		{"live_bytes", 5, 50000},
-		{"key_bytes", 6, 30000},
-		{"value_bytes", 7, 50000},
-		{"intent_bytes", 8, 30000},
-		{"system_bytes", 9, 30000},
-		{"leader_ranges", 10, 3},
-		{"repl_ranges", 11, 3},
-		{"avail_ranges", 12, 3},
+	testcases := []testCase{}
+
+	// We're skipping over the first 5 default fields such as node id and
+	// address. They don't need closer checks.
+	baseIdx := len(baseNodeColumnHeaders)
+
+	// Adding fields that need verification for --range flag.
+	if nodeCtx.statusShowRanges || nodeCtx.statusShowAll {
+		testcases = append(testcases,
+			testCase{"leader_ranges", baseIdx, 3},
+			testCase{"repl_ranges", baseIdx + 1, 3},
+			testCase{"avail_ranges", baseIdx + 2, 3},
+		)
+
+		// Ranges actually adds 5 fields, but we only need to check
+		// the 3 above.
+		baseIdx += len(statusNodesColumnHeadersForRanges)
 	}
+
+	// Adding fields that need verification for --stats flag.
+	if nodeCtx.statusShowStats || nodeCtx.statusShowAll {
+		testcases = append(testcases,
+			testCase{"live_bytes", baseIdx, 100000},
+			testCase{"key_bytes", baseIdx + 1, 30000},
+			testCase{"value_bytes", baseIdx + 2, 100000},
+			testCase{"intent_bytes", baseIdx + 3, 30000},
+			testCase{"system_bytes", baseIdx + 4, 30000},
+		)
+		baseIdx += len(statusNodesColumnHeadersForStats)
+	}
+
 	for _, tc := range testcases {
 		val, err := strconv.ParseInt(fields[tc.idx], 10, 64)
 		if err != nil {
@@ -1490,7 +1687,7 @@ func extractFields(line string) ([]string, error) {
 	// fields has two extra entries, one for the empty token to the left of the first
 	// |, and another empty one to the right of the final |. So, we need to take those
 	// out.
-	if a, e := len(fields), len(nodesColumnHeaders)+2; a != e {
+	if a, e := len(fields), len(getStatusNodeHeaders())+2; a != e {
 		return nil, errors.Errorf("can't extract fields: # of fields (%d) != expected (%d)", a, e)
 	}
 	fields = fields[1 : len(fields)-1]
@@ -1616,6 +1813,12 @@ writing ` + os.DevNull + `
   debug/nodes/1/ranges/8
   debug/nodes/1/ranges/9
   debug/nodes/1/ranges/10
+  debug/nodes/1/ranges/11
+  debug/nodes/1/ranges/12
+  debug/nodes/1/ranges/13
+  debug/nodes/1/ranges/14
+  debug/nodes/1/ranges/15
+  debug/nodes/1/ranges/16
   debug/schema/system@details
   debug/schema/system/descriptor
   debug/schema/system/eventlog
@@ -1626,6 +1829,7 @@ writing ` + os.DevNull + `
   debug/schema/system/settings
   debug/schema/system/ui
   debug/schema/system/users
+  debug/schema/system/web_sessions
   debug/schema/system/zones
 `
 
@@ -1652,7 +1856,7 @@ func Example_in_memory() {
 	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
 	// INSERT 1
 	// node ls
-	// 1 row
 	// id
 	// 1
+	// # 1 row
 }

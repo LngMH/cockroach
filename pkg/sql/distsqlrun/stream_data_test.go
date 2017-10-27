@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package distsqlrun
 
@@ -31,12 +29,12 @@ import (
 // The encoder/decoder don't maintain the ordering between rows and metadata
 // records.
 func testGetDecodedRows(
-	t *testing.T, sd *StreamDecoder, decodedRows sqlbase.EncDatumRows, metas []ProducerMetadata,
+	tb testing.TB, sd *StreamDecoder, decodedRows sqlbase.EncDatumRows, metas []ProducerMetadata,
 ) (sqlbase.EncDatumRows, []ProducerMetadata) {
 	for {
 		row, meta, err := sd.GetRow(nil /* rowBuf */)
 		if err != nil {
-			t.Fatal(err)
+			tb.Fatal(err)
 		}
 		if row == nil && meta.Empty() {
 			break
@@ -50,7 +48,7 @@ func testGetDecodedRows(
 	return decodedRows, metas
 }
 
-func testRowStream(t *testing.T, rng *rand.Rand, records []rowOrMeta) {
+func testRowStream(tb testing.TB, rng *rand.Rand, types []sqlbase.ColumnType, records []rowOrMeta) {
 	var se StreamEncoder
 	var sd StreamDecoder
 
@@ -59,11 +57,13 @@ func testRowStream(t *testing.T, rng *rand.Rand, records []rowOrMeta) {
 	numRows := 0
 	numMeta := 0
 
+	se.init(types)
+
 	for rowIdx := 0; rowIdx <= len(records); rowIdx++ {
 		if rowIdx < len(records) {
 			if records[rowIdx].row != nil {
 				if err := se.AddRow(records[rowIdx].row); err != nil {
-					t.Fatal(err)
+					tb.Fatal(err)
 				}
 				numRows++
 			} else {
@@ -79,16 +79,16 @@ func testRowStream(t *testing.T, rng *rand.Rand, records []rowOrMeta) {
 			msg.Data.RawBytes = append([]byte(nil), msg.Data.RawBytes...)
 			err := sd.AddMessage(msg)
 			if err != nil {
-				t.Fatal(err)
+				tb.Fatal(err)
 			}
-			decodedRows, metas = testGetDecodedRows(t, &sd, decodedRows, metas)
+			decodedRows, metas = testGetDecodedRows(tb, &sd, decodedRows, metas)
 		}
 	}
 	if len(metas) != numMeta {
-		t.Errorf("expected %d metadata records, got: %d", numMeta, len(metas))
+		tb.Errorf("expected %d metadata records, got: %d", numMeta, len(metas))
 	}
 	if len(decodedRows) != numRows {
-		t.Errorf("expected %d rows, got: %d", numRows, len(decodedRows))
+		tb.Errorf("expected %d rows, got: %d", numRows, len(decodedRows))
 	}
 }
 
@@ -104,9 +104,10 @@ func TestStreamEncodeDecode(t *testing.T) {
 	rng, _ := randutil.NewPseudoRand()
 	for test := 0; test < 100; test++ {
 		rowLen := rng.Intn(20)
+		types := sqlbase.RandColumnTypes(rng, rowLen)
 		info := make([]DatumInfo, rowLen)
 		for i := range info {
-			info[i].Type = sqlbase.RandColumnType(rng)
+			info[i].Type = types[i]
 			info[i].Encoding = sqlbase.RandDatumEncoding(rng)
 		}
 		numRows := rng.Intn(100)
@@ -122,7 +123,7 @@ func TestStreamEncodeDecode(t *testing.T) {
 				rows[i].meta.Err = fmt.Errorf("test error %d", i)
 			}
 		}
-		testRowStream(t, rng, rows)
+		testRowStream(t, rng, types, rows)
 	}
 }
 

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
@@ -25,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // sortNode represents a node that sorts the rows returned by its
@@ -79,6 +78,12 @@ func (p *planner) orderBy(
 		numOriginalCols = s.numOriginalCols
 	}
 	var ordering sqlbase.ColumnOrdering
+
+	var err error
+	orderBy, err = p.rewriteIndexOrderings(ctx, orderBy)
+	if err != nil {
+		return nil, err
+	}
 
 	for _, o := range orderBy {
 		direction := encoding.Ascending
@@ -138,9 +143,9 @@ func (p *planner) orderBy(
 				// handles cases like:
 				//
 				//   SELECT a AS b FROM t ORDER BY b
-				target := c.ColumnName.Normalize()
+				target := string(c.ColumnName)
 				for j, col := range columns {
-					if parser.ReNormalizeName(col.Name) == target {
+					if col.Name == target {
 						if index != -1 {
 							// There is more than one render alias that matches the ORDER BY
 							// clause. Here, SQL92 is specific as to what should be done:
@@ -152,9 +157,9 @@ func (p *planner) orderBy(
 								return nil, errors.Errorf("ORDER BY \"%s\" is ambiguous", target)
 							}
 							// Note that in this case we want to use the index of the first
-							// matching column. This is because renderNode.computeOrdering
-							// also prefers the first column, and we want the orderings to
-							// match as much as possible.
+							// matching column. This is because
+							// renderNode.computePhysicalProps also prefers the first column,
+							// and we want the orderings to match as much as possible.
 							continue
 						}
 						index = j
@@ -194,12 +199,15 @@ func (p *planner) orderBy(
 			if err != nil {
 				return nil, err
 			}
-			s.isStar = s.isStar || hasStar
+			p.hasStar = p.hasStar || hasStar
 
 			if len(cols) == 0 {
 				// Nothing was expanded! No order here.
 				continue
 			}
+
+			// ORDER BY (a, b) -> ORDER BY a, b
+			cols, exprs = flattenTuples(cols, exprs)
 
 			colIdxs := s.addOrReuseRenders(cols, exprs, true)
 			for i := 0; i < len(colIdxs)-1; i++ {
@@ -230,6 +238,145 @@ func (p *planner) orderBy(
 		return nil, nil
 	}
 	return &sortNode{p: p, columns: columns, ordering: ordering}, nil
+}
+
+// flattenTuples extracts the members of tuples into a list of columns.
+func flattenTuples(
+	cols sqlbase.ResultColumns, exprs []parser.TypedExpr,
+) (sqlbase.ResultColumns, []parser.TypedExpr) {
+	// We want to avoid allocating new slices unless strictly necessary.
+	var newExprs []parser.TypedExpr
+	var newCols sqlbase.ResultColumns
+	for i, e := range exprs {
+		if t, ok := e.(*parser.Tuple); ok {
+			if newExprs == nil {
+				// All right, it was necessary to allocate the slices after all.
+				newExprs = make([]parser.TypedExpr, i, len(exprs))
+				newCols = make(sqlbase.ResultColumns, i, len(cols))
+				copy(newExprs, exprs[:i])
+				copy(newCols, cols[:i])
+			}
+
+			newCols, newExprs = flattenTuple(t, newCols, newExprs)
+		} else if newExprs != nil {
+			newExprs = append(newExprs, e)
+			newCols = append(newCols, cols[i])
+		}
+	}
+	if newExprs != nil {
+		return newCols, newExprs
+	}
+	return cols, exprs
+}
+
+// flattenTuple extracts the members of one tuple into a list of columns.
+func flattenTuple(
+	t *parser.Tuple, cols sqlbase.ResultColumns, exprs []parser.TypedExpr,
+) (sqlbase.ResultColumns, []parser.TypedExpr) {
+	for _, e := range t.Exprs {
+		if eT, ok := e.(*parser.Tuple); ok {
+			cols, exprs = flattenTuple(eT, cols, exprs)
+		} else {
+			expr := e.(parser.TypedExpr)
+			exprs = append(exprs, expr)
+			cols = append(cols, sqlbase.ResultColumn{
+				Name: e.String(),
+				Typ:  expr.ResolvedType(),
+			})
+		}
+	}
+	return cols, exprs
+}
+
+// rewriteIndexOrderings rewrites an ORDER BY clause that uses the
+// extended INDEX or PRIMARY KEY syntax into an ORDER BY clause that
+// doesn't: each INDEX or PRIMARY KEY order specification is replaced
+// by the list of columns in the specified index.
+// For example,
+//   ORDER BY PRIMARY KEY kv -> ORDER BY kv.k ASC
+//   ORDER BY INDEX kv@primary -> ORDER BY kv.k ASC
+// With an index foo(a DESC, b ASC):
+//   ORDER BY INDEX t@foo ASC -> ORDER BY t.a DESC, t.a ASC
+//   ORDER BY INDEX t@foo DESC -> ORDER BY t.a ASC, t.b DESC
+func (p *planner) rewriteIndexOrderings(
+	ctx context.Context, orderBy parser.OrderBy,
+) (parser.OrderBy, error) {
+	// The loop above *may* allocate a new slice, but this is only
+	// needed if the INDEX / PRIMARY KEY syntax is used. In case the
+	// ORDER BY clause only uses the column syntax, we should reuse the
+	// same slice. So we start with an empty slice whose underlying
+	// array is the same as the original specification.
+	newOrderBy := orderBy[:0]
+	for _, o := range orderBy {
+		switch o.OrderType {
+		case parser.OrderByColumn:
+			// Nothing to do, just propagate the setting.
+			newOrderBy = append(newOrderBy, o)
+
+		case parser.OrderByIndex:
+			tn, err := p.QualifyWithDatabase(ctx, &o.Table)
+			if err != nil {
+				return nil, err
+			}
+			desc, err := p.getTableDesc(ctx, tn)
+			if err != nil {
+				return nil, err
+			}
+			var idxDesc *sqlbase.IndexDescriptor
+			if o.Index == "" || string(o.Index) == desc.PrimaryIndex.Name {
+				// ORDER BY PRIMARY KEY / ORDER BY INDEX t@primary
+				idxDesc = &desc.PrimaryIndex
+			} else {
+				// ORDER BY INDEX t@somename
+				// We need to search for the index with that name.
+				for i := range desc.Indexes {
+					if string(o.Index) == desc.Indexes[i].Name {
+						idxDesc = &desc.Indexes[i]
+						break
+					}
+				}
+				if idxDesc == nil {
+					return nil, errors.Errorf("index %q not found", parser.ErrString(o.Index))
+				}
+			}
+
+			// Now, expand the ORDER BY clause by an equivalent clause using that
+			// index's columns.
+
+			// First, make the final slice bigger.
+			prevNewOrderBy := newOrderBy
+			newOrderBy = make(parser.OrderBy,
+				len(newOrderBy),
+				cap(newOrderBy)+len(idxDesc.ColumnNames)-1)
+			copy(newOrderBy, prevNewOrderBy)
+
+			// Now expand the clause.
+			for k, colName := range idxDesc.ColumnNames {
+				newOrderBy = append(newOrderBy, &parser.Order{
+					OrderType: parser.OrderByColumn,
+					Expr:      &parser.ColumnItem{TableName: *tn, ColumnName: parser.Name(colName)},
+					Direction: chooseDirection(o.Direction == parser.Descending, idxDesc.ColumnDirections[k]),
+				})
+			}
+
+		default:
+			return nil, errors.Errorf("unknown ORDER BY specification: %s", parser.AsString(orderBy))
+		}
+	}
+
+	if log.V(2) {
+		log.Infof(ctx, "rewritten ORDER BY clause: %s", parser.AsString(newOrderBy))
+	}
+	return newOrderBy, nil
+}
+
+// chooseDirection translates the specified IndexDescriptor_Direction
+// into a parser.Direction. If invert is true, the idxDir is inverted.
+func chooseDirection(invert bool, idxDir sqlbase.IndexDescriptor_Direction) parser.Direction {
+	if (idxDir == sqlbase.IndexDescriptor_ASC) != invert {
+		return parser.Ascending
+	}
+	return parser.Descending
 }
 
 // colIndex takes an expression that refers to a column using an integer, verifies it refers to a
@@ -273,17 +420,19 @@ func (n *sortNode) Values() parser.Datums {
 	return n.valueIter.Values()[:len(n.columns)]
 }
 
-func (n *sortNode) Start(ctx context.Context) error {
-	return n.plan.Start(ctx)
+func (n *sortNode) Start(params runParams) error {
+	return n.plan.Start(params)
 }
 
-func (n *sortNode) Next(ctx context.Context) (bool, error) {
+func (n *sortNode) Next(params runParams) (bool, error) {
+	cancelChecker := params.p.cancelChecker
+
 	for n.needSort {
 		if v, ok := n.plan.(*valuesNode); ok {
 			// The plan we wrap is already a values node. Just sort it.
 			v.ordering = n.ordering
 			n.sortStrategy = newSortAllStrategy(v)
-			n.sortStrategy.Finish(ctx)
+			n.sortStrategy.Finish(params.ctx, cancelChecker)
 			n.needSort = false
 			break
 		} else if n.sortStrategy == nil {
@@ -292,32 +441,41 @@ func (n *sortNode) Next(ctx context.Context) (bool, error) {
 			n.sortStrategy = newSortAllStrategy(v)
 		}
 
+		if err := cancelChecker.Check(); err != nil {
+			return false, err
+		}
+
 		// TODO(andrei): If we're scanning an index with a prefix matching an
 		// ordering prefix, we should only accumulate values for equal fields
 		// in this prefix, then sort the accumulated chunk and output.
 		// TODO(irfansharif): matching column ordering speed-ups from distsql,
 		// when implemented, could be repurposed and used here.
-		next, err := n.plan.Next(ctx)
+		next, err := n.plan.Next(params)
 		if err != nil {
 			return false, err
 		}
 		if !next {
-			n.sortStrategy.Finish(ctx)
+			n.sortStrategy.Finish(params.ctx, cancelChecker)
 			n.valueIter = n.sortStrategy
 			n.needSort = false
 			break
 		}
 
 		values := n.plan.Values()
-		if err := n.sortStrategy.Add(ctx, values); err != nil {
+		if err := n.sortStrategy.Add(params.ctx, values); err != nil {
 			return false, err
 		}
+	}
+
+	// Check again, in case sort returned early due to a cancellation.
+	if err := cancelChecker.Check(); err != nil {
+		return false, err
 	}
 
 	if n.valueIter == nil {
 		n.valueIter = n.plan
 	}
-	return n.valueIter.Next(ctx)
+	return n.valueIter.Next(params)
 }
 
 func (n *sortNode) Close(ctx context.Context) {
@@ -325,16 +483,15 @@ func (n *sortNode) Close(ctx context.Context) {
 	if n.sortStrategy != nil {
 		n.sortStrategy.Close(ctx)
 	}
-	if n.valueIter != nil {
-		n.valueIter.Close(ctx)
-	}
+	// n.valueIter points to either n.plan or n.sortStrategy and thus has already
+	// been closed.
 }
 
 // valueIterator provides iterative access to a value source's values and
 // debug values. It is a subset of the planNode interface, so all methods
 // should conform to the comments expressed in the planNode definition.
 type valueIterator interface {
-	Next(ctx context.Context) (bool, error)
+	Next(runParams) (bool, error)
 	Values() parser.Datums
 	Close(ctx context.Context)
 }
@@ -349,7 +506,7 @@ type sortingStrategy interface {
 	// after all values have been provided to the strategy. The method should
 	// not be called more than once, and should only be called after all Add
 	// calls have occurred.
-	Finish(context.Context)
+	Finish(context.Context, *sqlbase.CancelChecker)
 }
 
 // sortAllStrategy reads in all values into the wrapped valuesNode and
@@ -372,12 +529,12 @@ func (ss *sortAllStrategy) Add(ctx context.Context, values parser.Datums) error 
 	return err
 }
 
-func (ss *sortAllStrategy) Finish(context.Context) {
-	ss.vNode.SortAll()
+func (ss *sortAllStrategy) Finish(ctx context.Context, cancelChecker *sqlbase.CancelChecker) {
+	ss.vNode.SortAll(cancelChecker)
 }
 
-func (ss *sortAllStrategy) Next(ctx context.Context) (bool, error) {
-	return ss.vNode.Next(ctx)
+func (ss *sortAllStrategy) Next(params runParams) (bool, error) {
+	return ss.vNode.Next(params)
 }
 
 func (ss *sortAllStrategy) Values() parser.Datums {
@@ -415,11 +572,11 @@ func (ss *iterativeSortStrategy) Add(ctx context.Context, values parser.Datums) 
 	return err
 }
 
-func (ss *iterativeSortStrategy) Finish(context.Context) {
+func (ss *iterativeSortStrategy) Finish(context.Context, *sqlbase.CancelChecker) {
 	ss.vNode.InitMinHeap()
 }
 
-func (ss *iterativeSortStrategy) Next(context.Context) (bool, error) {
+func (ss *iterativeSortStrategy) Next(runParams) (bool, error) {
 	if ss.vNode.Len() == 0 {
 		return false, nil
 	}
@@ -485,18 +642,21 @@ func (ss *sortTopKStrategy) Add(ctx context.Context, values parser.Datums) error
 	return nil
 }
 
-func (ss *sortTopKStrategy) Finish(context.Context) {
+func (ss *sortTopKStrategy) Finish(ctx context.Context, cancelChecker *sqlbase.CancelChecker) {
 	// Pop all values in the heap, resulting in the inverted ordering
 	// being sorted in reverse. Therefore, the slice is ordered correctly
 	// in-place.
 	for ss.vNode.Len() > 0 {
+		if cancelChecker.Check() != nil {
+			return
+		}
 		heap.Pop(ss.vNode)
 	}
 	ss.vNode.ResetLen()
 }
 
-func (ss *sortTopKStrategy) Next(ctx context.Context) (bool, error) {
-	return ss.vNode.Next(ctx)
+func (ss *sortTopKStrategy) Next(params runParams) (bool, error) {
+	return ss.vNode.Next(params)
 }
 
 func (ss *sortTopKStrategy) Values() parser.Datums {

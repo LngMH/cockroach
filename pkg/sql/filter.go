@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
@@ -29,10 +27,15 @@ import (
 // during plan optimizations in order to avoid instantiating a fully
 // blown selectTopNode/renderNode pair.
 type filterNode struct {
-	p          *planner
 	source     planDataSource
 	filter     parser.TypedExpr
 	ivarHelper parser.IndexedVarHelper
+	props      physicalProps
+}
+
+func (f *filterNode) computePhysicalProps(evalCtx *parser.EvalContext) {
+	f.props = planPhysicalProps(f.source.plan)
+	f.props.applyExpr(evalCtx, f.filter)
 }
 
 // IndexedVarEval implements the parser.IndexedVarContainer interface.
@@ -51,18 +54,18 @@ func (f *filterNode) IndexedVarFormat(buf *bytes.Buffer, fl parser.FmtFlags, idx
 }
 
 // Start implements the planNode interface.
-func (f *filterNode) Start(ctx context.Context) error {
-	return f.source.plan.Start(ctx)
+func (f *filterNode) Start(params runParams) error {
+	return f.source.plan.Start(params)
 }
 
 // Next implements the planNode interface.
-func (f *filterNode) Next(ctx context.Context) (bool, error) {
+func (f *filterNode) Next(params runParams) (bool, error) {
 	for {
-		if next, err := f.source.plan.Next(ctx); !next {
+		if next, err := f.source.plan.Next(params); !next {
 			return false, err
 		}
 
-		passesFilter, err := sqlbase.RunFilter(f.filter, &f.p.evalCtx)
+		passesFilter, err := sqlbase.RunFilter(f.filter, &params.p.evalCtx)
 		if err != nil {
 			return false, err
 		}

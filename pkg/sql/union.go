@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Dan Harrison (daniel.harrison@gmail.com)
 
 package sql
 
@@ -25,6 +23,61 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
+
+// unionNode is a planNode whose rows are the result of one of three set
+// operations (UNION, INTERSECT, or EXCEPT) on left and right. There are two
+// variations of each set operation: distinct, which always returns unique
+// results, and all, which does no uniqueing.
+//
+// Ordering of rows is expected to be handled externally to unionNode.
+// TODO(dan): In the long run, this is insufficient. If we know both left and
+// right are ordered the same way, we can do the set logic without the map
+// state. Additionally, if the unionNode has an ordering then we can hint it
+// down to left and right and force the condition for this first optimization.
+//
+// All six of the operations can be completed without cacheing rows by
+// iterating one side then the other and keeping counts of unique rows
+// in a map. The logic is common for all six. However, because EXCEPT
+// needs to iterate the right side first, the common code always reads
+// the right operand first. Meanwhile, we invert the operands for the
+// non-EXCEPT cases in order to preserve the appearance of the
+// original specified order.
+//
+// The emit logic for each op is represented by implementors of the
+// unionNodeEmit interface. The emitRight method is called for each row output
+// by the right side and passed a hashable representation of the row. If it
+// returns true, the row is emitted. After all right rows are examined, then
+// each left row is passed to emitLeft in the same way.
+//
+// An example: intersectNodeEmitAll
+// VALUES (1), (1), (1), (2), (2) INTERSECT ALL VALUES (1), (3), (1)
+// ----
+// 1
+// 1
+// There are three 1s on the left and two 1s on the right, so we emit 1, 1.
+// Nothing else is in both.
+//  emitRight: For each row, increment the map entry.
+//  emitLeft: For each row, if the row is not present in the map, it was not in
+//    both, don't emit. Otherwise, if the count for the row was > 0, emit and
+//    decrement the entry. Otherwise, the row was on the right, but we've
+//    already emitted as many as were on the right, don't emit.
+type unionNode struct {
+	// right and left are the data source operands.
+	// right is read first, to populate the `emit` field.
+	right, left planNode
+	// inverted, when true, indicates that the right plan corresponds to
+	// the left operand in the input SQL syntax, and vice-versa.
+	inverted bool
+	// emitAll is a performance optimization for UNION ALL. When set
+	// the union logic avoids the `emit` logic entirely.
+	emitAll bool
+	// emit contains the rows seen on the right so far and performs the
+	// selection/filtering logic.
+	emit unionNodeEmit
+	// scratch is a preallocated buffer for formatting the key of the
+	// current row on the right.
+	scratch []byte
+}
 
 // UnionClause constructs a planNode from a UNION/INTERSECT/EXCEPT expression.
 func (p *planner) UnionClause(
@@ -84,55 +137,26 @@ func (p *planner) UnionClause(
 		}
 	}
 
+	inverted := false
+	if n.Type != parser.ExceptOp {
+		// The logic below reads the rows from the right operand first,
+		// because for EXCEPT in particular this is what we need to match.
+		// However for the other operators (UNION, INTERSECT) it is
+		// actually confusing to see the right values come up first in the
+		// results. So invert this here, to reduce surprise by users.
+		left, right = right, left
+		inverted = true
+	}
+
 	node := &unionNode{
-		right:   right,
-		left:    left,
-		emitAll: emitAll,
-		emit:    emit,
-		scratch: make([]byte, 0),
+		right:    right,
+		left:     left,
+		inverted: inverted,
+		emitAll:  emitAll,
+		emit:     emit,
+		scratch:  make([]byte, 0),
 	}
 	return node, nil
-}
-
-// unionNode is a planNode whose rows are the result of one of three set
-// operations (UNION, INTERSECT, or EXCEPT) on left and right. There are two
-// variations of each set operation: distinct, which always returns unique
-// results, and all, which does no uniqueing.
-//
-// Ordering of rows is expected to be handled externally to unionNode.
-// TODO(dan): In the long run, this is insufficient. If we know both left and
-// right are ordered the same way, we can do the set logic without the map
-// state. Additionally, if the unionNode has an ordering then we can hint it
-// down to left and right and force the condition for this first optimization.
-//
-// All six of the operations can be completed without cacheing rows by iterating
-// one side then the other and keeping counts of unique rows in a map. Because
-// EXCEPT needs to iterate the right side first, and the other two don't care,
-// we always read right before left.
-//
-// The emit logic for each op is represented by implementors of the
-// unionNodeEmit interface. The emitRight method is called for each row output
-// by the right side and passed a hashable representation of the row. If it
-// returns true, the row is emitted. After all right rows are examined, then
-// each left row is passed to emitLeft in the same way.
-//
-// An example: intersectNodeEmitAll
-// VALUES (1), (1), (1), (2), (2) INTERSECT ALL VALUES (1), (3), (1)
-// ----
-// 1
-// 1
-// There are three 1s on the left and two 1s on the right, so we emit 1, 1.
-// Nothing else is in both.
-//  emitRight: For each row, increment the map entry.
-//  emitLeft: For each row, if the row is not present in the map, it was not in
-//    both, don't emit. Otherwise, if the count for the row was > 0, emit and
-//    decrement the entry. Otherwise, the row was on the right, but we've
-//    already emitted as many as were on the right, don't emit.
-type unionNode struct {
-	right, left planNode
-	emitAll     bool // emitAll is a performance optimization for UNION ALL.
-	emit        unionNodeEmit
-	scratch     []byte
 }
 
 func (n *unionNode) Values() parser.Datums {
@@ -145,9 +169,9 @@ func (n *unionNode) Values() parser.Datums {
 	return nil
 }
 
-func (n *unionNode) readRight(ctx context.Context) (bool, error) {
-	next, err := n.right.Next(ctx)
-	for ; next; next, err = n.right.Next(ctx) {
+func (n *unionNode) readRight(params runParams) (bool, error) {
+	next, err := n.right.Next(params)
+	for ; next; next, err = n.right.Next(params) {
 		if n.emitAll {
 			return true, nil
 		}
@@ -166,14 +190,14 @@ func (n *unionNode) readRight(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	n.right.Close(ctx)
+	n.right.Close(params.ctx)
 	n.right = nil
-	return n.readLeft(ctx)
+	return n.readLeft(params)
 }
 
-func (n *unionNode) readLeft(ctx context.Context) (bool, error) {
-	next, err := n.left.Next(ctx)
-	for ; next; next, err = n.left.Next(ctx) {
+func (n *unionNode) readLeft(params runParams) (bool, error) {
+	next, err := n.left.Next(params)
+	for ; next; next, err = n.left.Next(params) {
 		if n.emitAll {
 			return true, nil
 		}
@@ -188,24 +212,27 @@ func (n *unionNode) readLeft(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	n.left.Close(ctx)
+	n.left.Close(params.ctx)
 	n.left = nil
 	return false, nil
 }
 
-func (n *unionNode) Start(ctx context.Context) error {
-	if err := n.right.Start(ctx); err != nil {
+func (n *unionNode) Start(params runParams) error {
+	if err := n.right.Start(params); err != nil {
 		return err
 	}
-	return n.left.Start(ctx)
+	return n.left.Start(params)
 }
 
-func (n *unionNode) Next(ctx context.Context) (bool, error) {
+func (n *unionNode) Next(params runParams) (bool, error) {
+	if err := params.p.cancelChecker.Check(); err != nil {
+		return false, err
+	}
 	if n.right != nil {
-		return n.readRight(ctx)
+		return n.readRight(params)
 	}
 	if n.left != nil {
-		return n.readLeft(ctx)
+		return n.readLeft(params)
 	}
 	return false, nil
 }
